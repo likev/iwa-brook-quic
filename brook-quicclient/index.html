@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Brook QUIC Client — Isolated Web App</title>
+  <meta http-equiv="Cross-Origin-Opener-Policy" content="same-origin">
+  <meta http-equiv="Cross-Origin-Embedder-Policy" content="require-corp">
+  <meta http-equiv="Cross-Origin-Resource-Policy" content="same-origin">
+  <meta http-equiv="Permissions-Policy" content="direct-sockets=(self), direct-sockets-private=(self), cross-origin-isolated=(self), local-network=(self), loopback-network=(self)">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app-container">
+    <!-- Header -->
+    <header class="app-header">
+      <div class="brand-section">
+        <div class="logo-icon">⚡</div>
+        <div>
+          <h1 class="app-title">Brook QUIC Client</h1>
+          <p class="app-subtitle">Direct Sockets SOCKS5 & HTTP In-Browser Proxy Tunnel</p>
+        </div>
+      </div>
+      <div class="header-status-section">
+        <span id="status-badge" class="status-badge status-disconnected">STOPPED</span>
+        <span id="status-detail" class="status-detail">Ready to connect</span>
+      </div>
+    </header>
+
+    <!-- Main Grid -->
+    <main class="dashboard-grid">
+      <!-- Left Column: Configuration & Controls -->
+      <section class="card config-card">
+        <div class="card-header">
+          <h2 class="card-title">⚙️ Proxy Configuration</h2>
+        </div>
+        <div class="card-body">
+          <form id="proxy-config-form" onsubmit="return false;">
+            <div class="form-group">
+              <label for="input-server">Brook QUIC Server</label>
+              <input type="text" id="input-server" value="quic://brook-quic.pplx.io:4433" placeholder="quic://host:port" required>
+            </div>
+
+            <div class="form-group">
+              <label for="input-password">Server Password</label>
+              <input type="password" id="input-password" value="271828brook" placeholder="Server password" required>
+            </div>
+
+            <div class="form-row">
+              <div class="form-group" id="group-socks5-port">
+                <label for="input-socks5-port">SOCKS5 Port</label>
+                <input type="number" id="input-socks5-port" value="10808" min="1024" max="65535">
+              </div>
+
+              <div class="form-group" id="group-http-port">
+                <label for="input-http-port">HTTP Proxy Port</label>
+                <input type="number" id="input-http-port" value="8080" min="1024" max="65535">
+              </div>
+            </div>
+
+            <div class="form-options">
+              <label class="toggle-control">
+                <input type="checkbox" id="toggle-autodetect">
+                <span class="toggle-slider"></span>
+                <span class="toggle-label">Smart Auto-Detect (Single Port 10808)</span>
+              </label>
+
+              <label class="toggle-control">
+                <input type="checkbox" id="toggle-without-brook">
+                <span class="toggle-slider"></span>
+                <span class="toggle-label">WithoutBrook (SHA256 password)</span>
+              </label>
+            </div>
+
+            <div class="form-actions">
+              <button type="button" id="btn-toggle" class="btn btn-primary btn-large">Start Proxy</button>
+            </div>
+          </form>
+
+          <!-- Quick Test Commands -->
+          <div class="quick-test-section">
+            <h3 class="section-heading">Quick CLI Verification</h3>
+            <div class="command-box">
+              <span class="cmd-label">SOCKS5:</span>
+              <code id="code-socks-curl">curl -x socks5h://127.0.0.1:10808 https://httpbin.org/ip</code>
+              <button type="button" id="btn-copy-socks-curl" class="btn-copy" title="Copy command">📋</button>
+            </div>
+            <div class="command-box">
+              <span class="cmd-label">HTTP:</span>
+              <code id="code-http-curl">curl -x http://127.0.0.1:8080 https://httpbin.org/ip</code>
+              <button type="button" id="btn-copy-http-curl" class="btn-copy" title="Copy command">📋</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Right Column: Real-Time Telemetry & Gauges -->
+      <section class="card stats-card">
+        <div class="card-header">
+          <h2 class="card-title">📊 Live Telemetry & Throughput</h2>
+        </div>
+        <div class="card-body">
+          <div class="metrics-grid">
+            <div class="metric-box">
+              <span class="metric-label">Download Speed</span>
+              <span id="stat-speed-down" class="metric-value color-down">0 B/s</span>
+            </div>
+            <div class="metric-box">
+              <span class="metric-label">Upload Speed</span>
+              <span id="stat-speed-up" class="metric-value color-up">0 B/s</span>
+            </div>
+            <div class="metric-box">
+              <span class="metric-label">Total Received</span>
+              <span id="stat-total-down" class="metric-value">0 B</span>
+            </div>
+            <div class="metric-box">
+              <span class="metric-label">Total Sent</span>
+              <span id="stat-total-up" class="metric-value">0 B</span>
+            </div>
+            <div class="metric-box">
+              <span class="metric-label">Active Streams</span>
+              <span id="stat-active-sessions" class="metric-value color-active">0</span>
+            </div>
+            <div class="metric-box">
+              <span class="metric-label">Total Sessions</span>
+              <span id="stat-total-sessions" class="metric-value">0</span>
+            </div>
+          </div>
+
+          <!-- Active Sessions Table -->
+          <div class="session-table-container">
+            <h3 class="section-heading">Active Proxy Sessions</h3>
+            <table class="session-table">
+              <thead>
+                <tr>
+                  <th>ID</th>
+                  <th>Proto</th>
+                  <th>Target</th>
+                  <th>Traffic</th>
+                  <th>Duration</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody id="session-table-body">
+                <!-- Dynamically populated -->
+              </tbody>
+            </table>
+            <div id="empty-session-notice" class="empty-notice">No active proxy sessions</div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- Bottom Section: Live Traffic Event Log -->
+    <section class="card log-card">
+      <div class="card-header log-header">
+        <h2 class="card-title">📜 Traffic & Protocol Event Log</h2>
+        <div class="log-controls">
+          <select id="select-log-filter" class="select-filter">
+            <option value="all">All Levels</option>
+            <option value="info">Info</option>
+            <option value="success">Success</option>
+            <option value="warning">Warning</option>
+            <option value="error">Error</option>
+          </select>
+          <button type="button" id="btn-clear-logs" class="btn btn-secondary btn-sm">Clear Logs</button>
+        </div>
+      </div>
+      <div class="card-body log-body">
+        <div id="log-stream-container" class="log-stream"></div>
+      </div>
+    </section>
+  </div>
+
+  <!-- Hex Dump Modal -->
+  <div id="modal-container" class="modal-overlay hidden"></div>
+
+  <!-- Main Application Script -->
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

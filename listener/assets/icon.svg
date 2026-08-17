@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0f172a"/>
+      <stop offset="100%" stop-color="#022c22"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#34d399"/>
+      <stop offset="100%" stop-color="#059669"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="128" fill="url(#bg)" stroke="#10b981" stroke-width="8"/>
+  <rect x="128" y="112" width="256" height="288" rx="24" fill="#1e293b" stroke="#34d399" stroke-width="12"/>
+  <line x1="160" y1="184" x2="352" y2="184" stroke="#475569" stroke-width="8" stroke-linecap="round"/>
+  <line x1="160" y1="256" x2="352" y2="256" stroke="#475569" stroke-width="8" stroke-linecap="round"/>
+  <line x1="160" y1="328" x2="352" y2="328" stroke="#475569" stroke-width="8" stroke-linecap="round"/>
+  <circle cx="176" cy="148" r="14" fill="#34d399"/>
+  <circle cx="216" cy="148" r="14" fill="#38bdf8"/>
+  <circle cx="176" cy="220" r="14" fill="#34d399"/>
+  <circle cx="176" cy="292" r="14" fill="#34d399"/>
+  <path d="M 330 148 A 40 40 0 0 1 360 178" fill="none" stroke="#34d399" stroke-width="8" stroke-linecap="round"/>
+  <path d="M 345 133 A 60 60 0 0 1 390 178" fill="none" stroke="#34d399" stroke-width="8" stroke-linecap="round" opacity="0.6"/>
+  <text x="256" y="440" text-anchor="middle" fill="#34d399" font-family="system-ui, sans-serif" font-weight="800" font-size="36" letter-spacing="4">TCP LISTENER</text>
+</svg>

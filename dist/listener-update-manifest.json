@@ -1,0 +1,11 @@
+{
+  "versions": [
+    {
+      "version": "1.16.0",
+      "src": "https://t.iread.fun/downloads/iwa/dist/listener-v1.16.0.swbn",
+      "channels": [
+        "default"
+      ]
+    }
+  ]
+}

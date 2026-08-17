@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg-client" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#082f49"/>
+      <stop offset="100%" stop-color="#0f172a"/>
+    </linearGradient>
+    <linearGradient id="accent-client" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#38bdf8"/>
+      <stop offset="100%" stop-color="#0284c7"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="128" fill="url(#bg-client)" stroke="#0284c7" stroke-width="8"/>
+  <path d="M 140 160 L 260 256 L 140 352 Z" fill="url(#accent-client)" stroke="#38bdf8" stroke-width="8"/>
+  <path d="M 270 160 L 390 256 L 270 352 Z" fill="#38bdf8" stroke="#7dd3fc" stroke-width="8"/>
+  <circle cx="390" cy="256" r="16" fill="#f8fafc"/>
+  <text x="256" y="440" text-anchor="middle" fill="#38bdf8" font-family="system-ui, sans-serif" font-weight="800" font-size="36" letter-spacing="4">TCP CLIENT</text>
+</svg>

@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg-brook" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0b0f19"/>
+      <stop offset="100%" stop-color="#1e1b4b"/>
+    </linearGradient>
+    <linearGradient id="accent-brook" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#60a5fa"/>
+      <stop offset="100%" stop-color="#2563eb"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="128" fill="url(#bg-brook)" stroke="#3b82f6" stroke-width="8"/>
+  <polygon points="280,80 160,280 260,280 230,432 360,220 260,220" fill="url(#accent-brook)" stroke="#93c5fd" stroke-width="8"/>
+  <text x="256" y="468" text-anchor="middle" fill="#60a5fa" font-family="system-ui, sans-serif" font-weight="800" font-size="34" letter-spacing="4">BROOK QUIC</text>
+</svg>

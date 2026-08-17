@@ -1,0 +1,47 @@
+{
+  "name": "Brook QUIC Client IWA",
+  "short_name": "BrookQUIC",
+  "version": "1.16.0",
+  "update_manifest_url": "https://t.iread.fun/downloads/iwa/dist/brook-quicclient-update-manifest.json",
+  "id": "/",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#0d1117",
+  "theme_color": "#161b22",
+  "icons": [
+    {
+      "src": "/assets/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "/assets/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    },
+    {
+      "src": "/icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "/icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ],
+  "permissions_policy": {
+    "direct-sockets": ["self"],
+    "direct-sockets-private": ["self"],
+    "cross-origin-isolated": ["self"],
+    "local-network": ["self"],
+    "loopback-network": ["self"]
+  },
+  "permissions": [
+    {
+      "name": "direct-sockets"
+    }
+  ],
+  "isolated_storage": true
+}

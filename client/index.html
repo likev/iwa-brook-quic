@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TCP Client — Isolated Web App</title>
+  <meta http-equiv="Cross-Origin-Opener-Policy" content="same-origin">
+  <meta http-equiv="Cross-Origin-Embedder-Policy" content="require-corp">
+  <meta http-equiv="Cross-Origin-Resource-Policy" content="same-origin">
+  <meta http-equiv="Permissions-Policy" content="direct-sockets=(self), direct-sockets-private=(self), cross-origin-isolated=(self), local-network=(self), loopback-network=(self)">
+  <link rel="manifest" href="/.well-known/manifest.webmanifest">
+  <link rel="icon" href="/assets/icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app-container">
+    <!-- Header -->
+    <header class="app-header">
+      <div class="brand">
+        <div class="app-logo">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="13 17 18 12 13 7"></polyline>
+            <polyline points="6 17 11 12 6 7"></polyline>
+          </svg>
+        </div>
+        <div>
+          <div class="title-row">
+            <h1>TCP Client</h1>
+            <span class="badge badge-iwa">IWA Direct Sockets</span>
+          </div>
+          <p class="subtitle">Isolated Web App TCP Client connecting to remote or local TCP servers</p>
+        </div>
+      </div>
+
+      <div class="header-badges">
+        <div id="api-status-badge" class="status-pill status-checking">
+          <span class="status-dot"></span>
+          <span id="api-status-text">Detecting TCPSocket...</span>
+        </div>
+        <div id="coi-status-badge" class="status-pill status-muted" title="Cross-Origin Isolated State">
+          <span class="status-dot"></span>
+          <span id="coi-status-text">COI: Checking...</span>
+        </div>
+      </div>
+    </header>
+
+    <!-- Diagnostics Banner -->
+    <div id="diagnostics-banner" class="alert-banner hidden">
+      <div class="alert-icon">⚠️</div>
+      <div class="alert-content">
+        <strong>Direct Sockets API Notice:</strong>
+        <span id="diagnostics-msg"><code>TCPSocket</code> is only available inside Chrome Isolated Web Apps (IWAs).</span>
+        <div class="alert-actions">
+          <button id="toggle-sim-mode" class="btn btn-sm btn-outline">Enable Interactive Simulator Mode</button>
+          <a href="http://localhost:8000" target="_blank" class="btn btn-sm btn-ghost">IWA Setup Guide ↗</a>
+        </div>
+      </div>
+    </div>
+
+    <!-- Main Layout -->
+    <main class="main-layout">
+      <!-- Left Column: Connection & Message Composer -->
+      <section class="left-column">
+        
+        <!-- Connection Config Card -->
+        <div class="card conn-card">
+          <div class="card-header">
+            <div class="card-title">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M5 12h14M12 5l7 7-7 7"></path>
+              </svg>
+              Connection Target
+            </div>
+            <div id="conn-state-pill" class="status-pill status-stopped">
+              <span class="status-dot"></span>
+              <span id="conn-state-text">Disconnected</span>
+            </div>
+          </div>
+
+          <div class="card-body">
+            <div class="form-grid">
+              <!-- Target IP / Host -->
+              <div class="form-group">
+                <label for="target-ip">Remote IP / Hostname</label>
+                <div class="input-with-presets">
+                  <input type="text" id="target-ip" value="127.0.0.1" placeholder="e.g. 127.0.0.1 or 192.168.1.10">
+                  <div class="pill-presets">
+                    <button type="button" class="pill-btn active" data-ip="127.0.0.1">127.0.0.1 (Localhost)</button>
+                    <button type="button" class="pill-btn" data-ip="0.0.0.0">0.0.0.0</button>
+                    <button type="button" class="pill-btn" data-ip="::1">::1 (IPv6)</button>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Target Port -->
+              <div class="form-group">
+                <label for="target-port">Remote TCP Port</label>
+                <div class="port-input-row">
+                  <input type="number" id="target-port" min="1" max="65535" value="8080" placeholder="e.g. 8080 or 49215">
+                  <button type="button" id="btn-quick-fill-port" class="btn btn-sm btn-secondary" title="Paste or use copied port">
+                    Paste Port
+                  </button>
+                </div>
+              </div>
+
+              <!-- Advanced Socket Options (Collapsible) -->
+              <details class="socket-opts-details">
+                <summary>Advanced Socket Options (TCP_NODELAY, Keep-Alive)</summary>
+                <div class="socket-opts-grid">
+                  <label class="checkbox-row">
+                    <input type="checkbox" id="opt-no-delay" checked>
+                    <span>noDelay (Disable Nagle's algorithm)</span>
+                  </label>
+                  <div class="form-group">
+                    <label for="opt-keep-alive">keepAliveDelay (ms, 0 = disabled)</label>
+                    <input type="number" id="opt-keep-alive" min="0" value="0">
+                  </div>
+                </div>
+              </details>
+            </div>
+
+            <!-- Connect / Disconnect Action Button -->
+            <div class="action-row">
+              <button id="btn-toggle-connect" class="btn btn-primary btn-lg">
+                <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path>
+                  <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path>
+                </svg>
+                <span>Connect to TCP Server</span>
+              </button>
+            </div>
+
+            <!-- Active Connection Banner -->
+            <div id="conn-banner" class="conn-banner hidden">
+              <div class="banner-pulse"></div>
+              <div class="banner-info">
+                <div class="banner-label">Connected Remote Endpoint</div>
+                <div class="banner-endpoint">
+                  <span id="banner-remote-ip">127.0.0.1</span>:<span id="banner-remote-port" class="highlight-port">8080</span>
+                </div>
+                <div class="banner-local-info">
+                  Local ephemeral: <span id="banner-local-endpoint">127.0.0.1:-----</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- Telemetry Stats -->
+            <div class="stats-row">
+              <div class="stat-box">
+                <div class="stat-label">Packets (TX/RX)</div>
+                <div class="stat-value"><span id="stat-pkts-tx">0</span> / <span id="stat-pkts-rx">0</span></div>
+              </div>
+              <div class="stat-box">
+                <div class="stat-label">Bytes Sent</div>
+                <div class="stat-value" id="stat-bytes-tx">0 B</div>
+              </div>
+              <div class="stat-box">
+                <div class="stat-label">Bytes Received</div>
+                <div class="stat-value" id="stat-bytes-rx">0 B</div>
+              </div>
+              <div class="stat-box">
+                <div class="stat-label">Last RTT</div>
+                <div class="stat-value" id="stat-rtt">-- ms</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Message Composer Card -->
+        <div class="card composer-card">
+          <div class="card-header">
+            <div class="card-title">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+                <line x1="22" y1="2" x2="11" y2="13"></line>
+                <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+              </svg>
+              Message Composer
+            </div>
+
+            <div class="composer-mode-toggle">
+              <button id="composer-text-mode" class="mode-pill active">Text</button>
+              <button id="composer-hex-mode" class="mode-pill">Hex Bytes</button>
+            </div>
+          </div>
+
+          <div class="card-body">
+            <!-- Quick Payload Presets -->
+            <div class="preset-payloads">
+              <button class="preset-btn" data-payload="Hello TCP Server!\r\n">💬 Hello</button>
+              <button class="preset-btn" data-payload="PING" data-rtt="true">⚡ PING (RTT)</button>
+              <button class="preset-btn" data-payload="GET / HTTP/1.1\r\nHost: localhost\r\n\r\n">🌐 HTTP GET</button>
+              <button class="preset-btn" data-payload='{"action":"telemetry","status":"ok","ts":${Date.now()}}\r\n'>📦 JSON</button>
+              <button class="preset-btn" data-hex="48 65 6c 6c 6f 20 57 6f 72 6c 64 21 0a">🔢 Hex Msg</button>
+            </div>
+
+            <!-- Message Textarea -->
+            <div class="form-group">
+              <textarea id="composer-input" rows="3" placeholder="Enter message text or payload (Ctrl+Enter to send)...">Hello TCP Server!\r\n</textarea>
+            </div>
+
+            <!-- Endings & Sending options -->
+            <div class="composer-controls-row">
+              <div class="line-ending-select">
+                <label for="line-ending">Line Ending:</label>
+                <select id="line-ending">
+                  <option value="none">None (Raw input)</option>
+                  <option value="lf">\n (LF)</option>
+                  <option value="crlf" selected>\r\n (CRLF)</option>
+                </select>
+              </div>
+
+              <!-- Interval Repeat Sender -->
+              <div class="interval-sender">
+                <label class="checkbox-row">
+                  <input type="checkbox" id="opt-repeat-send">
+                  <span>Repeat every</span>
+                </label>
+                <input type="number" id="repeat-interval-ms" min="100" max="60000" value="1000" style="width: 70px;">
+                <span>ms</span>
+              </div>
+            </div>
+
+            <!-- Send Button -->
+            <div class="composer-action">
+              <button id="btn-send-message" class="btn btn-primary btn-lg" disabled>
+                <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+                  <line x1="22" y1="2" x2="11" y2="13"></line>
+                  <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+                </svg>
+                <span>Send Payload (Ctrl+Enter)</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Right Column: Live Stream & Packet Traffic -->
+      <section class="right-column">
+        <div class="card stream-card">
+          <div class="card-header">
+            <div class="card-title">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+                <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline>
+              </svg>
+              Bi-Directional Traffic Stream
+            </div>
+
+            <div class="stream-toolbar">
+              <!-- Filter Tabs -->
+              <div class="tab-pills">
+                <button class="tab-pill active" data-filter="all">All</button>
+                <button class="tab-pill" data-filter="tx">TX (Sent)</button>
+                <button class="tab-pill" data-filter="rx">RX (Received)</button>
+                <button class="tab-pill" data-filter="evt">Events</button>
+              </div>
+
+              <!-- View Mode (Text vs Hex) -->
+              <div class="view-mode-switch">
+                <button id="view-text-btn" class="mode-btn active" title="Text View">ASCII</button>
+                <button id="view-hex-btn" class="mode-btn" title="Hex View">HEX</button>
+              </div>
+
+              <!-- Clear & Export -->
+              <button id="btn-clear-logs" class="icon-btn" title="Clear log">
+                <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+                </svg>
+              </button>
+              <button id="btn-export-logs" class="icon-btn" title="Export log as JSON">
+                <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                  <polyline points="7 10 12 15 17 10"></polyline>
+                  <line x1="12" y1="15" x2="12" y2="3"></line>
+                </svg>
+              </button>
+            </div>
+          </div>
+
+          <!-- Log stream container -->
+          <div id="traffic-stream" class="traffic-stream">
+            <div class="stream-entry entry-system">
+              <span class="entry-time">[00:00:00]</span>
+              <span class="entry-tag tag-system">SYSTEM</span>
+              <span class="entry-content">TCP Client IWA initialized. Ready to connect via TCPSocket.</span>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- Modal: Hex Packet Inspector -->
+    <div id="hex-modal" class="modal hidden">
+      <div class="modal-backdrop"></div>
+      <div class="modal-card">
+        <div class="modal-header">
+          <h3 id="modal-title">Packet Hex Inspector</h3>
+          <button id="btn-close-modal" class="close-btn">&times;</button>
+        </div>
+        <div class="modal-body">
+          <div class="packet-meta-row" id="packet-meta"></div>
+          <div class="hex-dump-container" id="hex-dump-content"></div>
+        </div>
+        <div class="modal-footer">
+          <button id="btn-copy-hex" class="btn btn-secondary btn-sm">Copy Hex</button>
+          <button id="btn-copy-ascii" class="btn btn-secondary btn-sm">Copy ASCII</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Toast Notification -->
+    <div id="toast" class="toast hidden"></div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,40 @@
+{
+  "name": "iwa-direct-sockets-demo",
+  "version": "1.0.0",
+  "description": "Demo Isolated Web Apps (IWAs) demonstrating Direct Sockets API (TCPServerSocket and TCPSocket)",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "generate-keys": "node scripts/generate-keys.js",
+    "generate-icons": "node scripts/generate-icons.js",
+    "build": "node scripts/build.js",
+    "test": "node scripts/run-all-tests.js",
+    "test:tcp-client": "node scripts/test-tcp.js client",
+    "test:tcp-server": "node scripts/test-tcp.js server",
+    "test:brook-quic": "node scripts/test-brook-stream.js",
+    "test:brook-proxy": "node scripts/test-brook-proxy-cli.js"
+  },
+  "keywords": [
+    "iwa",
+    "isolated-web-apps",
+    "direct-sockets",
+    "tcpserversocket",
+    "tcpsocket",
+    "web-bundle",
+    "swbn"
+  ],
+  "author": "Google DeepMind Antigravity",
+  "license": "MIT",
+  "dependencies": {
+    "@noble/ciphers": "^2.3.0",
+    "@noble/curves": "^2.3.0",
+    "@noble/hashes": "^2.3.0",
+    "esbuild": "^0.28.2",
+    "flat-ranges": "^2.1.0",
+    "lemon-tls": "^0.7.0",
+    "quico": "^0.4.0",
+    "wbn": "^0.0.9",
+    "wbn-sign": "^0.3.1"
+  }
+}

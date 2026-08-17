@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Isolated Web Apps (IWA) — Direct Sockets Hub</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="hub-container">
+    <!-- Header -->
+    <header class="hub-header">
+      <div class="brand">
+        <div class="logo-box">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="2" y="2" width="20" height="8" rx="2" ry="2"></rect>
+            <rect x="2" y="14" width="20" height="8" rx="2" ry="2"></rect>
+            <line x1="6" y1="6" x2="6.01" y2="6"></line>
+            <line x1="6" y1="18" x2="6.01" y2="18"></line>
+          </svg>
+        </div>
+        <div>
+          <h1>Isolated Web Apps (IWAs) — Direct Sockets Suite</h1>
+          <p class="subtitle">Full-duplex TCP Listener, TCP Client &amp; Brook QUIC Encrypted Proxy powered by Chrome Direct Sockets API</p>
+        </div>
+      </div>
+      <div class="header-tag">IWA Dev Platform</div>
+    </header>
+
+    <!-- App Launchers Grid -->
+    <section class="launchers-grid">
+      <!-- Brook QUIC Client Card (Featured) -->
+      <div class="launcher-card card-brook" style="border-color: #3b82f6; grid-column: 1 / -1;">
+        <div class="card-top">
+          <div class="app-icon" style="background: rgba(37, 99, 235, 0.2); border-color: rgba(59, 130, 246, 0.4); color: #60a5fa;">
+            <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2">
+              <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
+            </svg>
+          </div>
+          <div class="status-indicator">
+            <span class="dot" style="background: #3b82f6;"></span>
+            <span>Port 8083 (IWA)</span>
+          </div>
+        </div>
+
+        <div class="app-info">
+          <h2>Brook QUIC Client IWA (v1.16.0)</h2>
+          <p class="app-desc">
+            In-browser implementation of the <strong>Brook QUIC Client</strong>. Accepts inbound local <strong>SOCKS5</strong> (<code>--socks5 127.0.0.1:10808</code>) and <strong>HTTP/HTTPS CONNECT</strong> (<code>--http 127.0.0.1:8080</code>) proxy requests, and tunnels them through authenticated, encrypted AES-256-GCM frames multiplexed over pure-browser <strong>QUIC</strong> (TLS 1.3 + Direct Sockets <code>window.UDPSocket</code>).
+          </p>
+        </div>
+
+        <div class="app-meta">
+          <div class="meta-item">
+            <span class="meta-label">Version:</span>
+            <code>v1.16.0</code>
+          </div>
+          <div class="meta-item">
+            <span class="meta-label">API Interfaces:</span>
+            <code>TCPServerSocket, UDPSocket</code>
+          </div>
+          <div class="meta-item">
+            <span class="meta-label">Inbound Protocols:</span>
+            <code>SOCKS5 + HTTP CONNECT + Auto-Detect</code>
+          </div>
+          <div class="meta-item">
+            <span class="meta-label">Signed Bundle URL:</span>
+            <code>https://t.iread.fun/downloads/iwa/dist/brook-quicclient-v1.16.0.swbn</code>
+          </div>
+          <div class="meta-item">
+            <span class="meta-label">Dev Server:</span>
+            <code>http://localhost:8083</code>
+          </div>
+          <div class="meta-item">
+            <span class="meta-label">Web Bundle ID:</span>
+            <code>5uad6swnv66tot24df52mjr7nc7pmnmwmmxofkkshietmn3nthqqaaic</code>
+          </div>
+        </div>
+
+        <div class="card-actions">
+          <a href="http://localhost:8083" target="_blank" class="btn btn-primary" style="background: #2563eb;">
+            Open Brook QUIC Client ↗
+          </a>
+          <button class="btn btn-secondary btn-copy" data-url="http://localhost:8083">
+            📋 Copy URL
+          </button>
+        </div>
+      </div>
+
+      <!-- TCP Listener Card -->
+      <div class="launcher-card card-listener">
+        <div class="card-top">
+          <div class="app-icon icon-listener">
+            <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="2" y="2" width="20" height="8" rx="2" ry="2"></rect>
+              <rect x="2" y="14" width="20" height="8" rx="2" ry="2"></rect>
+              <line x1="6" y1="6" x2="6.01" y2="6"></line>
+              <line x1="6" y1="18" x2="6.01" y2="18"></line>
+              <path d="M18 6a4 4 0 0 1 0 4"></path>
+            </svg>
+          </div>
+          <div class="status-indicator">
+            <span class="dot dot-green"></span>
+            <span>Port 8081</span>
+          </div>
+        </div>
+
+        <div class="app-info">
+          <h2>TCP Listener IWA (v1.16.0)</h2>
+          <p class="app-desc">
+            Binds to a <strong>random OS-assigned port</strong> (or custom port) using <code>new TCPServerSocket()</code>.
+            Accepts inbound client connections, live multi-client traffic feed, auto-echo mode, and hex packet inspector.
+          </p>
+        </div>
+
+        <div class="app-meta">
+          <div class="meta-item">
+            <span class="meta-label">Version:</span>
+            <code>v1.16.0</code>
+          </div>
+          <div class="meta-item">
+            <span class="meta-label">API Interface:</span>
+            <code>window.TCPServerSocket</code>
+          </div>
+          <div class="meta-item">
+            <span class="meta-label">Update Bundle URL:</span>
+            <code>https://t.iread.fun/downloads/iwa/dist/listener-v1.16.0.swbn</code>
+          </div>
+          <div class="meta-item">
+            <span class="meta-label">Dev Server:</span>
+            <code>http://localhost:8081</code>
+          </div>
+        </div>
+
+        <div class="card-actions">
+          <a href="http://localhost:8081" target="_blank" class="btn btn-primary">
+            Open Listener App ↗
+          </a>
+          <button class="btn btn-secondary btn-copy" data-url="http://localhost:8081">
+            📋 Copy URL
+          </button>
+        </div>
+      </div>
+
+      <!-- TCP Client Card -->
+      <div class="launcher-card card-client">
+        <div class="card-top">
+          <div class="app-icon icon-client">
+            <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2">
+              <polyline points="13 17 18 12 13 7"></polyline>
+              <polyline points="6 17 11 12 6 7"></polyline>
+            </svg>
+          </div>
+          <div class="status-indicator">
+            <span class="dot dot-blue"></span>
+            <span>Port 8082</span>
+          </div>
+        </div>
+
+        <div class="app-info">
+          <h2>TCP Client IWA (v1.16.0)</h2>
+          <p class="app-desc">
+            Connects to any remote or local IP &amp; Port using <code>new TCPSocket()</code>.
+            Features text &amp; hex payload composer, latency/RTT measurement, auto-repeat sender, and packet monitor.
+          </p>
+        </div>
+
+        <div class="app-meta">
+          <div class="meta-item">
+            <span class="meta-label">Version:</span>
+            <code>v1.16.0</code>
+          </div>
+          <div class="meta-item">
+            <span class="meta-label">API Interface:</span>
+            <code>window.TCPSocket</code>
+          </div>
+          <div class="meta-item">
+            <span class="meta-label">Update Bundle URL:</span>
+            <code>https://t.iread.fun/downloads/iwa/dist/client-v1.16.0.swbn</code>
+          </div>
+          <div class="meta-item">
+            <span class="meta-label">Dev Server:</span>
+            <code>http://localhost:8082</code>
+          </div>
+        </div>
+
+        <div class="card-actions">
+          <a href="http://localhost:8082" target="_blank" class="btn btn-cyan">
+            Open Client App ↗
+          </a>
+          <button class="btn btn-secondary btn-copy" data-url="http://localhost:8082">
+            📋 Copy URL
+          </button>
+        </div>
+      </div>
+    </section>
+
+    <!-- Chrome Installation & Setup Guide -->
+    <section class="guide-section">
+      <div class="section-header">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="10"></circle>
+          <path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"></path>
+          <line x1="12" y1="17" x2="12.01" y2="17"></line>
+        </svg>
+        <h2>Running &amp; Testing Isolated Web Apps in Chrome</h2>
+      </div>
+
+      <div class="steps-grid">
+        <!-- Step 1 -->
+        <div class="step-card">
+          <div class="step-number">1</div>
+          <h3>Enable Chrome Flags</h3>
+          <p>In Chrome (version 120+), navigate to these flags and set them to <strong>Enabled</strong>, then restart Chrome:</p>
+          <ul class="code-list">
+            <li><code>chrome://flags/#enable-isolated-web-apps</code></li>
+            <li><code>chrome://flags/#enable-isolated-web-app-dev-mode</code></li>
+          </ul>
+        </div>
+
+        <!-- Step 2 -->
+        <div class="step-card">
+          <div class="step-number">2</div>
+          <h3>Install via Dev Server Proxy</h3>
+          <p>Navigate to <code>chrome://web-app-internals</code> in Chrome:</p>
+          <ol class="step-list">
+            <li>Find <strong>"Install Isolated Web App from Dev Server"</strong>.</li>
+            <li>For Brook QUIC Client: Enter <code>http://localhost:8083</code>.</li>
+            <li>For Listener: Enter <code>http://localhost:8081</code>.</li>
+            <li>For Client: Enter <code>http://localhost:8082</code>.</li>
+          </ol>
+        </div>
+
+        <!-- Step 3 -->
+        <div class="step-card">
+          <div class="step-number">3</div>
+          <h3>Install via Signed Bundle (.swbn)</h3>
+          <p>To test production Signed Web Bundles:</p>
+          <ol class="step-list">
+            <li>Run <code>npm run build</code> to generate <code>dist/*.swbn</code>.</li>
+            <li>In <code>chrome://web-app-internals</code>, use <strong>"Install Isolated Web App from Signed Web Bundle"</strong>.</li>
+          </ol>
+        </div>
+
+        <!-- Step 4 -->
+        <div class="step-card">
+          <div class="step-number">4</div>
+          <h3>Test with CLI Proxy Command</h3>
+          <p>Once Brook QUIC Client IWA is running in Chrome, test with curl:</p>
+          <ul class="code-list">
+            <li><code>curl -x socks5h://127.0.0.1:1080 https://httpbin.org/ip</code></li>
+            <li><code>curl -x http://127.0.0.1:8080 https://httpbin.org/ip</code></li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- Toast Notification -->
+    <div id="toast" class="toast hidden"></div>
+  </div>
+
+  <script>
+    document.querySelectorAll('.btn-copy').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const url = btn.dataset.url;
+        navigator.clipboard.writeText(url).then(() => {
+          const toast = document.getElementById('toast');
+          toast.textContent = `Copied ${url} to clipboard!`;
+          toast.classList.remove('hidden');
+          setTimeout(() => toast.classList.add('hidden'), 2500);
+        });
+      });
+    });
+  </script>
+</body>
+</html>

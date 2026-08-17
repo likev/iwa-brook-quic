@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TCP Listener — Isolated Web App</title>
+  <meta http-equiv="Cross-Origin-Opener-Policy" content="same-origin">
+  <meta http-equiv="Cross-Origin-Embedder-Policy" content="require-corp">
+  <meta http-equiv="Cross-Origin-Resource-Policy" content="same-origin">
+  <meta http-equiv="Permissions-Policy" content="direct-sockets=(self), direct-sockets-private=(self), cross-origin-isolated=(self), local-network=(self), loopback-network=(self)">
+  <link rel="manifest" href="/.well-known/manifest.webmanifest">
+  <link rel="icon" href="/assets/icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app-container">
+    <!-- Top Navigation / Header -->
+    <header class="app-header">
+      <div class="brand">
+        <div class="app-logo">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="2" y="2" width="20" height="8" rx="2" ry="2"></rect>
+            <rect x="2" y="14" width="20" height="8" rx="2" ry="2"></rect>
+            <line x1="6" y1="6" x2="6.01" y2="6"></line>
+            <line x1="6" y1="18" x2="6.01" y2="18"></line>
+            <path d="M18 6a4 4 0 0 1 0 4"></path>
+          </svg>
+        </div>
+        <div>
+          <div class="title-row">
+            <h1>TCP Listener</h1>
+            <span class="badge badge-iwa">IWA Direct Sockets</span>
+          </div>
+          <p class="subtitle">Isolated Web App TCP Server listening for inbound connections</p>
+        </div>
+      </div>
+
+      <div class="header-badges">
+        <div id="api-status-badge" class="status-pill status-checking">
+          <span class="status-dot"></span>
+          <span id="api-status-text">Detecting TCPServerSocket...</span>
+        </div>
+        <div id="coi-status-badge" class="status-pill status-muted" title="Cross-Origin Isolated State">
+          <span class="status-dot"></span>
+          <span id="coi-status-text">COI: Checking...</span>
+        </div>
+      </div>
+    </header>
+
+    <!-- Diagnostics Banner (shown if not in IWA context) -->
+    <div id="diagnostics-banner" class="alert-banner hidden">
+      <div class="alert-icon">⚠️</div>
+      <div class="alert-content">
+        <strong>Direct Sockets API Notice:</strong>
+        <span id="diagnostics-msg"><code>TCPServerSocket</code> is only available inside Chrome Isolated Web Apps (IWAs).</span>
+        <div class="alert-actions">
+          <button id="toggle-sim-mode" class="btn btn-sm btn-outline">Enable Interactive Simulator Mode</button>
+          <a href="http://localhost:8000" target="_blank" class="btn btn-sm btn-ghost">IWA Setup Guide ↗</a>
+        </div>
+      </div>
+    </div>
+
+    <!-- Main Grid Layout -->
+    <main class="main-layout">
+      <!-- Left Column: Server Controls & Connected Clients -->
+      <section class="left-column">
+        
+        <!-- Server Config & Status Card -->
+        <div class="card server-card">
+          <div class="card-header">
+            <div class="card-title">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="12" cy="12" r="10"></circle>
+                <path d="M12 6v6l4 2"></path>
+              </svg>
+              Server Configuration
+            </div>
+            <div id="server-state-pill" class="status-pill status-stopped">
+              <span class="status-dot"></span>
+              <span id="server-state-text">Stopped</span>
+            </div>
+          </div>
+
+          <div class="card-body">
+            <div class="form-grid">
+              <!-- Bind IP Address -->
+              <div class="form-group">
+                <label for="bind-ip">Bind Address</label>
+                <div class="input-with-presets">
+                  <input type="text" id="bind-ip" value="0.0.0.0" placeholder="0.0.0.0">
+                  <div class="pill-presets">
+                    <button type="button" class="pill-btn active" data-ip="0.0.0.0">0.0.0.0 (All)</button>
+                    <button type="button" class="pill-btn" data-ip="127.0.0.1">127.0.0.1 (Loopback)</button>
+                    <button type="button" class="pill-btn" data-ip="::">:: (IPv6)</button>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Port Configuration -->
+              <div class="form-group">
+                <div class="label-row">
+                  <label for="listen-port">Port Assignment</label>
+                  <label class="toggle-label">
+                    <input type="checkbox" id="random-port-toggle" checked>
+                    <span class="toggle-text">🎲 Random Port (OS Assigned)</span>
+                  </label>
+                </div>
+                <div class="port-input-wrapper">
+                  <input type="number" id="listen-port" min="0" max="65535" value="0" disabled placeholder="Assigned by OS">
+                  <span class="port-hint" id="port-hint">OS will pick an available ephemeral port</span>
+                </div>
+              </div>
+
+              <!-- Backlog -->
+              <div class="form-group">
+                <label for="backlog-size">Queue Backlog</label>
+                <input type="number" id="backlog-size" min="1" max="1024" value="100">
+              </div>
+            </div>
+
+            <!-- Start / Stop Button -->
+            <div class="action-row">
+              <button id="btn-toggle-server" class="btn btn-primary btn-lg">
+                <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+                  <polygon points="5 3 19 12 5 21 5 3"></polygon>
+                </svg>
+                <span>Start Listening</span>
+              </button>
+            </div>
+
+            <!-- Live Listening Banner (Active state) -->
+            <div id="listening-banner" class="listening-banner hidden">
+              <div class="banner-pulse"></div>
+              <div class="banner-info">
+                <div class="banner-label">Active TCP Server</div>
+                <div class="banner-endpoint">
+                  <span id="bound-address">0.0.0.0</span>:<span id="bound-port" class="highlight-port">-----</span>
+                </div>
+              </div>
+              <button id="btn-copy-endpoint" class="btn btn-sm btn-secondary" title="Copy endpoint to clipboard">
+                📋 Copy Endpoint
+              </button>
+            </div>
+
+            <!-- Server Telemetry Stats -->
+            <div class="stats-row">
+              <div class="stat-box">
+                <div class="stat-label">Active Clients</div>
+                <div class="stat-value" id="stat-active-clients">0</div>
+              </div>
+              <div class="stat-box">
+                <div class="stat-label">Total Accepted</div>
+                <div class="stat-value" id="stat-total-accepted">0</div>
+              </div>
+              <div class="stat-box">
+                <div class="stat-label">Bytes Received</div>
+                <div class="stat-value" id="stat-bytes-rx">0 B</div>
+              </div>
+              <div class="stat-box">
+                <div class="stat-label">Bytes Sent</div>
+                <div class="stat-value" id="stat-bytes-tx">0 B</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Automation & Server Options -->
+        <div class="card options-card">
+          <div class="card-header">
+            <div class="card-title">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M12 20v-6M6 20V10M18 20V4"></path>
+              </svg>
+              Server Automation Rules
+            </div>
+          </div>
+          <div class="card-body">
+            <div class="toggle-group">
+              <label class="switch-row">
+                <input type="checkbox" id="opt-auto-echo" checked>
+                <div class="switch-content">
+                  <div class="switch-title">Auto-Echo Incoming Data</div>
+                  <div class="switch-desc">Instantly sends received payload back to client</div>
+                </div>
+              </label>
+
+              <label class="switch-row">
+                <input type="checkbox" id="opt-welcome-msg" checked>
+                <div class="switch-content">
+                  <div class="switch-title">Send Welcome Banner on Connect</div>
+                  <div class="switch-desc">Sends greeting when client connects</div>
+                </div>
+              </label>
+
+              <div class="sub-input-row" id="welcome-msg-container">
+                <input type="text" id="welcome-msg-text" value="220 TCP Listener IWA Ready\r\n">
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Connected Clients Panel -->
+        <div class="card clients-card">
+          <div class="card-header">
+            <div class="card-title">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
+                <circle cx="9" cy="7" r="4"></circle>
+                <path d="M23 21v-2a4 4 0 0 0-3-3.87"></path>
+                <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
+              </svg>
+              Connected Clients (<span id="clients-count">0</span>)
+            </div>
+            <button id="btn-broadcast-modal" class="btn btn-xs btn-outline" disabled>
+              📢 Broadcast to All
+            </button>
+          </div>
+
+          <div class="card-body">
+            <div id="clients-list" class="clients-list">
+              <div class="empty-state">
+                <div class="empty-icon">🔌</div>
+                <div class="empty-text">No clients currently connected</div>
+                <div class="empty-sub">Start the server and connect with a TCP client</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Right Column: Live Stream & Packet Inspector -->
+      <section class="right-column">
+        <div class="card stream-card">
+          <div class="card-header">
+            <div class="card-title">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+                <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline>
+              </svg>
+              Live Traffic & Activity Stream
+            </div>
+
+            <div class="stream-toolbar">
+              <!-- Filter Tabs -->
+              <div class="tab-pills">
+                <button class="tab-pill active" data-filter="all">All</button>
+                <button class="tab-pill" data-filter="rx">RX (In)</button>
+                <button class="tab-pill" data-filter="tx">TX (Out)</button>
+                <button class="tab-pill" data-filter="evt">Events</button>
+              </div>
+
+              <!-- View Mode (Text vs Hex) -->
+              <div class="view-mode-switch">
+                <button id="view-text-btn" class="mode-btn active" title="Text View">ASCII</button>
+                <button id="view-hex-btn" class="mode-btn" title="Hex View">HEX</button>
+              </div>
+
+              <!-- Clear & Export -->
+              <button id="btn-clear-logs" class="icon-btn" title="Clear log">
+                <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+                </svg>
+              </button>
+              <button id="btn-export-logs" class="icon-btn" title="Export log as JSON">
+                <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                  <polyline points="7 10 12 15 17 10"></polyline>
+                  <line x1="12" y1="15" x2="12" y2="3"></line>
+                </svg>
+              </button>
+            </div>
+          </div>
+
+          <!-- Log stream container -->
+          <div id="traffic-stream" class="traffic-stream">
+            <div class="stream-entry entry-system">
+              <span class="entry-time">[00:00:00]</span>
+              <span class="entry-tag tag-system">SYSTEM</span>
+              <span class="entry-content">TCP Listener IWA initialized. Ready to start TCPServerSocket.</span>
+            </div>
+          </div>
+
+          <!-- Quick Reply / Message Bar -->
+          <div class="stream-footer">
+            <div class="reply-bar">
+              <select id="target-client-select">
+                <option value="all">📢 Broadcast to All Clients</option>
+              </select>
+              <input type="text" id="manual-msg-input" placeholder="Type message to send (Press Enter)...">
+              <button id="btn-send-manual" class="btn btn-secondary">Send</button>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- Modal: Hex Packet Inspector -->
+    <div id="hex-modal" class="modal hidden">
+      <div class="modal-backdrop"></div>
+      <div class="modal-card">
+        <div class="modal-header">
+          <h3 id="modal-title">Packet Hex Inspector</h3>
+          <button id="btn-close-modal" class="close-btn">&times;</button>
+        </div>
+        <div class="modal-body">
+          <div class="packet-meta-row" id="packet-meta"></div>
+          <div class="hex-dump-container" id="hex-dump-content"></div>
+        </div>
+        <div class="modal-footer">
+          <button id="btn-copy-hex" class="btn btn-secondary btn-sm">Copy Hex</button>
+          <button id="btn-copy-ascii" class="btn btn-secondary btn-sm">Copy ASCII</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Toast Notification -->
+    <div id="toast" class="toast hidden"></div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
