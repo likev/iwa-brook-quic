@@ -69,7 +69,7 @@ export class BrookTunnel {
     sessionId = '',
     sendSuccess = null,
     sendFailure = null,
-    dialTimeoutMs = 3500,
+    dialTimeoutMs = 8000,
     closeClientStreams = true,
     onHandshakeDone = null,
     onClientDataRead = null,
@@ -130,12 +130,12 @@ export class BrookTunnel {
     const resetIdleTimer = (durationMs = null) => {
       if (idleTimer) clearTimeout(idleTimer);
       if (!isTerminated) {
-        // Active data tunnels get 30s idle timeout; speculative pre-connects get 15s
-        const timeout = durationMs !== null ? durationMs : (totalBytesRecv > 0 ? 30000 : 15000);
+        // Standard keep-alive idle timeout (60s)
+        const timeout = durationMs !== null ? durationMs : 60000;
         idleTimer = setTimeout(() => {
           if (!isTerminated) {
             if (totalBytesRecv === 0 && onLog) {
-              onLog('info', `${logTag} ℹ️ Speculative pre-connect for ${targetStr} idle for ${(timeout / 1000).toFixed(0)}s (reaped by hygiene).`);
+              onLog('info', `${logTag} ℹ️ Speculative connection for ${targetStr} idle for ${(timeout / 1000).toFixed(0)}s (closed by idle timer).`);
             }
             cleanup('idle_timeout');
           }

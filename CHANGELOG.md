@@ -4,6 +4,14 @@ All notable changes to the **Isolated Web Apps (IWAs) Direct Sockets Suite & Bro
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.30.1] - 2026-08-19
+
+### Fixed & Enhanced
+- **Optimized Handshake Dial Deadlines**: Increased `dialTimeoutMs` across attempts to 8s / 10s / 12s, eliminating false-positive handshake aborts under network latency.
+- **Extended Connection Keep-Alive**: Increased idle connection timeout from 15s to standard 60s, preserving browser HTTP/2 keep-alive socket pools and preventing premature speculative socket drops.
+
+---
+
 ## [v1.30.0] - 2026-08-19
 
 ### Changed & Streamlined (Per-UDPSocket Architecture Matching Original quicclient.go)

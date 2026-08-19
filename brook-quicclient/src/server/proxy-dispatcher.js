@@ -311,7 +311,7 @@ export class ProxyDispatcher {
           continue;
         }
 
-        const dialTimeoutMs = attempt === 1 ? 3500 : (attempt === 2 ? 4000 : 5000);
+        const dialTimeoutMs = attempt === 1 ? 8000 : (attempt === 2 ? 10000 : 12000);
         let outcome = null;
 
         try {
