@@ -36,7 +36,8 @@ export function getDcidHex(data) {
 }
 
 /**
- * Dedicated QUIC Session for a single Brook proxy tunnel.
+ * Dedicated QUIC Session for a single Brook proxy tunnel with its own dedicated UDPSocket.
+ * Strictly matches original Brook quicclient.go architecture (per-UDPSocket per-connect).
  */
 export class QuicSession {
   constructor({ manager, serverHost, serverPort, alpn = ['h3'], onLog }) {
@@ -46,6 +47,7 @@ export class QuicSession {
     this.alpn = Array.isArray(alpn) ? alpn : [alpn];
     this.onLog = onLog;
 
+    this.udpAdapter = null;
     this.quic = null;
     this.streamHandlers = new Map();
     this.isClosed = false;
@@ -103,6 +105,27 @@ export class QuicSession {
   async connect(timeoutMs = 25000) {
     if (this.isClosed) throw new Error('Session is closed');
 
+    // 1. Open dedicated Direct Sockets UDPSocket for this connection (matching original quicclient.go)
+    this.udpAdapter = new UdpSocketAdapter({
+      remoteAddress: this.serverHost,
+      remotePort: this.serverPort,
+      onDatagram: (data, fromAddr, fromPort) => {
+        this.feedDatagram(data, fromAddr, fromPort);
+      },
+      onError: (err) => {
+        if (!this.isClosed && this.onLog) {
+          this.onLog('warning', `[QUIC Session] Dedicated UDP socket error: ${err.message}`);
+        }
+      },
+      onClose: () => {
+        if (!this.isClosed) {
+          this.close();
+        }
+      }
+    });
+
+    await this.udpAdapter.open();
+
     return new Promise((resolve, reject) => {
       let isResolved = false;
       const timer = setTimeout(() => {
@@ -125,8 +148,8 @@ export class QuicSession {
 
       this.quic.on('packet', (data) => {
         this.lastActivity = Date.now();
-        if (!this.isClosed && this.manager) {
-          this.manager.sendDatagram(data);
+        if (!this.isClosed && this.udpAdapter) {
+          this.udpAdapter.send(data).catch(() => {});
         }
       });
 
@@ -137,6 +160,7 @@ export class QuicSession {
           this.isConnected = true;
           this.lastActivity = Date.now();
           this.lastPacketReceivedTime = Date.now();
+          if (this.manager) this.manager.registerSession(this);
           resolve(this);
         }
       });
@@ -170,20 +194,17 @@ export class QuicSession {
 
       this.quic.connect();
 
-      // Register Connection IDs with Manager
+      // Record Connection IDs if present
       if (this.quic.context) {
         if (this.quic.context.my_cids && this.quic.context.my_cids[0]) {
           this.scidHex = Array.from(this.quic.context.my_cids[0]).map(b => b.toString(16).padStart(2, '0')).join('');
-          if (this.manager) this.manager.registerCid(this.scidHex, this);
         }
         if (this.quic.context.original_dcid) {
           this.dcidHex = Array.from(this.quic.context.original_dcid).map(b => b.toString(16).padStart(2, '0')).join('');
-          if (this.manager) this.manager.registerCid(this.dcidHex, this);
         }
       }
     });
   }
-
 
   registerStream(streamId, handlers) {
     this.streamHandlers.set(streamId, handlers);
@@ -214,8 +235,6 @@ export class QuicSession {
 
     if (this.manager) {
       this.manager.unregisterSession(this);
-      if (this.scidHex) this.manager.unregisterCid(this.scidHex);
-      if (this.dcidHex) this.manager.unregisterCid(this.dcidHex);
     }
 
     for (const [id, handler] of this.streamHandlers.entries()) {
@@ -227,11 +246,17 @@ export class QuicSession {
       try { this.quic.close(0, 'close'); } catch (e) {}
       this.quic = null;
     }
+
+    if (this.udpAdapter) {
+      try { this.udpAdapter.close(); } catch (e) {}
+      this.udpAdapter = null;
+    }
   }
 }
 
 /**
- * Top-level Manager for Brook QUIC Client.
+ * Top-level Manager for Brook QUIC Client with Warm Standby Pool.
+ * Manages dedicated per-connect UDP sockets and 24 warm standby sessions.
  */
 export class QuicConnectionManager {
   constructor({ serverHost, serverPort, alpn = ['h3'], onStateChange, onLog }) {
@@ -240,8 +265,7 @@ export class QuicConnectionManager {
     this.alpn = Array.isArray(alpn) ? alpn : [alpn];
     this.onStateChange = onStateChange;
     this.state = ConnectionState.DISCONNECTED;
-    this.udpAdapter = null;
-    this.sessionsByCid = new Map(); // cidHex -> QuicSession
+    this.activeSessions = new Set(); // Active connected sessions in service
     this.warmPool = []; // Standby connected sessions ready to handle burst traffic with 0ms latency
     this.targetPoolSize = 24; // Healthy standby warm sessions pool (doubled for high concurrency)
     this.activeHandshakes = 0;
@@ -258,13 +282,34 @@ export class QuicConnectionManager {
   }
 
   getSnapshot(dispatcher = null) {
-    const udpStats = this.udpAdapter ? this.udpAdapter.getStats() : {
-      udpQueue: 0,
-      udpQueueMax: 0,
-      udpOldestMs: 0,
-      udpWriteMsP95: 0,
-      packetEvictions: 0
-    };
+    let totalUdpQueue = 0;
+    let maxUdpQueue = 0;
+    let maxUdpOldestMs = 0;
+    let writeDurations = [];
+    let totalPacketEvictions = 0;
+
+    // Aggregate stats across all active sessions and warm pool sessions
+    const allSessions = new Set([...this.warmPool, ...this.activeSessions]);
+    for (const session of allSessions) {
+      if (session.udpAdapter) {
+        const stats = session.udpAdapter.getStats();
+        totalUdpQueue += stats.udpQueue || 0;
+        if (stats.udpQueueMax > maxUdpQueue) maxUdpQueue = stats.udpQueueMax;
+        if (stats.udpOldestMs > maxUdpOldestMs) maxUdpOldestMs = stats.udpOldestMs;
+        totalPacketEvictions += stats.packetEvictions || 0;
+        if (session.udpAdapter.writeDurations) {
+          writeDurations = writeDurations.concat(session.udpAdapter.writeDurations);
+        }
+      }
+    }
+
+    let udpWriteMsP95 = 0;
+    if (writeDurations.length > 0) {
+      const sorted = writeDurations.sort((a, b) => a - b);
+      const idx = Math.min(sorted.length - 1, Math.floor(sorted.length * 0.95));
+      udpWriteMsP95 = Math.round(sorted[idx] * 10) / 10;
+    }
+
     const tunnelStats = (BrookTunnel && BrookTunnel.globalMetrics) ? BrookTunnel.globalMetrics.getStats() : {
       rxQueuedBytes: 0,
       uploadPendingBytes: 0,
@@ -278,28 +323,33 @@ export class QuicConnectionManager {
 
     return {
       warmStandby: this.warmPool.length,
-      activeSessions: this.sessionsByCid.size,
+      activeSessions: this.activeSessions.size,
       handshakes: this.activeHandshakes,
       handshakeQueue: this.handshakeQueue.length,
       hostQueueTotal: dispStats.hostQueueTotal,
-      udpQueue: udpStats.udpQueue,
-      udpQueueMax: udpStats.udpQueueMax,
-      udpOldestMs: udpStats.udpOldestMs,
-      udpWriteMsP95: udpStats.udpWriteMsP95,
+      udpQueue: totalUdpQueue,
+      udpQueueMax: maxUdpQueue,
+      udpOldestMs: maxUdpOldestMs,
+      udpWriteMsP95,
       uploadPendingBytes: tunnelStats.uploadPendingBytes,
       rxQueuedBytes: tunnelStats.rxQueuedBytes,
       writerWaitMs: tunnelStats.writerWaitMs,
       activeTunnels: dispStats.activeTunnels,
       retries: dispStats.retries,
-      packetEvictions: udpStats.packetEvictions,
+      packetEvictions: totalPacketEvictions,
       refillsStarted: this.refillsStarted,
       refillsCompleted: this.refillsCompleted,
       refillsFailed: this.refillsFailed
     };
   }
 
+  registerSession(session) {
+    this.activeSessions.add(session);
+  }
+
   unregisterSession(session) {
     this.warmPool = this.warmPool.filter(s => s !== session);
+    this.activeSessions.delete(session);
   }
 
   _setState(newState, details = '') {
@@ -315,20 +365,6 @@ export class QuicConnectionManager {
     }
   }
 
-  registerCid(cidHex, session) {
-    this.sessionsByCid.set(cidHex, session);
-  }
-
-  unregisterCid(cidHex) {
-    this.sessionsByCid.delete(cidHex);
-  }
-
-  sendDatagram(data) {
-    if (this.udpAdapter && !this.isClosed) {
-      this.udpAdapter.send(data).catch(() => {});
-    }
-  }
-
   _handleTransportFailure(err) {
     if (this.isClosed) return;
     this.isClosed = true;
@@ -340,10 +376,9 @@ export class QuicConnectionManager {
     while (this.handshakeQueue.length > 0) {
       const next = this.handshakeQueue.shift();
       if (next && next.reject) {
-        next.reject(err || new Error('UDP transport failed'));
+        next.reject(err || new Error('Transport failed'));
       }
     }
-    // Close all sessions cleanly (which triggers stream onClose and releases tunnels/permits)
     this._closeAllSessions('transport_failed');
   }
 
@@ -353,48 +388,23 @@ export class QuicConnectionManager {
     }
     this.warmPool = [];
 
-    const activeSessions = Array.from(this.sessionsByCid.values());
-    for (const session of activeSessions) {
+    const liveSessions = Array.from(this.activeSessions);
+    for (const session of liveSessions) {
       try { session.close(); } catch (e) {}
     }
-    this.sessionsByCid.clear();
+    this.activeSessions.clear();
   }
 
   /**
-   * Initial pre-flight connection verification and shared transport initialization.
+   * Initial pre-flight connection verification and warm pool initialization.
    */
   async connect() {
     if (this.isClosed) throw new Error('QuicConnectionManager is closed');
-    this._setState(ConnectionState.CONNECTING, 'Initializing UDP transport...');
-    this._log('info', `Initializing shared UDP transport with ${this.serverHost}:${this.serverPort}...`);
+    this._setState(ConnectionState.CONNECTING, 'Initializing QUIC warm pool...');
+    this._log('info', `Connecting to Brook QUIC server ${this.serverHost}:${this.serverPort} (per-UDPSocket architecture)...`);
 
     try {
-      this.udpAdapter = new UdpSocketAdapter({
-        remoteAddress: this.serverHost,
-        remotePort: this.serverPort,
-        onDatagram: (data, fromAddr, fromPort) => {
-          const dcidHex = getDcidHex(data);
-          if (dcidHex && this.sessionsByCid.has(dcidHex)) {
-            const session = this.sessionsByCid.get(dcidHex);
-            if (session && !session.isClosed) {
-              session.feedDatagram(data, fromAddr, fromPort);
-            }
-          }
-        },
-        onError: (err) => {
-          this._log('error', `UDP transport error: ${err.message}`);
-          this._setState(ConnectionState.ERROR, err.message);
-          this._handleTransportFailure(err);
-        },
-        onClose: () => {
-          this._setState(ConnectionState.DISCONNECTED, 'UDP transport closed');
-          this._handleTransportFailure(new Error('UDP transport closed unexpectedly'));
-        }
-      });
-
-      await this.udpAdapter.open();
-
-      // Preflight Handshake verification
+      // Preflight Handshake verification: connect initial session with dedicated UDPSocket
       const preflight = new QuicSession({
         manager: this,
         serverHost: this.serverHost,
@@ -407,9 +417,9 @@ export class QuicConnectionManager {
       this.warmPool.push(preflight);
 
       this._setState(ConnectionState.CONNECTED);
-      this._log('success', `✅ QUIC transport connected & persistent pool active (ALPN: ${this.alpn.join(',')})`);
+      this._log('success', `✅ QUIC server reached & warm pool active (ALPN: ${this.alpn.join(',')}, per-UDPSocket mode)`);
 
-      // Refill warm pool in background to target capacity
+      // Refill warm pool in background to target capacity (24 warm sessions)
       this._refillPool().catch(() => {});
 
       // Start periodic pool hygiene timer
@@ -440,7 +450,7 @@ export class QuicConnectionManager {
       this.warmPool = liveWarm;
 
       // Heartbeat event log every ~10s (every 4 cycles) to confirm keep-alive and transport activity
-      if (hygieneCycles % 4 === 0 && (this.warmPool.length > 0 || this.sessionsByCid.size > 0)) {
+      if (hygieneCycles % 4 === 0 && (this.warmPool.length > 0 || this.activeSessions.size > 0)) {
         let newestAckAgeSec = 999;
         for (const s of this.warmPool) {
           if (s.lastKeepAliveAckRecv) {
@@ -449,8 +459,8 @@ export class QuicConnectionManager {
           }
         }
         const ackInfo = newestAckAgeSec < 900 ? `latest ACK ${newestAckAgeSec.toFixed(1)}s ago` : 'awaiting ACK';
-        const udpQ = this.udpAdapter ? this.udpAdapter.sendQueue.length : 0;
-        this._log('info', `💓 [QUIC Pool] Standby: ${this.warmPool.length}/${this.targetPoolSize} | Active: ${this.sessionsByCid.size} | Handshakes: ${this.activeHandshakes} | UDP Queue: ${udpQ} (${ackInfo}).`);
+        const snapshot = this.getSnapshot();
+        this._log('info', `💓 [QUIC Pool] Standby: ${this.warmPool.length}/${this.targetPoolSize} | Active: ${this.activeSessions.size} | Handshakes: ${this.activeHandshakes} | UDP Queues: ${snapshot.udpQueue} (${ackInfo}).`);
       }
 
       // Refill if standby pool fell below target
@@ -685,14 +695,9 @@ export class QuicConnectionManager {
     }
     this.warmPool = [];
 
-    for (const session of this.sessionsByCid.values()) {
+    for (const session of this.activeSessions) {
       session.close();
     }
-    this.sessionsByCid.clear();
-
-    if (this.udpAdapter) {
-      await this.udpAdapter.close().catch(() => {});
-      this.udpAdapter = null;
-    }
+    this.activeSessions.clear();
   }
 }

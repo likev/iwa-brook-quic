@@ -1,8 +1,8 @@
 {
   "versions": [
     {
-      "version": "1.28.0",
-      "src": "https://t.iread.fun/downloads/iwa/dist/brook-quicclient-v1.28.0.swbn",
+      "version": "1.29.0",
+      "src": "https://t.iread.fun/downloads/iwa/dist/brook-quicclient-v1.29.0.swbn",
       "channels": [
         "default"
       ]

@@ -181,7 +181,7 @@ async function runUnitTests() {
   let warmClosed = false;
   let activeClosed = false;
   failMgr.warmPool.push({ isAlive: () => true, close: () => { warmClosed = true; } });
-  failMgr.registerCid('0102030405060708', { isAlive: () => true, close: () => { activeClosed = true; } });
+  failMgr.registerSession({ isAlive: () => true, close: () => { activeClosed = true; } });
   let queuedPermitRejected = false;
   failMgr.activeHandshakes = 8;
   failMgr._acquireHandshakePermit().catch((err) => { queuedPermitRejected = true; });
@@ -189,9 +189,9 @@ async function runUnitTests() {
   await new Promise(r => setTimeout(r, 10));
   assert(failMgr.isClosed === true, 'Transport failure marks manager as closed');
   assert(warmClosed === true, 'Transport failure closes all warm pool sessions');
-  assert(activeClosed === true, 'Transport failure closes all active CID sessions');
+  assert(activeClosed === true, 'Transport failure closes all active sessions');
   assert(failMgr.warmPool.length === 0, 'Warm pool is emptied on transport failure');
-  assert(failMgr.sessionsByCid.size === 0, 'Active CID sessions map is emptied on transport failure');
+  assert(failMgr.activeSessions.size === 0, 'Active sessions set is emptied on transport failure');
   assert(queuedPermitRejected === true, 'Queued handshake permits are rejected on transport failure');
 
   // Test QuicSession Strict Packet Receipt Watchdog (5s fast mobile failover)
@@ -314,13 +314,13 @@ async function runUnitTests() {
 
   // 3. QuicConnectionManager Transport Snapshot aggregation
   const snapshotMgr = new QuicConnectionManager({ serverHost: '127.0.0.1', serverPort: 4433 });
-  snapshotMgr.udpAdapter = mockUdpAdapter;
+  snapshotMgr.warmPool.push({ udpAdapter: mockUdpAdapter });
   snapshotMgr.targetPoolSize = 24;
   snapshotMgr.refillsStarted = 5;
   snapshotMgr.refillsCompleted = 4;
   snapshotMgr.refillsFailed = 1;
   const snapshot = snapshotMgr.getSnapshot({ getStats: () => ({ hostQueueTotal: 3, activeTunnels: 2, retries: 1 }) });
-  assert(snapshot.warmStandby === 0, 'Snapshot includes warmStandby count');
+  assert(snapshot.warmStandby === 1, 'Snapshot includes warmStandby count');
   assert(snapshot.udpQueue === 2, 'Snapshot includes udpQueue');
   assert(snapshot.udpQueueMax === 15, 'Snapshot includes udpQueueMax');
   assert(snapshot.udpWriteMsP95 > 0, 'Snapshot includes udpWriteMsP95');
