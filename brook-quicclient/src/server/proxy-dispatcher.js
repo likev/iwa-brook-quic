@@ -342,7 +342,9 @@ export class ProxyDispatcher {
               },
               onClose: () => {
                 releaseHostPermitOnce();
-                quicSession.close();
+                if (quicSession && !quicSession.isAlive()) {
+                  quicSession.close();
+                }
               },
               onLog: (lvl, msg) => this._log(lvl, msg)
             });
@@ -352,7 +354,9 @@ export class ProxyDispatcher {
               break; // Tunnel completed successfully
             } else {
               tunnelError = outcome.error || new Error(`Brook tunnel failed (${outcome.kind})`);
-              quicSession.close();
+              if (quicSession && !quicSession.isAlive()) {
+                quicSession.close();
+              }
 
               // Do not retry if client explicitly closed, or if payload data was already transmitted/consumed
               const bytesReceived = session ? session.bytesReceived : 0;
@@ -366,7 +370,9 @@ export class ProxyDispatcher {
             }
           } catch (err) {
             tunnelError = err;
-            quicSession.close();
+            if (quicSession && !quicSession.isAlive()) {
+              quicSession.close();
+            }
             const bytesReceived = session ? session.bytesReceived : 0;
             if (clientDataConsumed || proxyReplied || bytesReceived > 0 || err.message.includes('client_closed') || err.message.includes('client_abort') || err.message.includes('client_write_error')) {
               break;

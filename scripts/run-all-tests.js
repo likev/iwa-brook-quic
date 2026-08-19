@@ -190,6 +190,16 @@ async function runUnitTests() {
   mockSessionObj.lastPacketReceivedTime = Date.now();
   assert(mockSessionObj.isAlive() === true, 'QuicSession revived upon incoming packet receipt');
 
+  // Test QuicSession Multi-Stream Allocation & Connection Reuse (v1.20.0)
+  assert(mockSessionObj.canAcceptStream() === true, 'QuicSession can accept new stream');
+  const s0 = mockSessionObj.allocateStreamId();
+  const s4 = mockSessionObj.allocateStreamId();
+  const s8 = mockSessionObj.allocateStreamId();
+  assert(s0 === 0 && s4 === 4 && s8 === 8, `Multi-stream IDs match RFC 9000 client bidi sequence (0, 4, 8)`);
+  assert(mockSessionObj.activeStreams === 3, `QuicSession active streams count is 3 (${mockSessionObj.activeStreams})`);
+  mockSessionObj.releaseStream(s0);
+  assert(mockSessionObj.activeStreams === 2, `QuicSession active streams count decremented to 2 (${mockSessionObj.activeStreams})`);
+
   // Test ProxyDispatcher Per-Host Dial Permit Limiter
   const testDispatcher = new ProxyDispatcher({
     quicManager: null,
@@ -743,7 +753,7 @@ async function runE2ETests() {
     onLog: (lvl, msg) => console.log(`  [QUIC:${lvl}]`, msg)
   });
   await quicManager.connect();
-  assert(quicManager.warmPool.length >= 1, `Live preflight QUIC handshake established with ${SERVER_HOST}:${SERVER_PORT}`);
+  assert((quicManager.activeSessions.length + quicManager.warmPool.length) >= 1, `Live preflight QUIC handshake established with ${SERVER_HOST}:${SERVER_PORT}`);
 
   let sessionCount = 0;
   const dispatcher = new ProxyDispatcher({

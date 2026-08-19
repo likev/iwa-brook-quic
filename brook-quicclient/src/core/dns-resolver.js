@@ -117,9 +117,10 @@ export class DnsResolver {
 
   static async _resolveViaBrook(host, quicManager, password, { timeoutMs = 2000, withoutBrook = false, clockOffsetSec = 0 } = {}) {
     let session = null;
+    let streamId = null;
     try {
       session = await quicManager.createSession();
-      const streamId = session.allocateStreamId();
+      streamId = session.allocateStreamId();
 
       // Destination: 8.8.8.8:53 (TCP)
       const dstBytes = new Uint8Array([0x01, 8, 8, 8, 8, 0x00, 53]);
@@ -191,7 +192,13 @@ export class DnsResolver {
     } catch (e) {
       // Fallback
     } finally {
-      if (session) session.close();
+      if (session) {
+        if (session.releaseStream) {
+          session.releaseStream(streamId);
+        } else {
+          session.close();
+        }
+      }
     }
 
     return null;

@@ -140,7 +140,11 @@ export class BrookTunnel {
           idleTimer = null;
         }
 
-        quicManager.unregisterStream(streamId);
+        if (quicManager.releaseStream) {
+          quicManager.releaseStream(streamId);
+        } else if (quicManager.unregisterStream) {
+          quicManager.unregisterStream(streamId);
+        }
 
         // If dial never succeeded and client was not notified, signal error
         if (!serverHandshakeDone && !successSent && sendFailure && closeClientStreams) {

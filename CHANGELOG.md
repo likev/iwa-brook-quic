@@ -4,6 +4,19 @@ All notable changes to the **Isolated Web Apps (IWAs) Direct Sockets Suite & Bro
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.20.0] - 2026-08-19
+
+### Added & Fixed
+- **Persistent QUIC Connection Reuse & Multiplexing**: Eliminated "single-use disposable session" pattern where QUIC connections were destroyed upon each stream completion. Implemented RFC 9000 bidirectional stream multiplexing (`0, 4, 8, 12, 16...`) across persistent warm QUIC connections in [`QuicConnectionManager`](file:///root/downloads/iwa/brook-quicclient/src/quic/quic-connection-manager.js) and [`QuicSession`](file:///root/downloads/iwa/brook-quicclient/src/quic/quic-connection-manager.js).
+- **Zero-Latency Stream Allocation**: Subresources for heavy SPAs (e.g. `x.com`, `meta.ai`, `abs.twimg.com`) now dynamically share active persistent QUIC connections with capacity up to 8 streams per session, completely eliminating the 5.8s on-demand handshake queue delay during concurrency bursts.
+- **Stream-Level Cleanup in BrookTunnel & DnsResolver**: Updated [`BrookTunnel`](file:///root/downloads/iwa/brook-quicclient/src/core/brook-tunnel.js) and [`DnsResolver`](file:///root/downloads/iwa/brook-quicclient/src/core/dns-resolver.js) to release individual streams via `session.releaseStream(streamId)` upon tunnel or DNS query completion while keeping the underlying QUIC transport alive in the pool.
+
+### Tests
+- Added unit tests for RFC 9000 client bidirectional stream ID generation, capacity checks, and stream release.
+- Verified 81/81 test suite passing with 20 parallel website connections.
+
+---
+
 ## [v1.19.0] - 2026-08-19
 
 ### Fixed
