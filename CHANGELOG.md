@@ -4,6 +4,18 @@ All notable changes to the **Isolated Web Apps (IWAs) Direct Sockets Suite & Bro
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.26.0] - 2026-08-19
+
+### Changed & Fixed
+- **Transport Failure Teardown (Review8 P0)**: Implemented atomic `_handleTransportFailure()` in `QuicConnectionManager`. Unexpected UDP transport error or close immediately marks the manager closed, rejects queued handshake permits, and closes all active sessions and stream handlers, releasing all tunnels and permits.
+- **Accurate Outcome Classification (Review8 P0)**: Separated Brook dial initiation from target connection success. A tunnel is only classified as `success: true` if mutual clean FINs were exchanged or useful downstream data was delivered (`totalBytesRecv > 0`). Target dial refusals (0 bytes) and early transport drops are correctly classified as non-success, enabling clean retries and accurate metrics.
+- **Bounded Half-Close & Unblocked Teardown (Review8 P0)**: Wrapped `clientWriter.close()` with a non-blocking timeout, bounded post-FIN half-close to a strict 5-second maximum, and ensured transport `onClose` directly executes cleanup without deadlocking behind in-flight receive processing.
+- **Explicit `forceFresh` Session API (Review8 P1)**: Formalized `createSession({ forceFresh: true })` contract in `QuicConnectionManager` to explicitly bypass the standby pool when requested on dial retries.
+- **Single-Owner Stream Lock Release (Review8 P1)**: Eliminated concurrent `releaseLock()` races between `BrookTunnel` and `ProxyDispatcher`.
+- **Fast Anycast Clock Racing (Review8 P2)**: Upgraded `measureClockDrift()` to race parallel Anycast UTC probes via `Promise.any()`, eliminating startup delays.
+
+---
+
 ## [v1.25.0] - 2026-08-19
 
 ### Changed & Fixed

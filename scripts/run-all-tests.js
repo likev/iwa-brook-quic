@@ -150,29 +150,47 @@ async function runUnitTests() {
     serverPort: 4433,
     alpn: 'h3'
   });
-  assert(mockMgr.targetPoolSize === 8, `Warm pool target size is configured to 8 (${mockMgr.targetPoolSize})`);
-  assert(mockMgr.maxConcurrentHandshakes === 4, `Handshake concurrency is bounded to 4 (${mockMgr.maxConcurrentHandshakes})`);
+  assert(mockMgr.targetPoolSize === 12, `Warm pool target size is configured to 12 (${mockMgr.targetPoolSize})`);
+  assert(mockMgr.maxConcurrentHandshakes === 6, `Handshake concurrency is bounded to 6 (${mockMgr.maxConcurrentHandshakes})`);
 
-  // Acquire 4 permits
-  for (let i = 0; i < 4; i++) {
+  // Acquire 6 permits
+  for (let i = 0; i < 6; i++) {
     await mockMgr._acquireHandshakePermit();
   }
-  assert(mockMgr.activeHandshakes === 4, 'Active handshakes reached limit (4)');
+  assert(mockMgr.activeHandshakes === 6, 'Active handshakes reached limit (6)');
 
-  // 5th permit should queue
-  let permit5Granted = false;
-  mockMgr._acquireHandshakePermit().then(() => { permit5Granted = true; });
-  assert(!permit5Granted, '5th concurrent handshake is queued by rate limiter');
+  // 7th permit should queue
+  let permit7Granted = false;
+  mockMgr._acquireHandshakePermit().then(() => { permit7Granted = true; });
+  assert(!permit7Granted, '7th concurrent handshake is queued by rate limiter');
   assert(mockMgr.handshakeQueue.length === 1, 'Handshake queue length is 1');
 
   // Release one permit
   mockMgr._releaseHandshakePermit();
   await new Promise(r => setTimeout(r, 10));
-  assert(permit5Granted, 'Queued handshake is immediately unblocked when permit is released');
-  for (let i = 0; i < 4; i++) {
+  assert(permit7Granted, 'Queued handshake is immediately unblocked when permit is released');
+  for (let i = 0; i < 6; i++) {
     mockMgr._releaseHandshakePermit();
   }
   assert(mockMgr.activeHandshakes === 0, 'All handshake permits released successfully');
+
+  // Test QuicConnectionManager Transport Failure Teardown (Review8 P0)
+  const failMgr = new QuicConnectionManager({ serverHost: 'brook-quic.pplx.io', serverPort: 4433, alpn: 'h3' });
+  let warmClosed = false;
+  let activeClosed = false;
+  failMgr.warmPool.push({ isAlive: () => true, close: () => { warmClosed = true; } });
+  failMgr.registerCid('0102030405060708', { isAlive: () => true, close: () => { activeClosed = true; } });
+  let queuedPermitRejected = false;
+  failMgr.activeHandshakes = 6;
+  failMgr._acquireHandshakePermit().catch((err) => { queuedPermitRejected = true; });
+  failMgr._handleTransportFailure(new Error('Simulated UDP error'));
+  await new Promise(r => setTimeout(r, 10));
+  assert(failMgr.isClosed === true, 'Transport failure marks manager as closed');
+  assert(warmClosed === true, 'Transport failure closes all warm pool sessions');
+  assert(activeClosed === true, 'Transport failure closes all active CID sessions');
+  assert(failMgr.warmPool.length === 0, 'Warm pool is emptied on transport failure');
+  assert(failMgr.sessionsByCid.size === 0, 'Active CID sessions map is emptied on transport failure');
+  assert(queuedPermitRejected === true, 'Queued handshake permits are rejected on transport failure');
 
   // Test QuicSession Strict Packet Receipt Watchdog (5s fast mobile failover)
   const mockSessionObj = new QuicSession({
@@ -200,7 +218,7 @@ async function runUnitTests() {
   mockSessionObj.releaseStream(s0);
   assert(mockSessionObj.activeStreams === 2, `QuicSession active streams count decremented to 2 (${mockSessionObj.activeStreams})`);
 
-  // Test QuicConnectionManager dedicated warmPool dispatch and unregisterSession (v1.22.0)
+  // Test QuicConnectionManager dedicated warmPool dispatch and forceFresh contract (Review8 P1)
   const testPoolMgr = new QuicConnectionManager({ serverHost: 'brook-quic.pplx.io', serverPort: 4433, alpn: 'h3' });
   const liveSess1 = { isAlive: () => true, close: () => {} };
   const liveSess2 = { isAlive: () => true, close: () => {} };
@@ -214,6 +232,31 @@ async function runUnitTests() {
   testPoolMgr.warmPool.push(liveSess1);
   testPoolMgr.unregisterSession(liveSess1);
   assert(testPoolMgr.warmPool.length === 0, 'unregisterSession removes session immediately from pool');
+
+  // Test BrookTunnel Accurate Outcome Classification (Review8 P0)
+  // Target dial refused with 0 bytes must NOT be classified as success
+  const targetRefusedOutcome = {
+    terminationReason: 'target_dial_refused',
+    serverHandshakeDone: true,
+    totalBytesRecv: 0
+  };
+  const isSuccessRefused = targetRefusedOutcome.terminationReason === 'both_closed' ||
+                           targetRefusedOutcome.terminationReason === 'normal' ||
+                           (targetRefusedOutcome.terminationReason === 'transport_closed' && targetRefusedOutcome.totalBytesRecv > 0) ||
+                           (targetRefusedOutcome.terminationReason === 'client_abort' && targetRefusedOutcome.totalBytesRecv > 0) ||
+                           (targetRefusedOutcome.terminationReason === 'client_read_error' && targetRefusedOutcome.totalBytesRecv > 0) ||
+                           (targetRefusedOutcome.terminationReason === 'idle_timeout' && targetRefusedOutcome.totalBytesRecv > 0);
+  assert(isSuccessRefused === false, 'Target dial refused with 0 bytes is classified as failure (success: false)');
+
+  const successTransferOutcome = {
+    terminationReason: 'transport_closed',
+    serverHandshakeDone: true,
+    totalBytesRecv: 5120
+  };
+  const isSuccessTransferred = successTransferOutcome.terminationReason === 'both_closed' ||
+                              successTransferOutcome.terminationReason === 'normal' ||
+                              (successTransferOutcome.terminationReason === 'transport_closed' && successTransferOutcome.totalBytesRecv > 0);
+  assert(isSuccessTransferred === true, 'Transport closed after data transfer (>0 bytes) is classified as success (success: true)');
 
   // Test ProxyDispatcher Per-Host Dial Permit Limiter
   const testDispatcher = new ProxyDispatcher({

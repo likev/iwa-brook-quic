@@ -242,9 +242,9 @@ export class QuicConnectionManager {
     this.udpAdapter = null;
     this.sessionsByCid = new Map(); // cidHex -> QuicSession
     this.warmPool = []; // Standby connected sessions ready to handle burst traffic with 0ms latency
-    this.targetPoolSize = 8; // Healthy standby warm sessions pool (optimal for browser Direct Sockets)
+    this.targetPoolSize = 12; // Healthy standby warm sessions pool
     this.activeHandshakes = 0;
-    this.maxConcurrentHandshakes = 4;
+    this.maxConcurrentHandshakes = 6;
     this.handshakeQueue = [];
     this._isRefilling = false;
     this._hygieneTimer = null;
@@ -280,6 +280,24 @@ export class QuicConnectionManager {
     if (this.udpAdapter && !this.isClosed) {
       this.udpAdapter.send(data).catch(() => {});
     }
+  }
+
+  _handleTransportFailure(err) {
+    if (this.isClosed) return;
+    this.isClosed = true;
+    if (this._hygieneTimer) {
+      clearInterval(this._hygieneTimer);
+      this._hygieneTimer = null;
+    }
+    // Reject all pending queued handshake permits
+    while (this.handshakeQueue.length > 0) {
+      const next = this.handshakeQueue.shift();
+      if (next && next.reject) {
+        next.reject(err || new Error('UDP transport failed'));
+      }
+    }
+    // Close all sessions cleanly (which triggers stream onClose and releases tunnels/permits)
+    this._closeAllSessions('transport_failed');
   }
 
   _closeAllSessions(reason = 'transport_closed') {
@@ -319,9 +337,11 @@ export class QuicConnectionManager {
         onError: (err) => {
           this._log('error', `UDP transport error: ${err.message}`);
           this._setState(ConnectionState.ERROR, err.message);
+          this._handleTransportFailure(err);
         },
         onClose: () => {
           this._setState(ConnectionState.DISCONNECTED, 'UDP transport closed');
+          this._handleTransportFailure(new Error('UDP transport closed unexpectedly'));
         }
       });
 
@@ -475,19 +495,24 @@ export class QuicConnectionManager {
   /**
    * Acquire a dedicated, pre-connected QUIC session (from warm standby pool for 0ms latency, or created on demand).
    * Each proxy tunnel receives its own isolated QUIC connection with a pristine 100% flow-control window.
+   * @param {Object} [options]
+   * @param {boolean} [options.forceFresh=false] When true, bypasses warm pool and creates a fresh session
    * @returns {Promise<QuicSession>}
    */
-  async createSession() {
+  async createSession(options = {}) {
     if (this.isClosed) throw new Error('QuicConnectionManager is closed');
+    const { forceFresh = false } = options;
 
-    // 1. Check warm standby pool for 0ms latency with strict liveness verification
-    while (this.warmPool.length > 0) {
-      const session = this.warmPool.shift();
-      if (session && session.isAlive(45000)) {
-        this._refillPool().catch(() => {});
-        return session;
-      } else if (session) {
-        session.close(); // Clean up stale corpse
+    // 1. Check warm standby pool for 0ms latency unless forceFresh is requested
+    if (!forceFresh) {
+      while (this.warmPool.length > 0) {
+        const session = this.warmPool.shift();
+        if (session && session.isAlive(45000)) {
+          this._refillPool().catch(() => {});
+          return session;
+        } else if (session) {
+          session.close(); // Clean up stale corpse
+        }
       }
     }
 
@@ -515,27 +540,31 @@ export class QuicConnectionManager {
 
   /**
    * Measure network clock drift (in seconds) between local machine and standard UTC server.
-   * Probes multiple fast Anycast UTC endpoints in parallel with AbortController timeout.
+   * Probes multiple fast Anycast UTC endpoints in parallel, returning the fastest valid response.
    * @returns {Promise<number>}
    */
   static async measureClockDrift() {
     const fetchWithTimeout = async (url, parseFn) => {
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 3000);
+      const timer = setTimeout(() => controller.abort(), 2000);
       try {
         const start = Date.now();
         const resp = await fetch(url, { cache: 'no-store', signal: controller.signal });
         clearTimeout(timer);
         const rtt = Date.now() - start;
-        return parseFn(resp, rtt, start);
+        const result = await parseFn(resp, rtt, start);
+        if (typeof result === 'number' && !isNaN(result)) {
+          return result;
+        }
+        throw new Error('Invalid clock parse');
       } catch (e) {
         clearTimeout(timer);
-        return null;
+        throw e;
       }
     };
 
     const tasks = [
-      // 1. Cloudflare Anycast Trace
+      // 1. Cloudflare Anycast Trace (ultra-fast)
       fetchWithTimeout('https://cloudflare.com/cdn-cgi/trace', async (resp, rtt, start) => {
         const text = await resp.text();
         const m = text.match(/ts=([0-9.]+)/);
@@ -569,11 +598,9 @@ export class QuicConnectionManager {
     ];
 
     try {
-      const results = await Promise.allSettled(tasks);
-      for (const res of results) {
-        if (res.status === 'fulfilled' && typeof res.value === 'number' && !isNaN(res.value)) {
-          return res.value;
-        }
+      const fastResult = await Promise.any(tasks);
+      if (typeof fastResult === 'number' && !isNaN(fastResult)) {
+        return fastResult;
       }
     } catch (e) {}
 
