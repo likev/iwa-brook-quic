@@ -4,6 +4,19 @@ All notable changes to the **Isolated Web Apps (IWAs) Direct Sockets Suite & Bro
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.18.0] - 2026-08-19
+
+### Fixed
+- **Reader Lock Preservation Across Retries**: Fixed `ReadableStreamDefaultReader` release/cancel timing in [`BrookTunnel`](file:///root/downloads/iwa/brook-quicclient/src/core/brook-tunnel.js). When an initial dial times out or is refused, the client reader and writer are preserved without being cancelled or having their locks released (`closeClientStreams: false`), allowing subsequent retry attempts 2 and 3 to seamlessly reuse the client stream without `TypeError: This readable stream reader has been released`.
+- **Post-Connect Dial Verification Timer**: Shifted the dial verification timer in [`BrookTunnel`](file:///root/downloads/iwa/brook-quicclient/src/core/brook-tunnel.js) to start **strictly after** the QUIC session is connected and the client nonce/header are dispatched on the wire, decoupling dial timeout measurement from on-demand TLS/QUIC connection latency.
+- **Adjusted Dial Timeout Intervals**: Set dial timeout intervals in [`ProxyDispatcher`](file:///root/downloads/iwa/brook-quicclient/src/server/proxy-dispatcher.js) to **3.5s** (attempt 1), **4.0s** (attempt 2), and **5.0s** (attempt 3), providing sufficient headroom for high-latency target server dials while recovering quickly from dropped routes.
+- **Quiet TCP Keep-Alive Expirations**: Suppressed erroneous warning logs when long-lived HTTP keep-alive streams cleanly expire on idle timeout after exchanging payload data.
+
+### Changed
+- **Expanded QUIC Warm Pool**: Increased `targetPoolSize` to **35 warm sessions** and `maxConcurrentHandshakes` to **12** in [`QuicConnectionManager`](file:///root/downloads/iwa/brook-quicclient/src/quic/quic-connection-manager.js), with batch refill size of 8, eliminating on-demand handshake delays during 30+ request bursts on modern SPAs (e.g. `meta.ai`).
+
+---
+
 ## [v1.17.0] - 2026-08-19
 
 ### Fixed

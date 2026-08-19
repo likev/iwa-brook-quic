@@ -216,9 +216,9 @@ export class QuicConnectionManager {
     this.udpAdapter = null;
     this.sessionsByCid = new Map(); // cidHex -> QuicSession
     this.warmPool = [];
-    this.targetPoolSize = 20;
+    this.targetPoolSize = 35;
     this.activeHandshakes = 0;
-    this.maxConcurrentHandshakes = 8;
+    this.maxConcurrentHandshakes = 12;
     this.handshakeQueue = [];
     this._isRefilling = false;
     this._hygieneTimer = null;
@@ -386,7 +386,7 @@ export class QuicConnectionManager {
 
     try {
       while (this.warmPool.length < targetSize && !this.isClosed) {
-        const needed = Math.min(6, targetSize - this.warmPool.length); // Refill up to 6 parallel sessions
+        const needed = Math.min(8, targetSize - this.warmPool.length); // Refill up to 8 parallel sessions
         const refillTasks = Array.from({ length: needed }).map(async () => {
           try {
             await this._acquireHandshakePermit(false);

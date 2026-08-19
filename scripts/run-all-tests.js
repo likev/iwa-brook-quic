@@ -150,38 +150,28 @@ async function runUnitTests() {
     serverPort: 4433,
     alpn: 'h3'
   });
-  assert(mockMgr.targetPoolSize === 20, `Warm pool target size is expanded to 20 (${mockMgr.targetPoolSize})`);
-  assert(mockMgr.maxConcurrentHandshakes === 8, `Handshake concurrency is bounded to 8 (${mockMgr.maxConcurrentHandshakes})`);
+  assert(mockMgr.targetPoolSize === 35, `Warm pool target size is expanded to 35 (${mockMgr.targetPoolSize})`);
+  assert(mockMgr.maxConcurrentHandshakes === 12, `Handshake concurrency is bounded to 12 (${mockMgr.maxConcurrentHandshakes})`);
 
-  // Acquire 8 permits
-  await mockMgr._acquireHandshakePermit();
-  await mockMgr._acquireHandshakePermit();
-  await mockMgr._acquireHandshakePermit();
-  await mockMgr._acquireHandshakePermit();
-  await mockMgr._acquireHandshakePermit();
-  await mockMgr._acquireHandshakePermit();
-  await mockMgr._acquireHandshakePermit();
-  await mockMgr._acquireHandshakePermit();
-  assert(mockMgr.activeHandshakes === 8, 'Active handshakes reached limit (8)');
+  // Acquire 12 permits
+  for (let i = 0; i < 12; i++) {
+    await mockMgr._acquireHandshakePermit();
+  }
+  assert(mockMgr.activeHandshakes === 12, 'Active handshakes reached limit (12)');
 
-  // 9th permit should queue
-  let permit9Granted = false;
-  mockMgr._acquireHandshakePermit().then(() => { permit9Granted = true; });
-  assert(!permit9Granted, '9th concurrent handshake is queued by rate limiter');
+  // 13th permit should queue
+  let permit13Granted = false;
+  mockMgr._acquireHandshakePermit().then(() => { permit13Granted = true; });
+  assert(!permit13Granted, '13th concurrent handshake is queued by rate limiter');
   assert(mockMgr.handshakeQueue.length === 1, 'Handshake queue length is 1');
 
   // Release one permit
   mockMgr._releaseHandshakePermit();
   await new Promise(r => setTimeout(r, 10));
-  assert(permit9Granted, 'Queued handshake is immediately unblocked when permit is released');
-  mockMgr._releaseHandshakePermit();
-  mockMgr._releaseHandshakePermit();
-  mockMgr._releaseHandshakePermit();
-  mockMgr._releaseHandshakePermit();
-  mockMgr._releaseHandshakePermit();
-  mockMgr._releaseHandshakePermit();
-  mockMgr._releaseHandshakePermit();
-  mockMgr._releaseHandshakePermit();
+  assert(permit13Granted, 'Queued handshake is immediately unblocked when permit is released');
+  for (let i = 0; i < 12; i++) {
+    mockMgr._releaseHandshakePermit();
+  }
   assert(mockMgr.activeHandshakes === 0, 'All handshake permits released successfully');
 
   // Test QuicSession Strict Packet Receipt Watchdog (5s fast mobile failover)
@@ -245,6 +235,68 @@ async function runUnitTests() {
   });
   assert(!tunnelSuccessCalled, 'sendSuccess is NOT called prematurely on dial timeout');
   assert(tunnelFailureCode === 0x05, 'sendFailure(0x05) is sent to client upon dial timeout');
+
+  // Test BrookTunnel Reader Lock Preservation across Retries (v1.18.0)
+  let retryReaderCancelled = false;
+  let retryReaderReleased = false;
+  let retryReadCount = 0;
+  const retryReader = {
+    read: async () => {
+      retryReadCount++;
+      if (retryReadCount === 1) {
+        return { value: new Uint8Array([1, 2, 3]), done: false };
+      }
+      return { value: null, done: true };
+    },
+    cancel: async () => { retryReaderCancelled = true; },
+    releaseLock: () => { retryReaderReleased = true; }
+  };
+  const retryWriter = { write: async () => {}, close: async () => {}, releaseLock: () => {} };
+
+  // Attempt 1: dial times out with closeClientStreams: false
+  const outcome1 = await BrookTunnel.run({
+    clientReader: retryReader,
+    clientWriter: retryWriter,
+    quicManager: stubSession,
+    dstBytes: new Uint8Array([0x01, 1, 1, 1, 1, 0, 80]),
+    password: '271828brook',
+    targetStr: '1.1.1.1:80',
+    sessionId: 'test-retry-1',
+    dialTimeoutMs: 20,
+    closeClientStreams: false
+  });
+  assert(outcome1.success === false, 'Attempt 1 fails on dial timeout');
+  assert(!retryReaderCancelled, 'clientReader is NOT cancelled when closeClientStreams is false (retry preserved)');
+  assert(!retryReaderReleased, 'clientReader lock is NOT released on retryable failure');
+
+  // Attempt 2: retry with the same retryReader succeeds
+  let attempt2Cb = null;
+  const attempt2Session = {
+    allocateStreamId: () => 0,
+    registerStream: (id, cb) => { attempt2Cb = cb; },
+    unregisterStream: () => {},
+    ensureConnected: async () => {},
+    sendStreamData: async () => {}
+  };
+  let attempt2Success = false;
+  const attempt2Promise = BrookTunnel.run({
+    clientReader: retryReader,
+    clientWriter: retryWriter,
+    quicManager: attempt2Session,
+    dstBytes: new Uint8Array([0x01, 1, 1, 1, 1, 0, 80]),
+    password: '271828brook',
+    targetStr: '1.1.1.1:80',
+    sessionId: 'test-retry-2',
+    dialTimeoutMs: 2000,
+    sendSuccess: async () => { attempt2Success = true; },
+    closeClientStreams: true
+  });
+  await new Promise(r => setTimeout(r, 10));
+  attempt2Cb.onData(new Uint8Array(12).fill(0xee), false); // Server nonce
+  await new Promise(r => setTimeout(r, 10));
+  attempt2Cb.onData(new Uint8Array(0), true); // Close
+  const outcome2 = await attempt2Promise;
+  assert(attempt2Success, 'Attempt 2 successfully completed handshake using preserved clientReader');
 
   // Test BrookTunnel Immediate Termination on 0-Byte Target Dial Refusal
   let refusalCleanedUp = false;
@@ -320,7 +372,7 @@ async function runUnitTests() {
 
   // Test QuicConnectionManager close() Draining Queued Handshake Permits
   const closeMgr = new QuicConnectionManager({ serverHost: 'brook-quic.pplx.io', serverPort: 4433, alpn: 'h3' });
-  for (let i = 0; i < 8; i++) await closeMgr._acquireHandshakePermit();
+  for (let i = 0; i < 12; i++) await closeMgr._acquireHandshakePermit();
   let permitRejectionReceived = false;
   closeMgr._acquireHandshakePermit().catch(err => {
     if (err.message.includes('closed')) permitRejectionReceived = true;

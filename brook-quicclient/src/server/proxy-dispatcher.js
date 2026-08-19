@@ -313,8 +313,9 @@ export class ProxyDispatcher {
             continue;
           }
 
-          // Fast 2.0s dial timeout on initial attempt, 2.2s on retry 2, 2.5s on retry 3
-          const dialTimeoutMs = attempt === 1 ? 2000 : (attempt === 2 ? 2200 : 2500);
+          // Fast 3.5s dial timeout on initial attempt, 4.0s on retry 2, 5.0s on retry 3
+          // Started only after QUIC session is connected and frames are on the wire
+          const dialTimeoutMs = attempt === 1 ? 3500 : (attempt === 2 ? 4000 : 5000);
           let outcome = null;
 
           try {
@@ -332,6 +333,7 @@ export class ProxyDispatcher {
               sendSuccess: sendSuccessOnce,
               sendFailure: attempt === MAX_ATTEMPTS ? sendFailureOnce : null,
               dialTimeoutMs,
+              closeClientStreams: attempt === MAX_ATTEMPTS,
               onClientDataRead: () => {
                 clientDataConsumed = true;
               },
@@ -378,7 +380,12 @@ export class ProxyDispatcher {
         if (tunnelError) {
           releaseHostPermitOnce();
           await sendFailureOnce(0x05);
-          throw tunnelError;
+          // Normal keep-alive socket expiration after data exchange is not a critical error
+          if (tunnelError.message.includes('idle_timeout') && session && session.bytesReceived > 0) {
+            // Quiet normal termination
+          } else {
+            throw tunnelError;
+          }
         }
       } finally {
         releaseHostPermitOnce();
@@ -387,7 +394,9 @@ export class ProxyDispatcher {
         }
       }
     } catch (err) {
-      this._log('warning', `Proxy session error: ${err.message}`);
+      if (!err.message.includes('idle_timeout')) {
+        this._log('warning', `Proxy session error: ${err.message}`);
+      }
 
       try { if (reader) { await reader.cancel().catch(() => {}); reader.releaseLock(); } } catch (e) {}
       try { if (writer) { await writer.close().catch(() => {}); writer.releaseLock(); } } catch (e) {}
