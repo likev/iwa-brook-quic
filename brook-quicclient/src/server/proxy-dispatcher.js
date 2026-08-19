@@ -280,11 +280,16 @@ export class ProxyDispatcher {
             throw new Error('ProxyDispatcher was stopped during dial attempt');
           }
 
+          // Adaptive clock offset rotation: Probe ±30s on handshake_timeout retries to resolve server expiration
+          let offsetToUse = this.clockOffsetSec;
+          if (attempt === 2) offsetToUse = this.clockOffsetSec + 30;
+          if (attempt === 3) offsetToUse = this.clockOffsetSec - 30;
+
           // Resolve domain name to IPv4 locally via Brook DNS resolver (Anycast round-robin distribution)
           let forwardDstBytes = dstBytes;
           const resolvedIp = await DnsResolver.resolveIpv4(host, this.quicManager, this.password, {
             withoutBrook: this.withoutBrook,
-            clockOffsetSec: this.clockOffsetSec,
+            clockOffsetSec: offsetToUse,
             timeoutMs: 2500
           }).catch(() => null);
 
@@ -327,13 +332,19 @@ export class ProxyDispatcher {
               leftover,
               password: this.password,
               withoutBrook: this.withoutBrook,
-              clockOffsetSec: this.clockOffsetSec,
+              clockOffsetSec: offsetToUse,
               targetStr,
               sessionId: session.id,
               sendSuccess: sendSuccessOnce,
               sendFailure: attempt === MAX_ATTEMPTS ? sendFailureOnce : null,
               dialTimeoutMs,
               closeClientStreams: attempt === MAX_ATTEMPTS,
+              onHandshakeDone: () => {
+                if (offsetToUse !== this.clockOffsetSec) {
+                  this._log('info', `[#${session.id}] ⏱️ Clock drift auto-calibrated from ${this.clockOffsetSec}s -> ${offsetToUse}s`);
+                  this.clockOffsetSec = offsetToUse;
+                }
+              },
               onClientDataRead: () => {
                 clientDataConsumed = true;
               },

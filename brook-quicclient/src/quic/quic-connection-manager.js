@@ -514,25 +514,68 @@ export class QuicConnectionManager {
 
   /**
    * Measure network clock drift (in seconds) between local machine and standard UTC server.
-   * Uses AbortController with 2.5s timeout to prevent startup stalls.
+   * Probes multiple fast Anycast UTC endpoints in parallel with AbortController timeout.
    * @returns {Promise<number>}
    */
   static async measureClockDrift() {
-    try {
+    const fetchWithTimeout = async (url, parseFn) => {
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 2500);
-      const start = Date.now();
-      const resp = await fetch('https://httpbin.org/ip', { cache: 'no-store', signal: controller.signal });
-      clearTimeout(timer);
-      const dateHeader = resp.headers.get('date');
-      if (dateHeader) {
-        const serverTime = new Date(dateHeader).getTime();
+      const timer = setTimeout(() => controller.abort(), 3000);
+      try {
+        const start = Date.now();
+        const resp = await fetch(url, { cache: 'no-store', signal: controller.signal });
+        clearTimeout(timer);
         const rtt = Date.now() - start;
-        const estimatedServerNow = serverTime + Math.round(rtt / 2);
-        const offsetSec = Math.round((estimatedServerNow - Date.now()) / 1000);
-        return offsetSec;
+        return parseFn(resp, rtt, start);
+      } catch (e) {
+        clearTimeout(timer);
+        return null;
+      }
+    };
+
+    const tasks = [
+      // 1. Cloudflare Anycast Trace
+      fetchWithTimeout('https://cloudflare.com/cdn-cgi/trace', async (resp, rtt, start) => {
+        const text = await resp.text();
+        const m = text.match(/ts=([0-9.]+)/);
+        if (m && m[1]) {
+          const serverSec = parseFloat(m[1]);
+          const localSec = (start + Math.round(rtt / 2)) / 1000;
+          return Math.round(serverSec - localSec);
+        }
+        return null;
+      }),
+      // 2. WorldTimeAPI UTC
+      fetchWithTimeout('https://worldtimeapi.org/api/timezone/Etc/UTC', async (resp, rtt, start) => {
+        const json = await resp.json();
+        if (json && json.unixtime) {
+          const serverSec = json.unixtime;
+          const localSec = (start + Math.round(rtt / 2)) / 1000;
+          return Math.round(serverSec - localSec);
+        }
+        return null;
+      }),
+      // 3. HTTP Date header fallback
+      fetchWithTimeout('https://httpbin.org/ip', async (resp, rtt, start) => {
+        const dateHeader = resp.headers.get('date');
+        if (dateHeader) {
+          const serverTime = new Date(dateHeader).getTime();
+          const localTime = start + Math.round(rtt / 2);
+          return Math.round((serverTime - localTime) / 1000);
+        }
+        return null;
+      })
+    ];
+
+    try {
+      const results = await Promise.allSettled(tasks);
+      for (const res of results) {
+        if (res.status === 'fulfilled' && typeof res.value === 'number' && !isNaN(res.value)) {
+          return res.value;
+        }
       }
     } catch (e) {}
+
     return 0;
   }
 

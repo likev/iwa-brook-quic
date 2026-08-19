@@ -4,6 +4,15 @@ All notable changes to the **Isolated Web Apps (IWAs) Direct Sockets Suite & Bro
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.23.0] - 2026-08-19
+
+### Changed & Fixed
+- **Multi-Source Resilient Clock Synchronization**: Upgraded `QuicConnectionManager.measureClockDrift()` to query multiple Anycast UTC endpoints in parallel (Cloudflare trace, WorldTimeAPI, HTTP Date headers) to accurately synchronize against Brook Go server timestamp enforcement (`abs(diff) < 60s`).
+- **Adaptive Dial Retry Clock Offset Rotation**: Implemented dynamic ±30s offset probing on handshake timeout retries in `ProxyDispatcher`. Automatically locks in the calibrated clock drift offset upon successful handshake (`onHandshakeDone`) across all future proxy requests.
+- **Eliminated Boundary Oscillation**: Completely resolves the periodic 60-second boundary stall/drop where dials oscillated between succeeding in 230ms and hanging for 3.5s–5.0s on server `WaitReadErr`.
+
+---
+
 ## [v1.22.0] - 2026-08-19
 
 ### Changed & Fixed
