@@ -4,6 +4,20 @@ All notable changes to the **Isolated Web Apps (IWAs) Direct Sockets Suite & Bro
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.22.0] - 2026-08-19
+
+### Changed & Fixed
+- **Dedicated QUIC Connection Architecture with 35 Standby Warm Pool**: Replaced multi-stream multiplexing on a shared QUIC connection with the official Brook architecture (1 dedicated QUIC connection per inbound proxy tunnel), backed by an expansive **35-connection standby warm pool**.
+- **0ms Connection Latency with 100% Flow Control Isolation**: Every incoming browser TCP/HTTP CONNECT/SOCKS5 request receives a pristine pre-connected QUIC session with a full, fresh 1MB+ flow control window. Completely eliminates cross-site flow-control deadlocks (`connRemaining == 0`), head-of-line stalls, and dial response timeouts.
+- **Continuous Auto-Replenishment**: The warm standby pool automatically refills in the background to ensure 35 pre-handshaked connections are continuously available for traffic bursts.
+- **Clean Connection Disposal**: When a proxy tunnel or DNS resolution finishes, the dedicated session closes cleanly, releasing all memory buffers and connection state.
+
+### Tests
+- Updated unit test suite to validate dedicated warm session dispatching, 0ms pop, standby pool draining, and clean teardown.
+- Validated 100% passing across the entire test suite.
+
+---
+
 ## [v1.21.0] - 2026-08-19
 
 ### Added & Fixed

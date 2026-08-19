@@ -200,18 +200,20 @@ async function runUnitTests() {
   mockSessionObj.releaseStream(s0);
   assert(mockSessionObj.activeStreams === 2, `QuicSession active streams count decremented to 2 (${mockSessionObj.activeStreams})`);
 
-  // Test QuicConnectionManager unregisterSession on close and forceFresh createSession (v1.21.0)
+  // Test QuicConnectionManager dedicated warmPool dispatch and unregisterSession (v1.22.0)
   const testPoolMgr = new QuicConnectionManager({ serverHost: 'brook-quic.pplx.io', serverPort: 4433, alpn: 'h3' });
-  const liveSess1 = { isAlive: () => true, canAcceptStream: () => true, activeStreams: 0, close: () => {} };
-  const liveSess2 = { isAlive: () => true, canAcceptStream: () => true, activeStreams: 0, close: () => {} };
-  testPoolMgr.activeSessions.push(liveSess1);
+  const liveSess1 = { isAlive: () => true, close: () => {} };
+  const liveSess2 = { isAlive: () => true, close: () => {} };
+  testPoolMgr.warmPool.push(liveSess1);
   testPoolMgr.warmPool.push(liveSess2);
-  const reusedSess = await testPoolMgr.createSession({ forceFresh: false });
-  assert(reusedSess === liveSess1, 'createSession without forceFresh reuses active persistent session');
-  const freshSess = await testPoolMgr.createSession({ forceFresh: true });
-  assert(freshSess === liveSess2, 'createSession with forceFresh: true bypasses active sessions and grabs fresh standby session');
+  const sessA = await testPoolMgr.createSession();
+  assert(sessA === liveSess1, 'createSession pops dedicated warm session from pool with 0ms latency');
+  const sessB = await testPoolMgr.createSession();
+  assert(sessB === liveSess2, 'createSession pops second warm session from pool');
+  assert(testPoolMgr.warmPool.length === 0, 'warmPool is drained as sessions are dispatched to dedicated tunnels');
+  testPoolMgr.warmPool.push(liveSess1);
   testPoolMgr.unregisterSession(liveSess1);
-  assert(testPoolMgr.activeSessions.length === 1 && testPoolMgr.warmPool.length === 0, 'unregisterSession removes session immediately from pool');
+  assert(testPoolMgr.warmPool.length === 0, 'unregisterSession removes session immediately from pool');
 
   // Test ProxyDispatcher Per-Host Dial Permit Limiter
   const testDispatcher = new ProxyDispatcher({
@@ -766,7 +768,7 @@ async function runE2ETests() {
     onLog: (lvl, msg) => console.log(`  [QUIC:${lvl}]`, msg)
   });
   await quicManager.connect();
-  assert((quicManager.activeSessions.length + quicManager.warmPool.length) >= 1, `Live preflight QUIC handshake established with ${SERVER_HOST}:${SERVER_PORT}`);
+  assert(quicManager.warmPool.length >= 1, `Live preflight QUIC handshake established with ${SERVER_HOST}:${SERVER_PORT}`);
 
   let sessionCount = 0;
   const dispatcher = new ProxyDispatcher({

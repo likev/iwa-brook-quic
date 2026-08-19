@@ -193,11 +193,7 @@ export class DnsResolver {
       // Fallback
     } finally {
       if (session) {
-        if (session.releaseStream) {
-          session.releaseStream(streamId);
-        } else {
-          session.close();
-        }
+        session.close();
       }
     }
 

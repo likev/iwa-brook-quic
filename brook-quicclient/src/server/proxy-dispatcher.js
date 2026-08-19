@@ -342,7 +342,7 @@ export class ProxyDispatcher {
               },
               onClose: () => {
                 releaseHostPermitOnce();
-                if (quicSession && !quicSession.isAlive()) {
+                if (quicSession) {
                   quicSession.close();
                 }
               },
@@ -354,7 +354,7 @@ export class ProxyDispatcher {
               break; // Tunnel completed successfully
             } else {
               tunnelError = outcome.error || new Error(`Brook tunnel failed (${outcome.kind})`);
-              if (quicSession && !quicSession.isAlive()) {
+              if (quicSession) {
                 quicSession.close();
               }
 
