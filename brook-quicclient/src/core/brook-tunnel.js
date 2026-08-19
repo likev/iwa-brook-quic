@@ -107,8 +107,8 @@ export class BrookTunnel {
     const resetIdleTimer = (durationMs = null) => {
       if (idleTimer) clearTimeout(idleTimer);
       if (!isTerminated) {
-        // Speculative pre-connect with 0 received bytes only gets 15s to quickly release unused resources
-        const timeout = durationMs !== null ? durationMs : (totalBytesRecv > 0 ? 180000 : 15000);
+        // Active data tunnels get 30s idle timeout; speculative pre-connects get 15s
+        const timeout = durationMs !== null ? durationMs : (totalBytesRecv > 0 ? 30000 : 15000);
         idleTimer = setTimeout(() => {
           if (!isTerminated) {
             if (totalBytesRecv === 0 && onLog) {
@@ -458,6 +458,10 @@ export class BrookTunnel {
               await quicManager.sendStreamData(streamId, new Uint8Array(0), true);
             } catch (e) {}
             checkFullClose();
+            if (!isTerminated && !serverRxClosed) {
+              // Client closed its write side; give server at most 2s to complete response
+              resetIdleTimer(2000);
+            }
             break;
           }
 
@@ -466,7 +470,7 @@ export class BrookTunnel {
               onClientDataRead();
             }
             hasExchangedData = true;
-            resetIdleTimer(serverRxClosed ? 5000 : (totalBytesRecv > 0 ? 180000 : 15000));
+            resetIdleTimer(serverRxClosed ? 5000 : (totalBytesRecv > 0 ? 30000 : 15000));
             const CHUNK_SIZE = 16384;
             let writeFailed = false;
             for (let offset = 0; offset < value.length; offset += CHUNK_SIZE) {
