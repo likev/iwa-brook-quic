@@ -152,45 +152,40 @@ async function runUnitTests() {
     serverPort: 4433,
     alpn: 'h3'
   });
-  assert(mockMgr.targetPoolSize === 24, `Warm pool target size is configured to 24 (${mockMgr.targetPoolSize})`);
-  assert(mockMgr.maxConcurrentHandshakes === 8, `Handshake concurrency is bounded to 8 (${mockMgr.maxConcurrentHandshakes})`);
+  assert(mockMgr.maxConcurrentHandshakes === 16, `Handshake concurrency is bounded to 16 (${mockMgr.maxConcurrentHandshakes})`);
 
-  // Acquire 8 permits
-  for (let i = 0; i < 8; i++) {
+  // Acquire 16 permits
+  for (let i = 0; i < 16; i++) {
     await mockMgr._acquireHandshakePermit();
   }
-  assert(mockMgr.activeHandshakes === 8, 'Active handshakes reached limit (8)');
+  assert(mockMgr.activeHandshakes === 16, 'Active handshakes reached limit (16)');
 
-  // 9th permit should queue
-  let permit9Granted = false;
-  mockMgr._acquireHandshakePermit().then(() => { permit9Granted = true; });
-  assert(!permit9Granted, '9th concurrent handshake is queued by rate limiter');
+  // 17th permit should queue
+  let permit17Granted = false;
+  mockMgr._acquireHandshakePermit().then(() => { permit17Granted = true; });
+  assert(!permit17Granted, '17th concurrent handshake is queued by rate limiter');
   assert(mockMgr.handshakeQueue.length === 1, 'Handshake queue length is 1');
 
   // Release one permit
   mockMgr._releaseHandshakePermit();
   await new Promise(r => setTimeout(r, 10));
-  assert(permit9Granted, 'Queued handshake is immediately unblocked when permit is released');
-  for (let i = 0; i < 8; i++) {
+  assert(permit17Granted, 'Queued handshake is immediately unblocked when permit is released');
+  for (let i = 0; i < 16; i++) {
     mockMgr._releaseHandshakePermit();
   }
   assert(mockMgr.activeHandshakes === 0, 'All handshake permits released successfully');
 
   // Test QuicConnectionManager Transport Failure Teardown (Review8 P0)
   const failMgr = new QuicConnectionManager({ serverHost: 'brook-quic.pplx.io', serverPort: 4433, alpn: 'h3' });
-  let warmClosed = false;
   let activeClosed = false;
-  failMgr.warmPool.push({ isAlive: () => true, close: () => { warmClosed = true; } });
   failMgr.registerSession({ isAlive: () => true, close: () => { activeClosed = true; } });
   let queuedPermitRejected = false;
-  failMgr.activeHandshakes = 8;
+  failMgr.activeHandshakes = 16;
   failMgr._acquireHandshakePermit().catch((err) => { queuedPermitRejected = true; });
   failMgr._handleTransportFailure(new Error('Simulated UDP error'));
   await new Promise(r => setTimeout(r, 10));
   assert(failMgr.isClosed === true, 'Transport failure marks manager as closed');
-  assert(warmClosed === true, 'Transport failure closes all warm pool sessions');
   assert(activeClosed === true, 'Transport failure closes all active sessions');
-  assert(failMgr.warmPool.length === 0, 'Warm pool is emptied on transport failure');
   assert(failMgr.activeSessions.size === 0, 'Active sessions set is emptied on transport failure');
   assert(queuedPermitRejected === true, 'Queued handshake permits are rejected on transport failure');
 
@@ -220,34 +215,14 @@ async function runUnitTests() {
   mockSessionObj.releaseStream(s0);
   assert(mockSessionObj.activeStreams === 2, `QuicSession active streams count decremented to 2 (${mockSessionObj.activeStreams})`);
 
-  // Test QuicConnectionManager dedicated warmPool dispatch and forceFresh contract (Review8 P1)
-  const testPoolMgr = new QuicConnectionManager({ serverHost: 'brook-quic.pplx.io', serverPort: 4433, alpn: 'h3' });
+  // Test QuicConnectionManager On-Demand Session Lifecycle (Matching original quicclient.go)
+  const testOnDemandMgr = new QuicConnectionManager({ serverHost: 'brook-quic.pplx.io', serverPort: 4433, alpn: 'h3' });
   const liveSess1 = { isAlive: () => true, close: () => {} };
-  const liveSess2 = { isAlive: () => true, close: () => {} };
-  testPoolMgr.warmPool.push(liveSess1);
-  testPoolMgr.warmPool.push(liveSess2);
-  const sessA = await testPoolMgr.createSession();
-  assert(sessA === liveSess1, 'createSession pops dedicated warm session from pool with 0ms latency');
-  const sessB = await testPoolMgr.createSession();
-  assert(sessB === liveSess2, 'createSession pops second warm session from pool');
-  assert(testPoolMgr.warmPool.length === 0, 'warmPool is drained as sessions are dispatched to dedicated tunnels');
-  testPoolMgr.warmPool.push(liveSess1);
-  testPoolMgr.unregisterSession(liveSess1);
-  assert(testPoolMgr.warmPool.length === 0, 'unregisterSession removes session immediately from pool');
-
-  // Test forceFresh: true bypasses warmPool
-  testPoolMgr.warmPool.push(liveSess1);
-  let forceFreshAttempted = false;
-  try {
-    // When forceFresh is true, it skips liveSess1 and attempts to connect a new session
-    await testPoolMgr.createSession({ forceFresh: true });
-  } catch (err) {
-    // Expected in unit test because real UDP socket is not connected
-    forceFreshAttempted = true;
-  }
-  assert(forceFreshAttempted === true, 'createSession({ forceFresh: true }) skips standby warm pool');
-  assert(testPoolMgr.warmPool.length === 1, 'Standby warm pool is preserved when forceFresh is requested');
-  testPoolMgr.warmPool = [];
+  testOnDemandMgr.registerSession(liveSess1);
+  assert(testOnDemandMgr.activeSessions.has(liveSess1), 'registerSession tracks active connection');
+  assert(testOnDemandMgr.activeSessions.size === 1, 'activeSessions size is 1');
+  testOnDemandMgr.unregisterSession(liveSess1);
+  assert(testOnDemandMgr.activeSessions.size === 0, 'unregisterSession untracks closed connection');
 
   // Test BrookTunnel Accurate Outcome Classification (Review8 P0)
   // Target dial refused with 0 bytes must NOT be classified as success
@@ -314,13 +289,10 @@ async function runUnitTests() {
 
   // 3. QuicConnectionManager Transport Snapshot aggregation
   const snapshotMgr = new QuicConnectionManager({ serverHost: '127.0.0.1', serverPort: 4433 });
-  snapshotMgr.warmPool.push({ udpAdapter: mockUdpAdapter });
-  snapshotMgr.targetPoolSize = 24;
-  snapshotMgr.refillsStarted = 5;
-  snapshotMgr.refillsCompleted = 4;
-  snapshotMgr.refillsFailed = 1;
+  snapshotMgr.registerSession({ udpAdapter: mockUdpAdapter });
   const snapshot = snapshotMgr.getSnapshot({ getStats: () => ({ hostQueueTotal: 3, activeTunnels: 2, retries: 1 }) });
-  assert(snapshot.warmStandby === 1, 'Snapshot includes warmStandby count');
+  assert(snapshot.warmStandby === 0, 'Snapshot warmStandby is 0 in on-demand architecture');
+  assert(snapshot.activeSessions === 1, 'Snapshot includes activeSessions count');
   assert(snapshot.udpQueue === 2, 'Snapshot includes udpQueue');
   assert(snapshot.udpQueueMax === 15, 'Snapshot includes udpQueueMax');
   assert(snapshot.udpWriteMsP95 > 0, 'Snapshot includes udpWriteMsP95');
@@ -330,7 +302,6 @@ async function runUnitTests() {
   assert(snapshot.hostQueueTotal === 3, 'Snapshot includes hostQueueTotal');
   assert(snapshot.activeTunnels === 2, 'Snapshot includes activeTunnels');
   assert(snapshot.retries === 1, 'Snapshot includes retries');
-  assert(snapshot.refillsStarted === 5 && snapshot.refillsCompleted === 4, 'Snapshot includes warm pool refill lifecycle counts');
 
   // 4. SessionTracker Event Loop Delay & Snapshot Provider
   const testTracker = new SessionTracker();
@@ -559,7 +530,7 @@ async function runUnitTests() {
 
   // Test QuicConnectionManager close() Draining Queued Handshake Permits
   const closeMgr = new QuicConnectionManager({ serverHost: 'brook-quic.pplx.io', serverPort: 4433, alpn: 'h3' });
-  for (let i = 0; i < 12; i++) await closeMgr._acquireHandshakePermit();
+  for (let i = 0; i < 16; i++) await closeMgr._acquireHandshakePermit();
   let permitRejectionReceived = false;
   closeMgr._acquireHandshakePermit().catch(err => {
     if (err.message.includes('closed')) permitRejectionReceived = true;
@@ -893,7 +864,7 @@ async function runE2ETests() {
     onLog: (lvl, msg) => console.log(`  [QUIC:${lvl}]`, msg)
   });
   await quicManager.connect();
-  assert(quicManager.warmPool.length >= 1, `Live preflight QUIC handshake established with ${SERVER_HOST}:${SERVER_PORT}`);
+  assert(quicManager.state === 'connected', `Live preflight QUIC handshake established with ${SERVER_HOST}:${SERVER_PORT}`);
 
   let sessionCount = 0;
   const dispatcher = new ProxyDispatcher({

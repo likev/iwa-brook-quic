@@ -255,8 +255,10 @@ export class QuicSession {
 }
 
 /**
- * Top-level Manager for Brook QUIC Client with Warm Standby Pool.
- * Manages dedicated per-connect UDP sockets and 24 warm standby sessions.
+ * Top-level Manager for Brook QUIC Client (On-Demand Per-UDPSocket Architecture).
+ * Strictly matches original Brook quicclient.go: each proxy connection creates its
+ * own dedicated QUIC session with an independent Direct Sockets UDPSocket, and destroys
+ * it upon connection completion. No warm pool, no lingering idle connections.
  */
 export class QuicConnectionManager {
   constructor({ serverHost, serverPort, alpn = ['h3'], onStateChange, onLog }) {
@@ -265,20 +267,11 @@ export class QuicConnectionManager {
     this.alpn = Array.isArray(alpn) ? alpn : [alpn];
     this.onStateChange = onStateChange;
     this.state = ConnectionState.DISCONNECTED;
-    this.activeSessions = new Set(); // Active connected sessions in service
-    this.warmPool = []; // Standby connected sessions ready to handle burst traffic with 0ms latency
-    this.targetPoolSize = 24; // Healthy standby warm sessions pool (doubled for high concurrency)
+    this.activeSessions = new Set(); // Active connected sessions currently serving tunnels
     this.activeHandshakes = 0;
-    this.maxConcurrentHandshakes = 8;
+    this.maxConcurrentHandshakes = 16;
     this.handshakeQueue = [];
-    this._isRefilling = false;
-    this._hygieneTimer = null;
     this.isClosed = false;
-
-    // Refill lifecycle metrics
-    this.refillsStarted = 0;
-    this.refillsCompleted = 0;
-    this.refillsFailed = 0;
   }
 
   getSnapshot(dispatcher = null) {
@@ -288,9 +281,8 @@ export class QuicConnectionManager {
     let writeDurations = [];
     let totalPacketEvictions = 0;
 
-    // Aggregate stats across all active sessions and warm pool sessions
-    const allSessions = new Set([...this.warmPool, ...this.activeSessions]);
-    for (const session of allSessions) {
+    // Aggregate stats across all live active sessions
+    for (const session of this.activeSessions) {
       if (session.udpAdapter) {
         const stats = session.udpAdapter.getStats();
         totalUdpQueue += stats.udpQueue || 0;
@@ -322,7 +314,7 @@ export class QuicConnectionManager {
     };
 
     return {
-      warmStandby: this.warmPool.length,
+      warmStandby: 0,
       activeSessions: this.activeSessions.size,
       handshakes: this.activeHandshakes,
       handshakeQueue: this.handshakeQueue.length,
@@ -337,9 +329,9 @@ export class QuicConnectionManager {
       activeTunnels: dispStats.activeTunnels,
       retries: dispStats.retries,
       packetEvictions: totalPacketEvictions,
-      refillsStarted: this.refillsStarted,
-      refillsCompleted: this.refillsCompleted,
-      refillsFailed: this.refillsFailed
+      refillsStarted: 0,
+      refillsCompleted: 0,
+      refillsFailed: 0
     };
   }
 
@@ -348,7 +340,6 @@ export class QuicConnectionManager {
   }
 
   unregisterSession(session) {
-    this.warmPool = this.warmPool.filter(s => s !== session);
     this.activeSessions.delete(session);
   }
 
@@ -368,11 +359,6 @@ export class QuicConnectionManager {
   _handleTransportFailure(err) {
     if (this.isClosed) return;
     this.isClosed = true;
-    if (this._hygieneTimer) {
-      clearInterval(this._hygieneTimer);
-      this._hygieneTimer = null;
-    }
-    // Reject all pending queued handshake permits
     while (this.handshakeQueue.length > 0) {
       const next = this.handshakeQueue.shift();
       if (next && next.reject) {
@@ -383,11 +369,6 @@ export class QuicConnectionManager {
   }
 
   _closeAllSessions(reason = 'transport_closed') {
-    for (const session of this.warmPool) {
-      try { session.close(); } catch (e) {}
-    }
-    this.warmPool = [];
-
     const liveSessions = Array.from(this.activeSessions);
     for (const session of liveSessions) {
       try { session.close(); } catch (e) {}
@@ -396,17 +377,17 @@ export class QuicConnectionManager {
   }
 
   /**
-   * Initial pre-flight connection verification and warm pool initialization.
+   * Initial pre-flight connection verification with QUIC server.
    */
   async connect() {
     if (this.isClosed) throw new Error('QuicConnectionManager is closed');
-    this._setState(ConnectionState.CONNECTING, 'Initializing QUIC warm pool...');
-    this._log('info', `Connecting to Brook QUIC server ${this.serverHost}:${this.serverPort} (per-UDPSocket architecture)...`);
+    this._setState(ConnectionState.CONNECTING, 'Verifying QUIC server...');
+    this._log('info', `Connecting to Brook QUIC server ${this.serverHost}:${this.serverPort} (on-demand per-UDPSocket mode)...`);
 
     try {
-      // Preflight Handshake verification: connect initial session with dedicated UDPSocket
+      // Preflight Handshake verification: test reachability to QUIC server
       const preflight = new QuicSession({
-        manager: this,
+        manager: null,
         serverHost: this.serverHost,
         serverPort: this.serverPort,
         alpn: this.alpn,
@@ -414,60 +395,15 @@ export class QuicConnectionManager {
       });
 
       await preflight.connect(15000);
-      this.warmPool.push(preflight);
+      preflight.close(); // Clean up preflight probe immediately
 
       this._setState(ConnectionState.CONNECTED);
-      this._log('success', `✅ QUIC server reached & warm pool active (ALPN: ${this.alpn.join(',')}, per-UDPSocket mode)`);
-
-      // Refill warm pool in background to target capacity (24 warm sessions)
-      this._refillPool().catch(() => {});
-
-      // Start periodic pool hygiene timer
-      this._startPoolHygiene();
+      this._log('success', `✅ QUIC server reached & ready (ALPN: ${this.alpn.join(',')}, on-demand per-UDPSocket mode)`);
     } catch (err) {
       this._setState(ConnectionState.ERROR, `Failed: ${err.message}`);
       this._log('error', `Failed to reach QUIC server: ${err.message}`);
       throw err;
     }
-  }
-
-  _startPoolHygiene() {
-    if (this._hygieneTimer) clearInterval(this._hygieneTimer);
-    let hygieneCycles = 0;
-    this._hygieneTimer = setInterval(() => {
-      if (this.isClosed) return;
-      hygieneCycles++;
-
-      // Filter out dead standby sessions (45s idle threshold)
-      const liveWarm = [];
-      for (const s of this.warmPool) {
-        if (s && s.isAlive(45000)) {
-          liveWarm.push(s);
-        } else if (s) {
-          s.close();
-        }
-      }
-      this.warmPool = liveWarm;
-
-      // Heartbeat event log every ~10s (every 4 cycles) to confirm keep-alive and transport activity
-      if (hygieneCycles % 4 === 0 && (this.warmPool.length > 0 || this.activeSessions.size > 0)) {
-        let newestAckAgeSec = 999;
-        for (const s of this.warmPool) {
-          if (s.lastKeepAliveAckRecv) {
-            const ageSec = (Date.now() - s.lastKeepAliveAckRecv) / 1000;
-            if (ageSec < newestAckAgeSec) newestAckAgeSec = ageSec;
-          }
-        }
-        const ackInfo = newestAckAgeSec < 900 ? `latest ACK ${newestAckAgeSec.toFixed(1)}s ago` : 'awaiting ACK';
-        const snapshot = this.getSnapshot();
-        this._log('info', `💓 [QUIC Pool] Standby: ${this.warmPool.length}/${this.targetPoolSize} | Active: ${this.activeSessions.size} | Handshakes: ${this.activeHandshakes} | UDP Queues: ${snapshot.udpQueue} (${ackInfo}).`);
-      }
-
-      // Refill if standby pool fell below target
-      if (this.warmPool.length < this.targetPoolSize) {
-        this._refillPool().catch(() => {});
-      }
-    }, 2500);
   }
 
   async _acquireHandshakePermit(priority = false) {
@@ -505,80 +441,15 @@ export class QuicConnectionManager {
     }
   }
 
-  async _refillPool() {
-    if (this.isClosed || this._isRefilling) return;
-    this._isRefilling = true;
-    this.refillsStarted++;
-
-    try {
-      while (this.warmPool.length < this.targetPoolSize && !this.isClosed) {
-        const needed = Math.min(4, this.targetPoolSize - this.warmPool.length);
-        if (needed <= 0) break;
-
-        const refillTasks = Array.from({ length: needed }).map(async () => {
-          try {
-            await this._acquireHandshakePermit(false);
-          } catch (permErr) {
-            this.refillsFailed++;
-            return;
-          }
-          const session = new QuicSession({
-            manager: this,
-            serverHost: this.serverHost,
-            serverPort: this.serverPort,
-            alpn: this.alpn,
-            onLog: this.onLog
-          });
-          try {
-            await session.connect(10000);
-            if (!this.isClosed) {
-              this.warmPool.push(session);
-              this.refillsCompleted++;
-            } else {
-              session.close();
-            }
-          } catch (e) {
-            this.refillsFailed++;
-            session.close();
-          } finally {
-            this._releaseHandshakePermit();
-          }
-        });
-
-        await Promise.allSettled(refillTasks);
-        if (this.warmPool.length >= this.targetPoolSize) break;
-        await new Promise(r => setTimeout(r, 50));
-      }
-    } finally {
-      this._isRefilling = false;
-    }
-  }
-
   /**
-   * Acquire a dedicated, pre-connected QUIC session (from warm standby pool for 0ms latency, or created on demand).
-   * Each proxy tunnel receives its own isolated QUIC connection with a pristine 100% flow-control window.
+   * Create an on-demand, dedicated QUIC session for a proxy tunnel.
+   * Matches original Brook quicclient.go: fresh UDPSocket per connect.
    * @param {Object} [options]
-   * @param {boolean} [options.forceFresh=false] When true, bypasses warm pool and creates a fresh session
    * @returns {Promise<QuicSession>}
    */
   async createSession(options = {}) {
     if (this.isClosed) throw new Error('QuicConnectionManager is closed');
-    const { forceFresh = false } = options;
 
-    // 1. Check warm standby pool for 0ms latency unless forceFresh is requested
-    if (!forceFresh) {
-      while (this.warmPool.length > 0) {
-        const session = this.warmPool.shift();
-        if (session && session.isAlive(45000)) {
-          this._refillPool().catch(() => {});
-          return session;
-        } else if (session) {
-          session.close(); // Clean up stale corpse
-        }
-      }
-    }
-
-    // 2. Fallback to rate-limited on-demand session creation over shared UDP socket
     const startHs = Date.now();
     await this._acquireHandshakePermit(true);
     const session = new QuicSession({
@@ -590,12 +461,11 @@ export class QuicConnectionManager {
     });
 
     try {
-      await session.connect(8000);
+      await session.connect(10000);
       const hsDuration = Date.now() - startHs;
       if (this.onLog) {
-        this.onLog('info', `⚡ [QUIC] Fresh 1-RTT session established in ${hsDuration}ms (active handshakes: ${this.activeHandshakes})`);
+        this.onLog('info', `⚡ [QUIC] Dedicated 1-RTT session established in ${hsDuration}ms (active handshakes: ${this.activeHandshakes})`);
       }
-      this._refillPool().catch(() => {});
       return session;
     } catch (err) {
       session.close();
@@ -676,10 +546,6 @@ export class QuicConnectionManager {
 
   async close() {
     this.isClosed = true;
-    if (this._hygieneTimer) {
-      clearInterval(this._hygieneTimer);
-      this._hygieneTimer = null;
-    }
     this._setState(ConnectionState.DISCONNECTED, 'Stopped by user');
 
     // Drain and reject all pending handshake permits
@@ -690,14 +556,6 @@ export class QuicConnectionManager {
       }
     }
 
-    for (const session of this.warmPool) {
-      session.close();
-    }
-    this.warmPool = [];
-
-    for (const session of this.activeSessions) {
-      session.close();
-    }
-    this.activeSessions.clear();
+    this._closeAllSessions('manager_closed');
   }
 }

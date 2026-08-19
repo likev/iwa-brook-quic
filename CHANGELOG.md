@@ -4,6 +4,16 @@ All notable changes to the **Isolated Web Apps (IWAs) Direct Sockets Suite & Bro
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.30.0] - 2026-08-19
+
+### Changed & Streamlined (Per-UDPSocket Architecture Matching Original quicclient.go)
+- **100% On-Demand Connection Model**: Removed the warm standby pool, background pool refill routines, and pool hygiene intervals entirely.
+- **Strict 1-to-1 UDPSocket Isolation**: Each inbound SOCKS5 / HTTP proxy request connects a dedicated QUIC session with its own independent Direct Sockets `UDPSocket` (ephemeral port allocated by OS/browser kernel).
+- **Instant Clean Teardown**: Sockets and sessions are completely destroyed immediately upon proxy tunnel completion, eliminating idle session accumulation and background packet overhead.
+- **Enhanced Telemetry Aggregation**: `transport_snapshot` aggregates real-time metrics (`udpQueue`, `udpQueueMax`, `udpWriteMsP95`, `uploadPendingBytes`, `rxQueuedBytes`, `writerWaitMs`, `eventLoopDelayMs`) dynamically across all active on-demand connections.
+
+---
+
 ## [v1.29.0] - 2026-08-19
 
 ### Added & Instrumented (Review 9 Transport Diagnostics)

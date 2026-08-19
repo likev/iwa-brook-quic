@@ -196,6 +196,7 @@ export class ProxyDispatcher {
     let reader = null;
     let writer = null;
     let session = null;
+    let releaseHostPermitOnce = () => {};
 
     try {
       const { readable, writable, remoteAddress, remotePort } = await acceptedSocket.opened;
@@ -280,7 +281,7 @@ export class ProxyDispatcher {
       // Acquire per-host dial permit to pace burst connections (max 8 concurrent active connections per host)
       await this._acquireHostDialPermit(host, 8);
       let hostPermitReleased = false;
-      const releaseHostPermitOnce = () => {
+      releaseHostPermitOnce = () => {
         if (!hostPermitReleased) {
           hostPermitReleased = true;
           this._releaseHostDialPermit(host);
