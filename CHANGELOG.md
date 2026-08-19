@@ -4,6 +4,15 @@ All notable changes to the **Isolated Web Apps (IWAs) Direct Sockets Suite & Bro
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.28.0] - 2026-08-19
+
+### Added & Improved
+- **1-Click Diagnostic Report & Copy Logs**: Added `📋 Copy Logs` button to the UI traffic log panel with safe clipboard fallback, copying full telemetry gauges, system state, connection status, and all chronological protocol event logs for easy debugging and feedback.
+- **Enhanced Telemetry & Timing Logs**: Added dial duration (`dial: Xms, total: Ys`) to tunnel completion logs, explicit fresh session 1-RTT connection logs, and detailed pool/transport snapshot heartbeats (standby/target ratio, active tunnels, handshakes, UDP send queue depth, and newest ACK age).
+- **UDP Transport Telemetry**: Added `getStats()` to `UdpSocketAdapter` exposing real-time queue depth, drain status, packet counters, and byte metrics.
+
+---
+
 ## [v1.27.0] - 2026-08-19
 
 ### Changed & Fixed

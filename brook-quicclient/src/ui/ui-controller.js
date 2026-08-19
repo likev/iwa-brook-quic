@@ -56,8 +56,9 @@ export class UiController {
     this.codeSocksCurl = document.getElementById('code-socks-curl');
     this.codeHttpCurl = document.getElementById('code-http-curl');
 
-    // Log filters
+    // Log filters & Copy
     this.selectLogFilter = document.getElementById('select-log-filter');
+    this.btnCopyLogs = document.getElementById('btn-copy-logs');
     this.btnClearLogs = document.getElementById('btn-clear-logs');
   }
 
@@ -76,6 +77,48 @@ export class UiController {
 
     this.btnClearLogs?.addEventListener('click', () => {
       this.logStream.clear();
+    });
+
+    this.btnCopyLogs?.addEventListener('click', async () => {
+      const stats = this.lastStats || {};
+      const logText = this.logStream.getFormattedLogs();
+      const reportHeader = [
+        `================================================================`,
+        `  BROOK QUIC CLIENT IWA - DIAGNOSTIC REPORT & EVENT LOG`,
+        `  Generated: ${new Date().toISOString()}`,
+        `================================================================`,
+        `  Connection Status:  ${this.statusBadge?.textContent || 'STOPPED'}`,
+        `  Target Server:      ${this.inputServer?.value || 'N/A'}`,
+        `  Download Speed:     ${this.statSpeedDown?.textContent || '0 B/s'}`,
+        `  Upload Speed:       ${this.statSpeedUp?.textContent || '0 B/s'}`,
+        `  Total Received:     ${this.statTotalDown?.textContent || '0 B'}`,
+        `  Total Sent:         ${this.statTotalUp?.textContent || '0 B'}`,
+        `  Active Streams:     ${this.statActiveSessions?.textContent || '0'}`,
+        `  Total Sessions:     ${this.statTotalSessions?.textContent || '0'}`,
+        `================================================================`,
+        `\n--- LOG ENTRIES (${this.logStream.logs.length}) ---\n`
+      ].join('\n');
+
+      const fullReport = reportHeader + logText;
+
+      try {
+        await navigator.clipboard.writeText(fullReport);
+        this._showToast('📋 Diagnostic report & logs copied to clipboard!');
+      } catch (err) {
+        try {
+          const textarea = document.createElement('textarea');
+          textarea.value = fullReport;
+          textarea.style.position = 'fixed';
+          textarea.style.opacity = '0';
+          document.body.appendChild(textarea);
+          textarea.select();
+          document.execCommand('copy');
+          document.body.removeChild(textarea);
+          this._showToast('📋 Diagnostic report & logs copied to clipboard!');
+        } catch (e2) {
+          this._showToast('Failed to copy to clipboard');
+        }
+      }
     });
 
     this.btnCopySocksCurl?.addEventListener('click', () => {
@@ -263,6 +306,7 @@ export class UiController {
   }
 
   updateStats(stats) {
+    this.lastStats = stats;
     if (this.statSpeedDown) this.statSpeedDown.textContent = formatSpeed(stats.downloadSpeed);
     if (this.statSpeedUp) this.statSpeedUp.textContent = formatSpeed(stats.uploadSpeed);
     if (this.statTotalDown) this.statTotalDown.textContent = formatBytes(stats.totalBytesReceived);

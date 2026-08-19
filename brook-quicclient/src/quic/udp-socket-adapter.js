@@ -27,6 +27,17 @@ export class UdpSocketAdapter {
     this.packetsReceived = 0;
   }
 
+  getStats() {
+    return {
+      sendQueueLength: this.sendQueue.length,
+      isDraining: this.isDraining,
+      bytesSent: this.bytesSent,
+      bytesReceived: this.bytesReceived,
+      packetsSent: this.packetsSent,
+      packetsReceived: this.packetsReceived
+    };
+  }
+
   async open() {
     if (typeof globalThis.UDPSocket === 'undefined') {
       throw new Error('Direct Sockets UDPSocket API is not available. Please run inside an Isolated Web App (IWA).');

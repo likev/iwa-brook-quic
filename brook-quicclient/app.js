@@ -29,7 +29,7 @@ async function bootstrap() {
     modalContainer
   });
 
-  logStream.add('info', '🚀 Brook QUIC Client IWA v1.27.0 initialized');
+  logStream.add('info', '🚀 Brook QUIC Client IWA v1.28.0 initialized');
 
   // Initialize Session Tracker & Telemetry
   sessionTracker = new SessionTracker({

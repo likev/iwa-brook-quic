@@ -392,8 +392,8 @@ export class QuicConnectionManager {
       }
       this.warmPool = liveWarm;
 
-      // Heartbeat event log every ~10s (every 4 cycles) to confirm keep-alive activity
-      if (hygieneCycles % 4 === 0 && this.warmPool.length > 0) {
+      // Heartbeat event log every ~10s (every 4 cycles) to confirm keep-alive and transport activity
+      if (hygieneCycles % 4 === 0 && (this.warmPool.length > 0 || this.sessionsByCid.size > 0)) {
         let newestAckAgeSec = 999;
         for (const s of this.warmPool) {
           if (s.lastKeepAliveAckRecv) {
@@ -402,7 +402,8 @@ export class QuicConnectionManager {
           }
         }
         const ackInfo = newestAckAgeSec < 900 ? `latest ACK ${newestAckAgeSec.toFixed(1)}s ago` : 'awaiting ACK';
-        this._log('info', `💓 [QUIC Pool] Standby pool: ${this.warmPool.length} warm sessions ready (${ackInfo}).`);
+        const udpQ = this.udpAdapter ? this.udpAdapter.sendQueue.length : 0;
+        this._log('info', `💓 [QUIC Pool] Standby: ${this.warmPool.length}/${this.targetPoolSize} | Active: ${this.sessionsByCid.size} | Handshakes: ${this.activeHandshakes} | UDP Queue: ${udpQ} (${ackInfo}).`);
       }
 
       // Refill if standby pool fell below target
@@ -517,6 +518,7 @@ export class QuicConnectionManager {
     }
 
     // 2. Fallback to rate-limited on-demand session creation over shared UDP socket
+    const startHs = Date.now();
     await this._acquireHandshakePermit(true);
     const session = new QuicSession({
       manager: this,
@@ -528,6 +530,10 @@ export class QuicConnectionManager {
 
     try {
       await session.connect(8000);
+      const hsDuration = Date.now() - startHs;
+      if (this.onLog) {
+        this.onLog('info', `⚡ [QUIC] Fresh 1-RTT session established in ${hsDuration}ms (active handshakes: ${this.activeHandshakes})`);
+      }
       this._refillPool().catch(() => {});
       return session;
     } catch (err) {

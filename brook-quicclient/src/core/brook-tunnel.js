@@ -92,6 +92,7 @@ export class BrookTunnel {
     let rxBuffer = new Uint8Array(0);
     let rxOffset = 0;
     let serverHandshakeDone = false;
+    let dialDurationMs = 0;
     let expectedPayloadLen = -1;
 
     // Bounded Serialized FIFO queue for downstream processing (2MB hard buffer cap)
@@ -174,7 +175,8 @@ export class BrookTunnel {
 
         const durationSec = ((Date.now() - tunnelStartTime) / 1000).toFixed(2);
         if (onLog && hasExchangedData) {
-          onLog('info', `${logTag} 🛑 Tunnel finished for ${targetStr} (Up: ${totalBytesSent}B, Down: ${totalBytesRecv}B, ${durationSec}s, reason: ${reason})`);
+          const dialInfo = dialDurationMs > 0 ? `dial: ${dialDurationMs}ms, ` : '';
+          onLog('info', `${logTag} 🛑 Tunnel finished for ${targetStr} (Up: ${totalBytesSent}B, Down: ${totalBytesRecv}B, ${dialInfo}total: ${durationSec}s, reason: ${reason})`);
         }
 
         if (onClose) {
@@ -226,6 +228,7 @@ export class BrookTunnel {
               rxOffset += 12;
               sk = deriveKey(password, sn, 'brook', withoutBrook);
               serverHandshakeDone = true;
+              dialDurationMs = Date.now() - tunnelStartTime;
 
               if (handshakeTimer) {
                 clearTimeout(handshakeTimer);

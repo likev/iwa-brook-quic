@@ -49,6 +49,10 @@ export class LogStream {
     this.render();
   }
 
+  getFormattedLogs() {
+    return this.logs.map(l => `[${l.timestamp}] ${l.level.toUpperCase().padEnd(7)} ${l.message}`).join('\n');
+  }
+
   clear() {
     this.logs = [];
     if (this.container) {
