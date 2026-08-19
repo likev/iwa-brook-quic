@@ -360,6 +360,12 @@ export class BrookTunnel {
                 }
               }
             }
+
+            // Immediately trim rxBuffer to retain only unconsumed remainder
+            if (rxOffset > 0) {
+              rxBuffer = rxOffset === rxBuffer.length ? new Uint8Array(0) : rxBuffer.subarray(rxOffset);
+              rxOffset = 0;
+            }
           }
 
           if (fin) {

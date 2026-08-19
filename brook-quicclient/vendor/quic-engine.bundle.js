@@ -14303,13 +14303,13 @@ init_buffer();
 function defaultTransportParams() {
   return {
     max_udp_payload_size: 65527,
-    max_idle_timeout: 3e4,
-    initial_max_data: 1048576,
-    initial_max_stream_data_bidi_local: 262144,
-    initial_max_stream_data_bidi_remote: 262144,
-    initial_max_stream_data_uni: 131072,
+    max_idle_timeout: 6e4,
+    initial_max_data: 67108864,
+    initial_max_stream_data_bidi_local: 33554432,
+    initial_max_stream_data_bidi_remote: 33554432,
+    initial_max_stream_data_uni: 16777216,
     initial_max_streams_bidi: 100,
-    initial_max_streams_uni: 3,
+    initial_max_streams_uni: 10,
     ack_delay_exponent: 3,
     max_ack_delay: 25,
     disable_active_migration: true,
@@ -14640,8 +14640,8 @@ function QUICConnection(options) {
     // Until those algorithms run, init_* = max_* so behavior is the static default.
     // When 4b lands, lower the in-flight init_* toward IW10 (~10 pkts / ~14 KB)
     // and let the algorithm climb from there.
-    max_packets_per_burst: 20,
-    // fixed cap — not CC-controlled, no current_/init_
+    max_packets_per_burst: 64,
+    // increased from 20 for high-throughput bursts
     // packet payload (MTU). current_ is the size actually used; max_ is the ceiling
     // DPLPMTUD must not probe past; init_/floor is QUIC's guaranteed 1200-byte minimum.
     max_limit_packet_payload: 1452,
@@ -14651,39 +14651,35 @@ function QUICConnection(options) {
     current_limit_packet_payload: 1200,
     // = init_; DPLPMTUD raises toward max_
     // in-flight window (cwnd) — bytes is the primary signal; packets kept coherent.
-    // init_/current_ start at IW24 (~24 pkts / ~30 KB) and BBR-lite climbs from there toward 2·BDP;
-    // min_ is the floor (12 pkts / 16000 B) ensuring proxy client uplink/downlink never starves.
-    max_limit_packets_in_flight: 256,
-    // ceiling ≈ 300 KB at 1200 B/pkt
-    min_limit_packets_in_flight: 12,
-    // floor — never drop below 12 packets for proxy client
-    init_limit_packets_in_flight: 24,
-    // IW24
-    current_limit_packets_in_flight: 24,
-    // = init_; BBR rewrites at round-end
-    max_limit_bytes_in_flight: 3e5,
-    // ceiling ~300 KB — coherent with packets ↑
-    min_limit_bytes_in_flight: 16e3,
-    // floor ~12 packets (16000 B)
-    init_limit_bytes_in_flight: 3e4,
-    // IW24 (24 × 1200 B ≈ 30 KB)
-    current_limit_bytes_in_flight: 3e4,
-    // = init_; BBR rewrites at round-end
+    // init_/current_ start at IW64 and BBR-lite climbs toward 2·BDP;
+    // min_ is the floor ensuring proxy client uplink/downlink never starves.
+    max_limit_packets_in_flight: 16384,
+    // ceiling ~20 MB
+    min_limit_packets_in_flight: 24,
+    // floor
+    init_limit_packets_in_flight: 64,
+    // IW64
+    current_limit_packets_in_flight: 64,
+    max_limit_bytes_in_flight: 2e7,
+    // ceiling ~20 MB (coherent with packets ↑)
+    min_limit_bytes_in_flight: 32e3,
+    // floor ~24 packets
+    init_limit_bytes_in_flight: 8e4,
+    // IW64 (~80 KB)
+    current_limit_bytes_in_flight: 8e4,
     // pacing rate
-    max_limit_packets_per_sec: 12e3,
-    // ceiling ≈ 14 MB/s
-    min_limit_packets_per_sec: 1500,
-    // floor ~2 MB/s
-    init_limit_packets_per_sec: 12e3,
-    current_limit_packets_per_sec: 12e3,
-    // = init_; BBR rewrites at round-end
-    max_limit_bytes_per_sec: 14e6,
-    // ceiling ~14 MB/s — coherent ↑
-    min_limit_bytes_per_sec: 2e6,
-    // floor ~2 MB/s — prevents long download trickle
-    init_limit_bytes_per_sec: 14e6,
-    current_limit_bytes_per_sec: 14e6,
-    // = init_; BBR rewrites at round-end
+    max_limit_packets_per_sec: 1e5,
+    // ceiling ~120 MB/s
+    min_limit_packets_per_sec: 3e3,
+    // floor ~4 MB/s
+    init_limit_packets_per_sec: 1e5,
+    current_limit_packets_per_sec: 1e5,
+    max_limit_bytes_per_sec: 12e7,
+    // ceiling ~120 MB/s
+    min_limit_bytes_per_sec: 4e6,
+    // floor ~4 MB/s
+    init_limit_bytes_per_sec: 12e7,
+    current_limit_bytes_per_sec: 12e7,
     burst_timer: null,
     pacing_tokens: 0,
     // token-bucket pacer: accumulated send credit (bytes)
@@ -14703,8 +14699,8 @@ function QUICConnection(options) {
     max_data_sent: 0,
     bytes_received: 0,
     // total STREAM bytes *received off the wire* (incl. out-of-order)
-    remote_max_data: 1048576,
-    // peer's limit on what we can send (default 1MB until parsed)
+    remote_max_data: 67108864,
+    // peer's limit on what we can send (default 64MB until parsed)
     // ── Flow control, receive side (RFC 9000 §4.1) — consumption-based
     // sliding window (the ngtcp2/quiche scheme; replaces the old unbounded
     // ×2 doubling, which never actually limited the peer and grew forever).
@@ -14728,20 +14724,20 @@ function QUICConnection(options) {
     // STREAM_DATA_BLOCKED, answered by re-sending the current advertised —
     // that pairing (see the frame handlers) is what makes a lost window
     // update recoverable.
-    local_max_data: 1048576,
-    // ADVERTISED conn limit (starts = window, from transport params)
-    local_max_data_window: 1048576,
-    // W — fixed; matches initial_max_data we advertise
+    local_max_data: 67108864,
+    // ADVERTISED conn limit (64MB)
+    local_max_data_window: 67108864,
+    // W — fixed; matches initial_max_data we advertise (64MB)
     local_max_data_consumed: 0,
     // in-order bytes delivered to the app (all streams)
     fc_recv_usage: 0,
     // Σ per-stream max_recv_offset — the peer's usage
     //
     // Flow control — stream level (RFC 9000 §4.1)
-    local_initial_max_stream_data: 262144,
-    // matches transport params; doubled on MAX_STREAM_DATA updates
+    local_initial_max_stream_data: 33554432,
+    // matches transport params (32MB)
     remote_max_streams_bidi: 100,
-    remote_max_streams_uni: 3,
+    remote_max_streams_uni: 10,
     // ── Per-stream send-side flow control (RFC 9000 §4.1) — the peer's limits
     // on what WE may send per stream. Seeded from the peer's transport params
     // (initial_max_stream_data_*, mapped by stream direction/initiator in

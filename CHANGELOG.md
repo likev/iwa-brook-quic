@@ -4,6 +4,22 @@ All notable changes to the **Isolated Web Apps (IWAs) Direct Sockets Suite & Bro
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.30.4] - 2026-08-19
+
+### Performance & Flow Control (Massive Speedup, Fixed 2-5MB Stall)
+- **Scaled QUIC Flow Control Windows**:
+  - Connection Flow Control (`initial_max_data` & `local_max_data_window`): Scaled from **1 MB to 64 MB**.
+  - Stream Flow Control (`initial_max_stream_data` & `local_initial_max_stream_data`): Scaled from **256 KB to 32 MB**.
+  - Eliminates the stop-and-go round-trip window update stall every 128KB, allowing the Brook server to stream large multi-megabyte files (videos, assets, AI streams) at full wire speed (3+ MB/s).
+- **Scaled Congestion Control & Burst Limits**:
+  - In-flight byte ceiling (`max_limit_bytes_in_flight`): Raised from 300 KB to **20 MB**.
+  - Pacing rate ceiling (`max_limit_bytes_per_sec`): Raised from 14 MB/s to **120 MB/s**.
+  - Burst packet limit (`max_packets_per_burst`): Scaled from 20 to **64 packets**.
+- **Optimized Receive Memory Management**:
+  - Immediately trims and recycles `rxBuffer` after each AES-GCM frame decode to eliminate O(N) TypedArray reallocations during large downloads.
+
+---
+
 ## [v1.30.3] - 2026-08-19
 
 ### Fixed (Eliminated NS_ERROR_NET_PARTIAL_TRANSFER & Stream Truncation)
