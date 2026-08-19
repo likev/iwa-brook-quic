@@ -490,10 +490,11 @@ export class BrookTunnel {
     const isSuccess = terminationReason === 'both_closed' ||
                       terminationReason === 'normal' ||
                       terminationReason === 'server_fin_timeout' ||
-                      (terminationReason === 'transport_closed' && serverHandshakeDone && totalBytesRecv > 0) ||
+                      (terminationReason === 'target_dial_refused' && serverHandshakeDone) ||
+                      (terminationReason === 'transport_closed' && serverHandshakeDone) ||
                       (terminationReason === 'client_abort' && serverHandshakeDone) ||
-                      (terminationReason === 'client_read_error' && serverHandshakeDone && totalBytesRecv > 0) ||
-                      (terminationReason === 'idle_timeout' && serverHandshakeDone && totalBytesRecv > 0);
+                      (terminationReason === 'client_read_error' && serverHandshakeDone) ||
+                      (terminationReason === 'idle_timeout' && serverHandshakeDone);
 
     return {
       success: isSuccess,

@@ -274,140 +274,94 @@ export class ProxyDispatcher {
       let clientDataConsumed = false;
       const MAX_ATTEMPTS = 3;
 
-      try {
-        for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-          if (!this.isRunning) {
-            throw new Error('ProxyDispatcher was stopped during dial attempt');
+      for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+        if (!this.isRunning) {
+          throw new Error('ProxyDispatcher was stopped during dial attempt');
+        }
+
+        // Create or acquire dedicated QUIC session to remote Brook server (guaranteed fresh on retries)
+        const acqStart = Date.now();
+        let quicSession;
+        try {
+          quicSession = await this.quicManager.createSession({ forceFresh: attempt > 1 });
+        } catch (sessErr) {
+          tunnelError = sessErr;
+          if (attempt === MAX_ATTEMPTS) {
+            this._log('error', `[#${session.id}] ❌ Failed to acquire QUIC session for ${targetStr}: ${sessErr.message}`);
+            break;
           }
+          continue;
+        }
 
-          // Adaptive clock offset rotation: Probe ±30s on handshake_timeout retries to resolve server expiration
-          let offsetToUse = this.clockOffsetSec;
-          if (attempt === 2) offsetToUse = this.clockOffsetSec + 30;
-          if (attempt === 3) offsetToUse = this.clockOffsetSec - 30;
+        const dialTimeoutMs = attempt === 1 ? 3500 : (attempt === 2 ? 4000 : 5000);
+        let outcome = null;
 
-          // Resolve domain name to IPv4 locally via Brook DNS resolver (Anycast round-robin distribution)
-          let forwardDstBytes = dstBytes;
-          const resolvedIp = await DnsResolver.resolveIpv4(host, this.quicManager, this.password, {
+        try {
+          outcome = await BrookTunnel.run({
+            clientReader: reader,
+            clientWriter: writer,
+            quicManager: quicSession,
+            dstBytes: dstBytes,
+            leftover,
+            password: this.password,
             withoutBrook: this.withoutBrook,
-            clockOffsetSec: offsetToUse,
-            timeoutMs: 2500
-          }).catch(() => null);
-
-          if (resolvedIp && (DnsResolver.isIpv4(resolvedIp) || DnsResolver.isIpv6(resolvedIp))) {
-            forwardDstBytes = encodeAddress(resolvedIp, port);
-            if (resolvedIp !== host) {
-              this._log('info', `[#${session.id}] 🎯 Proxy DNS resolved: ${host} -> ${resolvedIp}${attempt > 1 ? ` (retry ${attempt} rotation)` : ''}`);
-            }
-          }
-
-          // Create or acquire dedicated QUIC session to remote Brook server (guaranteed fresh on retries)
-          const acqStart = Date.now();
-          let quicSession;
-          try {
-            quicSession = await this.quicManager.createSession({ forceFresh: attempt > 1 });
-            const acqElapsed = Date.now() - acqStart;
-            if (acqElapsed > 50) {
-              this._log('info', `[#${session.id}] ⚡ QUIC session acquired ${attempt > 1 ? 'fresh on retry' : 'on-demand'} (${acqElapsed}ms)`);
-            }
-          } catch (sessErr) {
-            tunnelError = sessErr;
-            if (attempt === MAX_ATTEMPTS) {
-              this._log('error', `[#${session.id}] ❌ Failed to acquire QUIC session for ${targetStr}: ${sessErr.message}`);
-              break;
-            }
-            continue;
-          }
-
-          // Fast 3.5s dial timeout on initial attempt, 4.0s on retry 2, 5.0s on retry 3
-          // Started only after QUIC session is connected and frames are on the wire
-          const dialTimeoutMs = attempt === 1 ? 3500 : (attempt === 2 ? 4000 : 5000);
-          let outcome = null;
-
-          try {
-            outcome = await BrookTunnel.run({
-              clientReader: reader,
-              clientWriter: writer,
-              quicManager: quicSession,
-              dstBytes: forwardDstBytes,
-              leftover,
-              password: this.password,
-              withoutBrook: this.withoutBrook,
-              clockOffsetSec: offsetToUse,
-              targetStr,
-              sessionId: session.id,
-              sendSuccess: sendSuccessOnce,
-              sendFailure: attempt === MAX_ATTEMPTS ? sendFailureOnce : null,
-              dialTimeoutMs,
-              closeClientStreams: attempt === MAX_ATTEMPTS,
-              onHandshakeDone: () => {
-                if (offsetToUse !== this.clockOffsetSec) {
-                  this._log('info', `[#${session.id}] ⏱️ Clock drift auto-calibrated from ${this.clockOffsetSec}s -> ${offsetToUse}s`);
-                  this.clockOffsetSec = offsetToUse;
-                }
-              },
-              onClientDataRead: () => {
-                clientDataConsumed = true;
-              },
-              onBytes: (sent, recv) => {
-                this.sessionTracker.recordBytes(session.id, sent, recv);
-              },
-              onClose: () => {
-                releaseHostPermitOnce();
-                if (quicSession) {
-                  quicSession.close();
-                }
-              },
-              onLog: (lvl, msg) => this._log(lvl, msg)
-            });
-
-            if (outcome.success) {
-              tunnelError = null;
-              break; // Tunnel completed successfully
-            } else {
-              tunnelError = outcome.error || new Error(`Brook tunnel failed (${outcome.kind})`);
+            clockOffsetSec: this.clockOffsetSec,
+            targetStr,
+            sessionId: session.id,
+            sendSuccess: sendSuccessOnce,
+            sendFailure: attempt === MAX_ATTEMPTS ? sendFailureOnce : null,
+            dialTimeoutMs,
+            closeClientStreams: attempt === MAX_ATTEMPTS,
+            onClientDataRead: () => {
+              clientDataConsumed = true;
+            },
+            onBytes: (sent, recv) => {
+              this.sessionTracker.recordBytes(session.id, sent, recv);
+            },
+            onClose: () => {
+              releaseHostPermitOnce();
               if (quicSession) {
                 quicSession.close();
               }
+            },
+            onLog: (lvl, msg) => this._log(lvl, msg)
+          });
 
-              // Do not retry if client explicitly closed, or if payload data was already transmitted/consumed
-              const bytesReceived = session ? session.bytesReceived : 0;
-              if (clientDataConsumed || proxyReplied || bytesReceived > 0 || outcome.kind === 'client_abort' || outcome.kind === 'client_read_error' || outcome.kind === 'rx_overflow') {
-                break;
-              }
-
-              if (attempt < MAX_ATTEMPTS) {
-                this._log('warning', `[#${session.id}] ⚠️ [Brook] Dial attempt ${attempt} for ${targetStr} failed (${outcome.kind}). Retrying with fresh QUIC session (${attempt + 1}/${MAX_ATTEMPTS})...`);
-              }
-            }
-          } catch (err) {
-            tunnelError = err;
-            if (quicSession && !quicSession.isAlive()) {
+          if (outcome.success) {
+            tunnelError = null;
+            break;
+          } else {
+            tunnelError = outcome.error || new Error(`Brook tunnel failed (${outcome.kind})`);
+            if (quicSession) {
               quicSession.close();
             }
+
             const bytesReceived = session ? session.bytesReceived : 0;
-            if (clientDataConsumed || proxyReplied || bytesReceived > 0 || err.message.includes('client_closed') || err.message.includes('client_abort') || err.message.includes('client_write_error')) {
+            if (clientDataConsumed || proxyReplied || bytesReceived > 0 || outcome.kind === 'client_abort' || outcome.kind === 'client_read_error' || outcome.kind === 'rx_overflow') {
               break;
             }
+
             if (attempt < MAX_ATTEMPTS) {
-              this._log('warning', `[#${session.id}] ⚠️ [Brook] Dial attempt ${attempt} for ${targetStr} failed (${err.message}). Retrying with fresh QUIC session (${attempt + 1}/${MAX_ATTEMPTS})...`);
+              this._log('warning', `[#${session.id}] ⚠️ [Brook] Dial attempt ${attempt} for ${targetStr} failed (${outcome.kind}). Retrying with fresh QUIC session (${attempt + 1}/${MAX_ATTEMPTS})...`);
             }
           }
-        }
-
-        if (tunnelError) {
-          releaseHostPermitOnce();
-          await sendFailureOnce(0x05);
-          // Normal keep-alive socket expiration or clean transport closure after data exchange is not a critical error
-          if ((tunnelError.message.includes('idle_timeout') || tunnelError.message.includes('transport_closed')) && session && session.bytesReceived > 0) {
-            // Quiet normal termination
-          } else {
-            throw tunnelError;
+        } catch (runErr) {
+          tunnelError = runErr;
+          if (quicSession) {
+            quicSession.close();
           }
+          break;
         }
-      } finally {
+      }
+
+      if (tunnelError) {
         releaseHostPermitOnce();
-        if (session) {
-          this.sessionTracker.closeSession(session.id);
+        await sendFailureOnce(0x05);
+        // Normal keep-alive socket expiration or clean transport closure after data exchange is not a critical error
+        if ((tunnelError.message.includes('idle_timeout') || tunnelError.message.includes('transport_closed')) && session && session.bytesReceived > 0) {
+          // Quiet normal termination
+        } else {
+          throw tunnelError;
         }
       }
     } catch (err) {
@@ -418,6 +372,11 @@ export class ProxyDispatcher {
       try { if (reader) { await reader.cancel().catch(() => {}); reader.releaseLock(); } } catch (e) {}
       try { if (writer) { await writer.close().catch(() => {}); writer.releaseLock(); } } catch (e) {}
       try { await acceptedSocket.close().catch(() => {}); } catch (e) {}
+    } finally {
+      releaseHostPermitOnce();
+      if (session) {
+        this.sessionTracker.closeSession(session.id);
+      }
     }
   }
 

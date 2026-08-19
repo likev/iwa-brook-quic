@@ -4,6 +4,15 @@ All notable changes to the **Isolated Web Apps (IWAs) Direct Sockets Suite & Bro
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.25.0] - 2026-08-19
+
+### Changed & Fixed
+- **Native Remote Domain Resolution**: Replaced client-side DNS IP overwrite with direct domain forwarding in Brook header frames (`dstBytes`). The Brook server resolves domains dynamically across Anycast and CDN IP pools (Happy Eyeballs RFC 8305), eliminating TCP connection resets (`target_dial_refused`) caused by pinning multiple parallel browser requests to a single Anycast node (e.g. Meta CDN `static.xx.fbcdn.net`).
+- **Clean Clock Drift Stabilization**: Removed volatile offset probing that caused valid 0s timestamps to drift beyond the Brook 60-second limit.
+- **Graceful Speculative Pre-Connect Handling**: Handshake-verified remote target closures (such as browser speculative pre-connect timeouts) are now classified as clean completions rather than triggering unnecessary dial retries.
+
+---
+
 ## [v1.24.0] - 2026-08-19
 
 ### Changed & Fixed
