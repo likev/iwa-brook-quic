@@ -104,17 +104,19 @@ export class BrookTunnel {
     let handshakeTimer = null;
     let idleTimer = null;
 
-    const resetIdleTimer = (durationMs = (hasExchangedData ? 180000 : 15000)) => {
+    const resetIdleTimer = (durationMs = null) => {
       if (idleTimer) clearTimeout(idleTimer);
       if (!isTerminated) {
+        // Speculative pre-connect with 0 received bytes only gets 15s to quickly release unused resources
+        const timeout = durationMs !== null ? durationMs : (totalBytesRecv > 0 ? 180000 : 15000);
         idleTimer = setTimeout(() => {
           if (!isTerminated) {
-            if (!hasExchangedData && onLog) {
-              onLog('info', `${logTag} ℹ️ Speculative pre-connect for ${targetStr} idle for 15s (closed by pool hygiene).`);
+            if (totalBytesRecv === 0 && onLog) {
+              onLog('info', `${logTag} ℹ️ Speculative pre-connect for ${targetStr} idle for ${(timeout / 1000).toFixed(0)}s (reaped by hygiene).`);
             }
             cleanup('idle_timeout');
           }
-        }, durationMs);
+        }, timeout);
       }
     };
 
@@ -319,10 +321,10 @@ export class BrookTunnel {
               await clientWriter.close().catch(() => {});
             } catch (e) {}
 
-            // If target closed with 0 bytes, fail fast immediately (target dial refused / connection reset)
+            // If target closed with 0 bytes, fail fast immediately (target dial refused, dropped, or redundant pre-connect)
             if (totalBytesRecv === 0) {
               if (onLog) {
-                onLog('warning', `${logTag} ⚠️ [Brook] Target ${targetStr} closed connection with 0 bytes (dial refused or dropped)`);
+                onLog('warning', `${logTag} ⚠️ [Brook] Target ${targetStr} closed connection with 0 bytes (dial refused, dropped, or redundant pre-connect)`);
               }
               cleanup('target_dial_refused', new Error('Target connection refused (0 bytes)'));
               return;
@@ -446,7 +448,7 @@ export class BrookTunnel {
               onClientDataRead();
             }
             hasExchangedData = true;
-            resetIdleTimer(180000);
+            resetIdleTimer(totalBytesRecv > 0 ? 180000 : 15000);
             const CHUNK_SIZE = 16384;
             let writeFailed = false;
             for (let offset = 0; offset < value.length; offset += CHUNK_SIZE) {
@@ -483,6 +485,7 @@ export class BrookTunnel {
     const isSuccess = terminationReason === 'both_closed' ||
                       terminationReason === 'normal' ||
                       terminationReason === 'server_fin_timeout' ||
+                      (terminationReason === 'transport_closed' && serverHandshakeDone && totalBytesRecv > 0) ||
                       (terminationReason === 'client_abort' && serverHandshakeDone) ||
                       (terminationReason === 'client_read_error' && serverHandshakeDone && totalBytesRecv > 0) ||
                       (terminationReason === 'idle_timeout' && serverHandshakeDone && totalBytesRecv > 0);

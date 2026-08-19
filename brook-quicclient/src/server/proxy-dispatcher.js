@@ -380,8 +380,8 @@ export class ProxyDispatcher {
         if (tunnelError) {
           releaseHostPermitOnce();
           await sendFailureOnce(0x05);
-          // Normal keep-alive socket expiration after data exchange is not a critical error
-          if (tunnelError.message.includes('idle_timeout') && session && session.bytesReceived > 0) {
+          // Normal keep-alive socket expiration or clean transport closure after data exchange is not a critical error
+          if ((tunnelError.message.includes('idle_timeout') || tunnelError.message.includes('transport_closed')) && session && session.bytesReceived > 0) {
             // Quiet normal termination
           } else {
             throw tunnelError;
@@ -394,7 +394,7 @@ export class ProxyDispatcher {
         }
       }
     } catch (err) {
-      if (!err.message.includes('idle_timeout')) {
+      if (!err.message.includes('idle_timeout') && !err.message.includes('transport_closed')) {
         this._log('warning', `Proxy session error: ${err.message}`);
       }
 

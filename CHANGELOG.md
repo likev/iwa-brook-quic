@@ -4,6 +4,18 @@ All notable changes to the **Isolated Web Apps (IWAs) Direct Sockets Suite & Bro
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.19.0] - 2026-08-19
+
+### Fixed
+- **`transport_closed` Outcome Classification**: Marked `outcome.success = true` in [`BrookTunnel`](file:///root/downloads/iwa/brook-quicclient/src/core/brook-tunnel.js) when `transport_closed` occurs after successful payload transfer (`serverHandshakeDone && totalBytesRecv > 0`), eliminating false error reporting on completed large downloads (e.g. 1.08MB stream completion).
+- **Fast Reaping for Unused Speculative Sockets (15s Window)**: Updated idle timer logic in [`BrookTunnel`](file:///root/downloads/iwa/brook-quicclient/src/core/brook-tunnel.js) so speculative pre-connect connections that only send ClientHello with `totalBytesRecv === 0` are automatically reaped in 15 seconds instead of occupying pool sessions and host dial permits for 180 seconds. Active streams that receive response bytes continue to enjoy the full 180s HTTP/2 keep-alive window.
+- **Speculative Refusal Notification**: Adjusted `target_dial_refused` log messages and suppressed erroneous proxy session warnings on normal transport closures.
+
+### Tests
+- Added unit test in [`scripts/run-all-tests.js`](file:///root/downloads/iwa/scripts/run-all-tests.js) verifying `transport_closed` outcome with received bytes is classified as `success: true`.
+
+---
+
 ## [v1.18.0] - 2026-08-19
 
 ### Fixed

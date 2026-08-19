@@ -295,8 +295,45 @@ async function runUnitTests() {
   attempt2Cb.onData(new Uint8Array(12).fill(0xee), false); // Server nonce
   await new Promise(r => setTimeout(r, 10));
   attempt2Cb.onData(new Uint8Array(0), true); // Close
-  const outcome2 = await attempt2Promise;
+  await attempt2Promise;
   assert(attempt2Success, 'Attempt 2 successfully completed handshake using preserved clientReader');
+
+  // Test BrookTunnel transport_closed outcome with payload data is marked as success (v1.19.0)
+  let transportCb = null;
+  const stubTransportSession = {
+    allocateStreamId: () => 0,
+    registerStream: (id, cb) => { transportCb = cb; },
+    unregisterStream: () => {},
+    ensureConnected: async () => {},
+    sendStreamData: async () => {}
+  };
+  let tWritten = 0;
+  const transportWriter = { write: async (buf) => { tWritten += buf.length; }, close: async () => {}, releaseLock: () => {} };
+  const transportReader = { read: async () => ({ value: null, done: true }), cancel: async () => {}, releaseLock: () => {} };
+  const transportPromise = BrookTunnel.run({
+    clientReader: transportReader,
+    clientWriter: transportWriter,
+    quicManager: stubTransportSession,
+    dstBytes: new Uint8Array([0x01, 1, 1, 1, 1, 0, 80]),
+    password: '271828brook',
+    targetStr: '1.1.1.1:80',
+    sessionId: 'test-transport-closed',
+    dialTimeoutMs: 5000
+  });
+  await new Promise(r => setTimeout(r, 10));
+  const snSample = new Uint8Array(12).fill(0xbb);
+  transportCb.onData(snSample, false);
+  await new Promise(r => setTimeout(r, 10));
+  // Send 1 frame of data then trigger onClose (transport_closed)
+  const sampleKey = deriveKey('271828brook', snSample, 'brook', false);
+  const samplePayload = new TextEncoder().encode('HTTP/1.1 200 OK\r\n\r\nHello');
+  const sealedData = sealFrame(sampleKey, snSample, samplePayload);
+  transportCb.onData(sealedData, false);
+  await new Promise(r => setTimeout(r, 20));
+  transportCb.onClose(); // Transport closes after data
+  const transportOutcome = await transportPromise;
+  assert(transportOutcome.success === true, 'transport_closed after data received is evaluated as success');
+  assert(transportOutcome.bytesReceived > 0, 'Bytes received is recorded accurately on transport close');
 
   // Test BrookTunnel Immediate Termination on 0-Byte Target Dial Refusal
   let refusalCleanedUp = false;
