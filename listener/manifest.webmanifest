@@ -1,7 +1,7 @@
 {
   "name": "TCP Listener - Isolated Web App",
   "short_name": "TCP Listener",
-  "version": "1.20.0",
+  "version": "1.21.0",
   "update_manifest_url": "https://t.iread.fun/downloads/iwa/dist/listener-update-manifest.json",
   "id": "/",
   "start_url": "/",

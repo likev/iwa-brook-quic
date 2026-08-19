@@ -160,7 +160,7 @@ Because it runs completely inside an **Isolated Web App (IWA)**, no native binar
 2. Open `chrome://web-app-internals` in Chrome.
 3. In the **"Install Isolated Web App from Signed Web Bundle"** section, select:
    ```
-   dist/brook-quicclient-v1.20.0.swbn
+   dist/brook-quicclient-v1.21.0.swbn
    ```
 
 ---

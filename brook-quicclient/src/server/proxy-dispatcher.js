@@ -295,14 +295,14 @@ export class ProxyDispatcher {
             }
           }
 
-          // Create or acquire dedicated QUIC session to remote Brook server
+          // Create or acquire dedicated QUIC session to remote Brook server (guaranteed fresh on retries)
           const acqStart = Date.now();
           let quicSession;
           try {
-            quicSession = await this.quicManager.createSession();
+            quicSession = await this.quicManager.createSession({ forceFresh: attempt > 1 });
             const acqElapsed = Date.now() - acqStart;
             if (acqElapsed > 50) {
-              this._log('info', `[#${session.id}] ⚡ QUIC session acquired on-demand (${acqElapsed}ms)`);
+              this._log('info', `[#${session.id}] ⚡ QUIC session acquired ${attempt > 1 ? 'fresh on retry' : 'on-demand'} (${acqElapsed}ms)`);
             }
           } catch (sessErr) {
             tunnelError = sessErr;

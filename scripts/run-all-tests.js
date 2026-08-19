@@ -183,14 +183,14 @@ async function runUnitTests() {
   });
   mockSessionObj.isConnected = true;
   mockSessionObj.quic = testConn;
-  assert(mockSessionObj.isAlive() === true, 'Fresh QuicSession is alive with default 5s threshold');
+  assert(mockSessionObj.isAlive() === true, 'Fresh QuicSession is alive with default 45s threshold');
   assert(mockSessionObj.isAlive(5000) === true, 'Fresh QuicSession is alive (isAlive(5000))');
-  mockSessionObj.lastPacketReceivedTime = Date.now() - 5500;
-  assert(mockSessionObj.isAlive() === false, 'QuicSession >5s without incoming packet is detected as dead');
+  mockSessionObj.lastPacketReceivedTime = Date.now() - 46000;
+  assert(mockSessionObj.isAlive() === false, 'QuicSession >45s without incoming packet is detected as dead');
   mockSessionObj.lastPacketReceivedTime = Date.now();
   assert(mockSessionObj.isAlive() === true, 'QuicSession revived upon incoming packet receipt');
 
-  // Test QuicSession Multi-Stream Allocation & Connection Reuse (v1.20.0)
+  // Test QuicSession Multi-Stream Allocation & Connection Reuse (v1.20.0 / v1.21.0)
   assert(mockSessionObj.canAcceptStream() === true, 'QuicSession can accept new stream');
   const s0 = mockSessionObj.allocateStreamId();
   const s4 = mockSessionObj.allocateStreamId();
@@ -199,6 +199,19 @@ async function runUnitTests() {
   assert(mockSessionObj.activeStreams === 3, `QuicSession active streams count is 3 (${mockSessionObj.activeStreams})`);
   mockSessionObj.releaseStream(s0);
   assert(mockSessionObj.activeStreams === 2, `QuicSession active streams count decremented to 2 (${mockSessionObj.activeStreams})`);
+
+  // Test QuicConnectionManager unregisterSession on close and forceFresh createSession (v1.21.0)
+  const testPoolMgr = new QuicConnectionManager({ serverHost: 'brook-quic.pplx.io', serverPort: 4433, alpn: 'h3' });
+  const liveSess1 = { isAlive: () => true, canAcceptStream: () => true, activeStreams: 0, close: () => {} };
+  const liveSess2 = { isAlive: () => true, canAcceptStream: () => true, activeStreams: 0, close: () => {} };
+  testPoolMgr.activeSessions.push(liveSess1);
+  testPoolMgr.warmPool.push(liveSess2);
+  const reusedSess = await testPoolMgr.createSession({ forceFresh: false });
+  assert(reusedSess === liveSess1, 'createSession without forceFresh reuses active persistent session');
+  const freshSess = await testPoolMgr.createSession({ forceFresh: true });
+  assert(freshSess === liveSess2, 'createSession with forceFresh: true bypasses active sessions and grabs fresh standby session');
+  testPoolMgr.unregisterSession(liveSess1);
+  assert(testPoolMgr.activeSessions.length === 1 && testPoolMgr.warmPool.length === 0, 'unregisterSession removes session immediately from pool');
 
   // Test ProxyDispatcher Per-Host Dial Permit Limiter
   const testDispatcher = new ProxyDispatcher({
@@ -477,8 +490,8 @@ async function runUnitTests() {
   });
   datagramSession.isConnected = true;
   datagramSession.quic = { feedDatagram: () => {}, state: 'connected' };
-  datagramSession.lastPacketReceivedTime = Date.now() - 6000; // Simulated stale session
-  assert(datagramSession.isAlive() === false, 'Session is not alive when idle for >5s without inbound packet');
+  datagramSession.lastPacketReceivedTime = Date.now() - 46000; // Simulated stale session (>45s)
+  assert(datagramSession.isAlive() === false, 'Session is not alive when idle for >45s without inbound packet');
   datagramSession.feedDatagram(new Uint8Array([0x40, 1, 2, 3]), '127.0.0.1', 4433);
   assert(datagramSession.isAlive() === true, 'feedDatagram updates lastPacketReceivedTime and restores liveness');
   assert(Date.now() - datagramSession.lastPacketReceivedTime < 50, 'lastPacketReceivedTime is updated to current timestamp on any inbound packet');

@@ -60,6 +60,11 @@ export class QuicSession {
     this.activeStreams = 0;
     this.maxConcurrentStreams = 8;
     this.totalStreamsServed = 0;
+
+    // Keep-alive telemetry tracking
+    this.keepAlivePingCount = 0;
+    this.keepAliveAckCount = 0;
+    this.lastKeepAliveAckRecv = Date.now();
   }
 
   canAcceptStream() {
@@ -79,7 +84,7 @@ export class QuicSession {
     this.activeStreams = Math.max(0, this.activeStreams - 1);
   }
 
-  isAlive(maxIdleMs = 5000) {
+  isAlive(maxIdleMs = 45000) {
     if (this.isClosed || !this.isConnected || !this.quic) return false;
     if (this.quic.state === 'closed' || this.quic.state === 'draining' || this.quic.state === 'closing') return false;
     return (Date.now() - this.lastPacketReceivedTime) < maxIdleMs;
@@ -89,6 +94,8 @@ export class QuicSession {
     if (this.isClosed || !this.quic) return;
     this.lastActivity = Date.now();
     this.lastPacketReceivedTime = Date.now();
+    this.lastKeepAliveAckRecv = Date.now();
+    this.keepAliveAckCount++;
     this.quic.feedDatagram(fromAddr, fromPort, data);
   }
 
@@ -205,6 +212,7 @@ export class QuicSession {
     this.isClosed = true;
 
     if (this.manager) {
+      this.manager.unregisterSession(this);
       if (this.scidHex) this.manager.unregisterCid(this.scidHex);
       if (this.dcidHex) this.manager.unregisterCid(this.dcidHex);
     }
@@ -245,6 +253,11 @@ export class QuicConnectionManager {
     this._isRefilling = false;
     this._hygieneTimer = null;
     this.isClosed = false;
+  }
+
+  unregisterSession(session) {
+    this.activeSessions = this.activeSessions.filter(s => s !== session);
+    this.warmPool = this.warmPool.filter(s => s !== session);
   }
 
   _setState(newState, details = '') {
@@ -353,12 +366,15 @@ export class QuicConnectionManager {
 
   _startPoolHygiene() {
     if (this._hygieneTimer) clearInterval(this._hygieneTimer);
+    let hygieneCycles = 0;
     this._hygieneTimer = setInterval(() => {
       if (this.isClosed) return;
-      // Filter out dead active sessions
+      hygieneCycles++;
+
+      // Filter out dead active sessions (45s idle threshold)
       const liveActive = [];
       for (const s of this.activeSessions) {
-        if (s && s.isAlive()) {
+        if (s && s.isAlive(45000)) {
           liveActive.push(s);
         } else if (s) {
           s.close();
@@ -366,16 +382,29 @@ export class QuicConnectionManager {
       }
       this.activeSessions = liveActive;
 
-      // Filter out dead standby sessions
+      // Filter out dead standby sessions (45s idle threshold)
       const liveWarm = [];
       for (const s of this.warmPool) {
-        if (s && s.isAlive()) {
+        if (s && s.isAlive(45000)) {
           liveWarm.push(s);
         } else if (s) {
           s.close();
         }
       }
       this.warmPool = liveWarm;
+
+      // Heartbeat event log every ~10s (every 4 cycles) to confirm keep-alive activity
+      if (hygieneCycles % 4 === 0 && (this.activeSessions.length > 0 || this.warmPool.length > 0)) {
+        let newestAckAgeSec = 999;
+        for (const s of [...this.activeSessions, ...this.warmPool]) {
+          if (s.lastKeepAliveAckRecv) {
+            const ageSec = (Date.now() - s.lastKeepAliveAckRecv) / 1000;
+            if (ageSec < newestAckAgeSec) newestAckAgeSec = ageSec;
+          }
+        }
+        const ackInfo = newestAckAgeSec < 900 ? `latest ACK ${newestAckAgeSec.toFixed(1)}s ago` : 'awaiting ACK';
+        this._log('info', `💓 [QUIC Pool] Keep-alive active: ${this.activeSessions.length} persistent + ${this.warmPool.length} standby sessions healthy (${ackInfo}).`);
+      }
 
       // Refill if total live sessions fell below target
       const totalLive = this.activeSessions.length + this.warmPool.length;
@@ -472,29 +501,33 @@ export class QuicConnectionManager {
 
   /**
    * Acquire a validated, connected QUIC session (reused from active pool, promoted from warm pool, or created on demand).
+   * @param {Object} options
+   * @param {boolean} options.forceFresh - When true (e.g. dial retry), bypasses active pooled sessions and grabs a guaranteed fresh session.
    * @returns {Promise<QuicSession>}
    */
-  async createSession() {
+  async createSession({ forceFresh = false } = {}) {
     if (this.isClosed) throw new Error('QuicConnectionManager is closed');
 
-    // 1. Clean up and reuse an existing active persistent session with capacity
-    this.activeSessions = this.activeSessions.filter(s => s && s.isAlive());
-    let bestActive = null;
-    for (const s of this.activeSessions) {
-      if (s.canAcceptStream()) {
-        if (!bestActive || s.activeStreams < bestActive.activeStreams) {
-          bestActive = s;
+    // 1. Clean up and reuse an existing active persistent session with capacity (unless forceFresh is requested)
+    if (!forceFresh) {
+      this.activeSessions = this.activeSessions.filter(s => s && s.isAlive(45000));
+      let bestActive = null;
+      for (const s of this.activeSessions) {
+        if (s.canAcceptStream()) {
+          if (!bestActive || s.activeStreams < bestActive.activeStreams) {
+            bestActive = s;
+          }
         }
       }
-    }
-    if (bestActive) {
-      return bestActive;
+      if (bestActive) {
+        return bestActive;
+      }
     }
 
     // 2. Check warm standby pool for 0ms latency with strict liveness verification
     while (this.warmPool.length > 0) {
       const session = this.warmPool.shift();
-      if (session && session.isAlive()) {
+      if (session && session.isAlive(45000)) {
         this.activeSessions.push(session);
         this._refillPool().catch(() => {});
         return session;

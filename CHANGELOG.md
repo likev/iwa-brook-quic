@@ -4,6 +4,20 @@ All notable changes to the **Isolated Web Apps (IWAs) Direct Sockets Suite & Bro
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.21.0] - 2026-08-19
+
+### Added & Fixed
+- **QUIC Pool Idle Window Expansion (45s)**: Updated `isAlive(maxIdleMs = 45000)` and `_startPoolHygiene()` in [`QuicConnectionManager`](file:///root/downloads/iwa/brook-quicclient/src/quic/quic-connection-manager.js) to match RFC 9000 QUIC idle timeout (45s). Prevents aggressive 5-second timers from destroying the persistent session pool during normal user reading pauses.
+- **Keep-Alive Heartbeat Telemetry**: Added periodic keep-alive event logging and telemetry tracking (`💓 [QUIC Pool] Keep-alive active: X persistent + Y standby sessions healthy (latest ACK Zs ago)`), proving real-time keep-alive connectivity and ACK reception across all idle pool sessions.
+- **Guaranteed Fresh Session on Dial Retries (`forceFresh = true`)**: Updated [`ProxyDispatcher`](file:///root/downloads/iwa/brook-quicclient/src/server/proxy-dispatcher.js) to request `createSession({ forceFresh: true })` on retry attempts 2 and 3, bypassing active pooled connections to guarantee retries never re-use a stale or closing session.
+- **Instant Pool Cleanup on Session Termination**: Added `manager.unregisterSession(this)` inside `QuicSession.close()` to immediately purge terminating sessions from `activeSessions` and `warmPool`.
+
+### Tests
+- Added unit tests for 45s idle threshold detection, `createSession({ forceFresh: true })`, and `unregisterSession`.
+- Validated 100% passing across the full 83-test suite with live parallel proxy requests.
+
+---
+
 ## [v1.20.0] - 2026-08-19
 
 ### Added & Fixed
