@@ -81,6 +81,7 @@ export class UiController {
 
     this.btnCopyLogs?.addEventListener('click', async () => {
       const stats = this.lastStats || {};
+      const snap = stats.transportSnapshot || {};
       const logText = this.logStream.getFormattedLogs(true);
       const totalCount = this.logStream.getTotalLogsCount();
       const reportHeader = [
@@ -88,14 +89,36 @@ export class UiController {
         `  BROOK QUIC CLIENT IWA - FULL DIAGNOSTIC REPORT & COMPLETE LOG`,
         `  Generated: ${new Date().toISOString()}`,
         `================================================================`,
-        `  Connection Status:  ${this.statusBadge?.textContent || 'STOPPED'}`,
-        `  Target Server:      ${this.inputServer?.value || 'N/A'}`,
-        `  Download Speed:     ${this.statSpeedDown?.textContent || '0 B/s'}`,
-        `  Upload Speed:       ${this.statSpeedUp?.textContent || '0 B/s'}`,
-        `  Total Received:     ${this.statTotalDown?.textContent || '0 B'}`,
-        `  Total Sent:         ${this.statTotalUp?.textContent || '0 B'}`,
-        `  Active Streams:     ${this.statActiveSessions?.textContent || '0'}`,
-        `  Total Sessions:     ${this.statTotalSessions?.textContent || '0'}`,
+        `  Connection Status:    ${this.statusBadge?.textContent || 'STOPPED'}`,
+        `  Target Server:        ${this.inputServer?.value || 'N/A'}`,
+        `  Download Speed:       ${this.statSpeedDown?.textContent || '0 B/s'}`,
+        `  Upload Speed:         ${this.statSpeedUp?.textContent || '0 B/s'}`,
+        `  Total Received:       ${this.statTotalDown?.textContent || '0 B'}`,
+        `  Total Sent:           ${this.statTotalUp?.textContent || '0 B'}`,
+        `  Active Streams:       ${this.statActiveSessions?.textContent || '0'}`,
+        `  Total Sessions:       ${this.statTotalSessions?.textContent || '0'}`,
+        `----------------------------------------------------------------`,
+        `  TRANSPORT SNAPSHOT METRICS (Review 9 Instrumentation):`,
+        `  • warmStandby:        ${snap.warmStandby ?? 'N/A'}`,
+        `  • activeSessions:     ${snap.activeSessions ?? 'N/A'}`,
+        `  • handshakes:         ${snap.handshakes ?? 'N/A'}`,
+        `  • handshakeQueue:     ${snap.handshakeQueue ?? 'N/A'}`,
+        `  • hostQueueTotal:     ${snap.hostQueueTotal ?? 'N/A'}`,
+        `  • udpQueue:           ${snap.udpQueue ?? 'N/A'}`,
+        `  • udpQueueMax:        ${snap.udpQueueMax ?? 'N/A'}`,
+        `  • udpOldestMs:        ${snap.udpOldestMs ?? 'N/A'}ms`,
+        `  • udpWriteMsP95:      ${snap.udpWriteMsP95 ?? 'N/A'}ms`,
+        `  • uploadPendingBytes: ${snap.uploadPendingBytes ?? 'N/A'} bytes`,
+        `  • rxQueuedBytes:      ${snap.rxQueuedBytes ?? 'N/A'} bytes`,
+        `  • writerWaitMs:       ${snap.writerWaitMs ?? 'N/A'}ms`,
+        `  • eventLoopDelayMs:   ${snap.eventLoopDelayMs ?? 'N/A'}ms`,
+        `  • activeTunnels:      ${snap.activeTunnels ?? 'N/A'}`,
+        `  • retries:            ${snap.retries ?? 'N/A'}`,
+        `  • packetEvictions:    ${snap.packetEvictions ?? 'N/A'}`,
+        `  • warmPoolRefills:    ${snap.refillsCompleted ?? 0} ok / ${snap.refillsFailed ?? 0} fail (started: ${snap.refillsStarted ?? 0})`,
+        `----------------------------------------------------------------`,
+        `  TRANSPORT SNAPSHOT JSON:`,
+        JSON.stringify(snap, null, 2),
         `================================================================`,
         `\n--- COMPLETE LOG ENTRIES SINCE APP START (${totalCount} entries) ---\n`
       ].join('\n');

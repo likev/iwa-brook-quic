@@ -23,6 +23,7 @@ import { QuicConnectionManager, QuicSession } from '../brook-quicclient/src/quic
 import { ProxyDispatcher } from '../brook-quicclient/src/server/proxy-dispatcher.js';
 import { TcpListener } from '../brook-quicclient/src/server/tcp-listener.js';
 import { LogStream } from '../brook-quicclient/src/ui/log-stream.js';
+import { SessionTracker } from '../brook-quicclient/src/server/session-tracker.js';
 
 const execAsync = promisify(exec);
 
@@ -140,7 +141,7 @@ async function runUnitTests() {
   // Enqueue Long Header control packet (Initial: MSB=1)
   const initialPkt = new Uint8Array([0xC0, 0x00, 0x00, 0x01]);
   mockAdapter.send(initialPkt);
-  const foundControl = mockAdapter.sendQueue.some(pkt => (pkt[0] & 0x80) !== 0) || writtenChunks.some(pkt => (pkt[0] & 0x80) !== 0);
+  const foundControl = mockAdapter.sendQueue.some(pkt => (((pkt.data || pkt)[0]) & 0x80) !== 0) || writtenChunks.some(pkt => (pkt[0] & 0x80) !== 0);
   assert(foundControl, 'UDP send queue prioritizes and retains Long-Header control/handshake packets');
   await mockAdapter._waitForDrain(0);
   assert(mockAdapter.sendQueue.length === 0, 'All queued packets drained to UDP writer');
@@ -284,6 +285,60 @@ async function runUnitTests() {
   assert(allFormatted.includes('Event log #1') && allFormatted.includes('Event log #600'), 'Formatted export includes first (#1) and last (#600) logs from app start');
   const displayFormatted = testLogStream.getFormattedLogs(false);
   assert(!displayFormatted.includes('Event log #1') && displayFormatted.includes('Event log #600'), 'Display formatted only contains recent bounded logs');
+
+  // Test Review 9 Transport Snapshot Metrics & Telemetry
+  // 1. UDP Adapter Stats
+  const mockUdpAdapter = new UdpSocketAdapter({ remoteAddress: '127.0.0.1', remotePort: 4433 });
+  mockUdpAdapter.sendQueue = [
+    { data: new Uint8Array(100), enqueuedAt: Date.now() - 250 },
+    { data: new Uint8Array(200), enqueuedAt: Date.now() - 50 }
+  ];
+  mockUdpAdapter.maxQueueLength = 15;
+  mockUdpAdapter.packetEvictions = 2;
+  mockUdpAdapter.writeDurations = [0.5, 1.2, 0.8, 2.5, 1.0];
+  const udpStats = mockUdpAdapter.getStats();
+  assert(udpStats.udpQueue === 2, 'UdpSocketAdapter reports accurate udpQueue length');
+  assert(udpStats.udpQueueMax === 15, 'UdpSocketAdapter reports peak queue depth (udpQueueMax)');
+  assert(udpStats.udpOldestMs >= 200, 'UdpSocketAdapter calculates oldest packet age in ms (udpOldestMs)');
+  assert(udpStats.udpWriteMsP95 > 0, 'UdpSocketAdapter calculates p95 write duration (udpWriteMsP95)');
+  assert(udpStats.packetEvictions === 2, 'UdpSocketAdapter tracks packet eviction count');
+
+  // 2. BrookTunnel Global Metrics
+  BrookTunnel.globalMetrics.rxQueuedBytes = 4096;
+  BrookTunnel.globalMetrics.uploadPendingBytes = 8192;
+  BrookTunnel.globalMetrics.recordWriterWait(3.5);
+  const tunnelMetrics = BrookTunnel.globalMetrics.getStats();
+  assert(tunnelMetrics.rxQueuedBytes === 4096, 'BrookTunnel globalMetrics reports accurate rxQueuedBytes');
+  assert(tunnelMetrics.uploadPendingBytes === 8192, 'BrookTunnel globalMetrics reports uploadPendingBytes');
+  assert(tunnelMetrics.writerWaitMs > 0, 'BrookTunnel globalMetrics computes writerWaitMs p95');
+
+  // 3. QuicConnectionManager Transport Snapshot aggregation
+  const snapshotMgr = new QuicConnectionManager({ serverHost: '127.0.0.1', serverPort: 4433 });
+  snapshotMgr.udpAdapter = mockUdpAdapter;
+  snapshotMgr.targetPoolSize = 24;
+  snapshotMgr.refillsStarted = 5;
+  snapshotMgr.refillsCompleted = 4;
+  snapshotMgr.refillsFailed = 1;
+  const snapshot = snapshotMgr.getSnapshot({ getStats: () => ({ hostQueueTotal: 3, activeTunnels: 2, retries: 1 }) });
+  assert(snapshot.warmStandby === 0, 'Snapshot includes warmStandby count');
+  assert(snapshot.udpQueue === 2, 'Snapshot includes udpQueue');
+  assert(snapshot.udpQueueMax === 15, 'Snapshot includes udpQueueMax');
+  assert(snapshot.udpWriteMsP95 > 0, 'Snapshot includes udpWriteMsP95');
+  assert(snapshot.uploadPendingBytes === 8192, 'Snapshot includes uploadPendingBytes');
+  assert(snapshot.rxQueuedBytes === 4096, 'Snapshot includes rxQueuedBytes');
+  assert(snapshot.writerWaitMs > 0, 'Snapshot includes writerWaitMs');
+  assert(snapshot.hostQueueTotal === 3, 'Snapshot includes hostQueueTotal');
+  assert(snapshot.activeTunnels === 2, 'Snapshot includes activeTunnels');
+  assert(snapshot.retries === 1, 'Snapshot includes retries');
+  assert(snapshot.refillsStarted === 5 && snapshot.refillsCompleted === 4, 'Snapshot includes warm pool refill lifecycle counts');
+
+  // 4. SessionTracker Event Loop Delay & Snapshot Provider
+  const testTracker = new SessionTracker();
+  testTracker.setSnapshotProvider(() => snapshot);
+  const trackerStats = testTracker.getStats();
+  assert(trackerStats.transportSnapshot.udpQueueMax === 15, 'SessionTracker delivers complete transport snapshot');
+  assert(typeof trackerStats.eventLoopDelayMs === 'number', 'SessionTracker measures eventLoopDelayMs');
+  testTracker.destroy();
 
   // Test ProxyDispatcher Per-Host Dial Permit Limiter
   const testDispatcher = new ProxyDispatcher({

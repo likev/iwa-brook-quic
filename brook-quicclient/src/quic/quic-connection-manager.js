@@ -6,6 +6,7 @@
 
 import { QUICConnection } from '../../vendor/quic-engine.bundle.js';
 import { UdpSocketAdapter } from './udp-socket-adapter.js';
+import { BrookTunnel } from '../core/brook-tunnel.js';
 
 export const ConnectionState = {
   DISCONNECTED: 'disconnected',
@@ -249,6 +250,52 @@ export class QuicConnectionManager {
     this._isRefilling = false;
     this._hygieneTimer = null;
     this.isClosed = false;
+
+    // Refill lifecycle metrics
+    this.refillsStarted = 0;
+    this.refillsCompleted = 0;
+    this.refillsFailed = 0;
+  }
+
+  getSnapshot(dispatcher = null) {
+    const udpStats = this.udpAdapter ? this.udpAdapter.getStats() : {
+      udpQueue: 0,
+      udpQueueMax: 0,
+      udpOldestMs: 0,
+      udpWriteMsP95: 0,
+      packetEvictions: 0
+    };
+    const tunnelStats = (BrookTunnel && BrookTunnel.globalMetrics) ? BrookTunnel.globalMetrics.getStats() : {
+      rxQueuedBytes: 0,
+      uploadPendingBytes: 0,
+      writerWaitMs: 0
+    };
+    const dispStats = (dispatcher && dispatcher.getStats) ? dispatcher.getStats() : {
+      hostQueueTotal: 0,
+      activeTunnels: 0,
+      retries: 0
+    };
+
+    return {
+      warmStandby: this.warmPool.length,
+      activeSessions: this.sessionsByCid.size,
+      handshakes: this.activeHandshakes,
+      handshakeQueue: this.handshakeQueue.length,
+      hostQueueTotal: dispStats.hostQueueTotal,
+      udpQueue: udpStats.udpQueue,
+      udpQueueMax: udpStats.udpQueueMax,
+      udpOldestMs: udpStats.udpOldestMs,
+      udpWriteMsP95: udpStats.udpWriteMsP95,
+      uploadPendingBytes: tunnelStats.uploadPendingBytes,
+      rxQueuedBytes: tunnelStats.rxQueuedBytes,
+      writerWaitMs: tunnelStats.writerWaitMs,
+      activeTunnels: dispStats.activeTunnels,
+      retries: dispStats.retries,
+      packetEvictions: udpStats.packetEvictions,
+      refillsStarted: this.refillsStarted,
+      refillsCompleted: this.refillsCompleted,
+      refillsFailed: this.refillsFailed
+    };
   }
 
   unregisterSession(session) {
@@ -451,6 +498,7 @@ export class QuicConnectionManager {
   async _refillPool() {
     if (this.isClosed || this._isRefilling) return;
     this._isRefilling = true;
+    this.refillsStarted++;
 
     try {
       while (this.warmPool.length < this.targetPoolSize && !this.isClosed) {
@@ -461,6 +509,7 @@ export class QuicConnectionManager {
           try {
             await this._acquireHandshakePermit(false);
           } catch (permErr) {
+            this.refillsFailed++;
             return;
           }
           const session = new QuicSession({
@@ -474,10 +523,12 @@ export class QuicConnectionManager {
             await session.connect(10000);
             if (!this.isClosed) {
               this.warmPool.push(session);
+              this.refillsCompleted++;
             } else {
               session.close();
             }
           } catch (e) {
+            this.refillsFailed++;
             session.close();
           } finally {
             this._releaseHandshakePermit();

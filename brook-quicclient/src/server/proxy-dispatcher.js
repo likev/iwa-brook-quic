@@ -32,7 +32,24 @@ export class ProxyDispatcher {
     this.hostDialQueues = new Map(); // host -> Array<{resolve, reject}>
     this.hostActiveDials = new Map(); // host -> number
     this.activeHandlers = new Set();
+    this.totalRetries = 0;
     this.isRunning = true;
+  }
+
+  getHostQueueTotal() {
+    let total = 0;
+    for (const q of this.hostDialQueues.values()) {
+      total += q.length;
+    }
+    return total;
+  }
+
+  getStats() {
+    return {
+      hostQueueTotal: this.getHostQueueTotal(),
+      activeTunnels: this.activeHandlers.size,
+      retries: this.totalRetries
+    };
   }
 
   async _acquireHostDialPermit(host, maxConcurrent = 8) {
@@ -342,6 +359,7 @@ export class ProxyDispatcher {
             }
 
             if (attempt < MAX_ATTEMPTS) {
+              this.totalRetries++;
               this._log('warning', `[#${session.id}] ⚠️ [Brook] Dial attempt ${attempt} for ${targetStr} failed (${outcome.kind}). Retrying with fresh QUIC session (${attempt + 1}/${MAX_ATTEMPTS})...`);
             }
           }

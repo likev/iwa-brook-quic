@@ -4,6 +4,24 @@ All notable changes to the **Isolated Web Apps (IWAs) Direct Sockets Suite & Bro
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.29.0] - 2026-08-19
+
+### Added & Instrumented (Review 9 Transport Diagnostics)
+- **Review 9 Telemetry & Transport Snapshot Engine**: Implemented complete, real-time structured telemetry capturing all diagnostic fields requested in Review 9:
+  - `udpQueue`: Live UDP socket send queue depth.
+  - `udpQueueMax`: Peak UDP queue length observed during operation.
+  - `udpOldestMs`: Age in milliseconds of the oldest un-drained packet in the send queue.
+  - `udpWriteMsP95`: 95th-percentile execution time of underlying Direct Sockets `UDPSocket` `writer.write()`.
+  - `uploadPendingBytes`: Live bytes queued across upstream transmit pipelines.
+  - `rxQueuedBytes`: Aggregate downstream received bytes buffered across active tunnels.
+  - `writerWaitMs`: 95th-percentile time spent waiting for local TCP client stream writes (`writer.write()`).
+  - `eventLoopDelayMs`: Real-time main/UI event loop lag measurement.
+  - `warmStandby`, `activeSessions`, `handshakes`, `handshakeQueue`, `hostQueueTotal`, `activeTunnels`, `retries`, `packetEvictions`, and warm pool refill lifecycle counters (`refillsStarted`, `refillsCompleted`, `refillsFailed`).
+- **Structured Diagnostic Report Export**: "📋 Copy Logs" now embeds the live `TRANSPORT SNAPSHOT METRICS` table and raw JSON object at the top of the exported diagnostic report.
+- **Fixed Active Tunnel Idle Timeout Override**: Corrected payload receive path `resetIdleTimer` from 180s to the intended 30s active-tunnel timeout.
+
+---
+
 ## [v1.28.0] - 2026-08-19
 
 ### Added & Improved

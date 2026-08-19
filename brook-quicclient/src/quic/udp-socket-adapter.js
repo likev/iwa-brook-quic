@@ -25,10 +25,29 @@ export class UdpSocketAdapter {
     this.bytesReceived = 0;
     this.packetsSent = 0;
     this.packetsReceived = 0;
+    this.maxQueueLength = 0;
+    this.packetEvictions = 0;
+    this.writeDurations = []; // Rolling window of writer.write() durations in ms
   }
 
   getStats() {
+    const oldestItem = this.sendQueue[0];
+    const oldestEnqueuedAt = oldestItem ? (oldestItem.enqueuedAt || Date.now()) : Date.now();
+    const udpOldestMs = this.sendQueue.length > 0 ? Math.max(0, Date.now() - oldestEnqueuedAt) : 0;
+
+    let udpWriteMsP95 = 0;
+    if (this.writeDurations.length > 0) {
+      const sorted = [...this.writeDurations].sort((a, b) => a - b);
+      const idx = Math.min(sorted.length - 1, Math.floor(sorted.length * 0.95));
+      udpWriteMsP95 = Math.round(sorted[idx] * 10) / 10;
+    }
+
     return {
+      udpQueue: this.sendQueue.length,
+      udpQueueMax: this.maxQueueLength,
+      udpOldestMs,
+      udpWriteMsP95,
+      packetEvictions: this.packetEvictions,
       sendQueueLength: this.sendQueue.length,
       isDraining: this.isDraining,
       bytesSent: this.bytesSent,
@@ -136,9 +155,13 @@ export class UdpSocketAdapter {
     const HIGH_WATERMARK = 512;
 
     if (this.sendQueue.length >= MAX_QUEUE_SIZE) {
+      this.packetEvictions++;
       if (isControlPacket) {
         // Evict oldest short-header non-control packet (1-RTT data) to prioritize handshake/control
-        const nonControlIndex = this.sendQueue.findIndex(pkt => pkt.length > 0 && (pkt[0] & 0x80) === 0);
+        const nonControlIndex = this.sendQueue.findIndex(pkt => {
+          const raw = pkt.data || pkt;
+          return raw.length > 0 && (raw[0] & 0x80) === 0;
+        });
         if (nonControlIndex >= 0) {
           this.sendQueue.splice(nonControlIndex, 1);
         } else {
@@ -147,7 +170,10 @@ export class UdpSocketAdapter {
         }
       } else {
         // For non-control data packets, evict oldest short-header packet; never evict long-header control packets
-        const nonControlIndex = this.sendQueue.findIndex(pkt => pkt.length > 0 && (pkt[0] & 0x80) === 0);
+        const nonControlIndex = this.sendQueue.findIndex(pkt => {
+          const raw = pkt.data || pkt;
+          return raw.length > 0 && (raw[0] & 0x80) === 0;
+        });
         if (nonControlIndex >= 0) {
           this.sendQueue.splice(nonControlIndex, 1);
         } else {
@@ -156,7 +182,10 @@ export class UdpSocketAdapter {
       }
     }
 
-    this.sendQueue.push(u8);
+    this.sendQueue.push({ data: u8, enqueuedAt: Date.now() });
+    if (this.sendQueue.length > this.maxQueueLength) {
+      this.maxQueueLength = this.sendQueue.length;
+    }
     this._drainSendQueue();
 
     // Apply asynchronous backpressure when queue exceeds high watermark
@@ -170,10 +199,15 @@ export class UdpSocketAdapter {
     this.isDraining = true;
     try {
       while (this.sendQueue.length > 0 && !this.isClosed && this.writer) {
-        const chunk = this.sendQueue.shift();
+        const item = this.sendQueue.shift();
+        const chunk = item.data || item;
         this.bytesSent += chunk.length;
         this.packetsSent++;
+        const t0 = (typeof performance !== 'undefined') ? performance.now() : Date.now();
         await this.writer.write({ data: chunk });
+        const dur = ((typeof performance !== 'undefined') ? performance.now() : Date.now()) - t0;
+        this.writeDurations.push(dur);
+        if (this.writeDurations.length > 100) this.writeDurations.shift();
         this._notifyDrain();
       }
     } catch (e) {

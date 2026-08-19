@@ -9,6 +9,28 @@ import { generateNonce, deriveKey } from './brook-crypto.js';
 import { sealFrame, openLength, openPayload, buildBrookHeader } from './brook-framing.js';
 
 export class BrookTunnel {
+  static globalMetrics = {
+    rxQueuedBytes: 0,
+    uploadPendingBytes: 0,
+    writerDurations: [],
+    recordWriterWait(ms) {
+      this.writerDurations.push(ms);
+      if (this.writerDurations.length > 100) this.writerDurations.shift();
+    },
+    getWriterWaitMsP95() {
+      if (this.writerDurations.length === 0) return 0;
+      const sorted = [...this.writerDurations].sort((a, b) => a - b);
+      const idx = Math.min(sorted.length - 1, Math.floor(sorted.length * 0.95));
+      return Math.round(sorted[idx] * 10) / 10;
+    },
+    getStats() {
+      return {
+        rxQueuedBytes: Math.max(0, this.rxQueuedBytes),
+        uploadPendingBytes: Math.max(0, this.uploadPendingBytes),
+        writerWaitMs: this.getWriterWaitMsP95()
+      };
+    }
+  };
   /**
    * Run bidirectional Brook encrypted tunnel over a QUIC stream.
    *
@@ -147,6 +169,11 @@ export class BrookTunnel {
           quicManager.unregisterStream(streamId);
         }
 
+        if (rxQueuedBytes > 0) {
+          BrookTunnel.globalMetrics.rxQueuedBytes = Math.max(0, BrookTunnel.globalMetrics.rxQueuedBytes - rxQueuedBytes);
+          rxQueuedBytes = 0;
+        }
+
         // If dial never succeeded and client was not notified, signal error
         if (!serverHandshakeDone && !successSent && sendFailure && closeClientStreams) {
           try {
@@ -204,6 +231,7 @@ export class BrookTunnel {
           const { data, fin } = item;
           if (data) {
             rxQueuedBytes -= data.length;
+            BrookTunnel.globalMetrics.rxQueuedBytes = Math.max(0, BrookTunnel.globalMetrics.rxQueuedBytes - data.length);
           }
 
           if (data && data.length > 0) {
@@ -305,8 +333,11 @@ export class BrookTunnel {
                   hasExchangedData = true;
                   totalBytesRecv += plainPayload.length;
                   try {
+                    const t0 = (typeof performance !== 'undefined') ? performance.now() : Date.now();
                     await clientWriter.write(plainPayload);
-                    resetIdleTimer(180000);
+                    const waitMs = ((typeof performance !== 'undefined') ? performance.now() : Date.now()) - t0;
+                    BrookTunnel.globalMetrics.recordWriterWait(waitMs);
+                    resetIdleTimer(30000);
                     if (onBytes) onBytes(0, plainPayload.length);
                   } catch (err) {
                     cleanup('client_write_error', err);
@@ -365,6 +396,7 @@ export class BrookTunnel {
             return;
           }
           rxQueuedBytes += dataLen;
+          BrookTunnel.globalMetrics.rxQueuedBytes += dataLen;
           rxQueue.push({ data, fin });
           processRxQueue();
         },
@@ -469,6 +501,7 @@ export class BrookTunnel {
           }
 
           if (value && value.length > 0) {
+            BrookTunnel.globalMetrics.uploadPendingBytes += value.length;
             if (onClientDataRead) {
               onClientDataRead();
             }
@@ -481,9 +514,11 @@ export class BrookTunnel {
               const sealedChunk = sealFrame(ck, cnCopy, slice);
               try {
                 await quicManager.sendStreamData(streamId, sealedChunk, false);
+                BrookTunnel.globalMetrics.uploadPendingBytes = Math.max(0, BrookTunnel.globalMetrics.uploadPendingBytes - slice.length);
                 totalBytesSent += sealedChunk.length;
                 if (onBytes) onBytes(sealedChunk.length, 0);
               } catch (err) {
+                BrookTunnel.globalMetrics.uploadPendingBytes = Math.max(0, BrookTunnel.globalMetrics.uploadPendingBytes - (value.length - offset));
                 writeFailed = true;
                 break;
               }

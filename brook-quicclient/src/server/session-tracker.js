@@ -3,8 +3,9 @@
  */
 
 export class SessionTracker {
-  constructor({ onStatsUpdate }) {
+  constructor({ onStatsUpdate, getSnapshotFn = null } = {}) {
     this.onStatsUpdate = onStatsUpdate;
+    this.getSnapshotFn = getSnapshotFn;
 
     this.sessions = new Map(); // id -> sessionObj
     this.nextSessionId = 1;
@@ -17,16 +18,27 @@ export class SessionTracker {
     this.lastBytesSent = 0;
     this.lastBytesReceived = 0;
     this.lastTimestamp = Date.now();
+    this.lastPerfTime = (typeof performance !== 'undefined') ? performance.now() : Date.now();
     this.currentUploadSpeed = 0; // Bytes/sec
     this.currentDownloadSpeed = 0; // Bytes/sec
+    this.eventLoopDelayMs = 0;
 
     this.tickerInterval = null;
     this._startTicker();
   }
 
+  setSnapshotProvider(fn) {
+    this.getSnapshotFn = fn;
+  }
+
   _startTicker() {
     this.tickerInterval = setInterval(() => {
       const now = Date.now();
+      const perfNow = (typeof performance !== 'undefined') ? performance.now() : Date.now();
+      const actualDeltaMs = perfNow - this.lastPerfTime;
+      this.lastPerfTime = perfNow;
+      this.eventLoopDelayMs = Math.round(Math.max(0, actualDeltaMs - 500) * 10) / 10;
+
       const elapsedSec = (now - this.lastTimestamp) / 1000;
       if (elapsedSec > 0) {
         const sentDelta = this.totalBytesSent - this.lastBytesSent;
@@ -84,6 +96,9 @@ export class SessionTracker {
   }
 
   getStats() {
+    const transportSnapshot = this.getSnapshotFn ? this.getSnapshotFn() : {};
+    transportSnapshot.eventLoopDelayMs = this.eventLoopDelayMs;
+
     return {
       activeSessions: this.sessions.size,
       totalSessions: this.totalSessionsCount,
@@ -91,6 +106,8 @@ export class SessionTracker {
       totalBytesReceived: this.totalBytesReceived,
       uploadSpeed: this.currentUploadSpeed,
       downloadSpeed: this.currentDownloadSpeed,
+      eventLoopDelayMs: this.eventLoopDelayMs,
+      transportSnapshot,
       activeSessionList: Array.from(this.sessions.values())
     };
   }

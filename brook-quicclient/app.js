@@ -29,7 +29,7 @@ async function bootstrap() {
     modalContainer
   });
 
-  logStream.add('info', '🚀 Brook QUIC Client IWA v1.28.0 initialized');
+  logStream.add('info', '🚀 Brook QUIC Client IWA v1.29.0 initialized');
 
   // Initialize Session Tracker & Telemetry
   sessionTracker = new SessionTracker({
@@ -88,6 +88,10 @@ async function bootstrap() {
           }
         });
 
+        sessionTracker.setSnapshotProvider(() => {
+          return quicManager ? quicManager.getSnapshot(proxyDispatcher) : {};
+        });
+
         // 4. Start Inbound Listeners
         const boundPorts = await proxyDispatcher.start({
           socks5Port: config.socks5Port,
@@ -126,6 +130,8 @@ async function bootstrap() {
         try { await quicManager.close(); } catch (e) {}
         quicManager = null;
       }
+
+      sessionTracker.setSnapshotProvider(null);
 
       logStream.add('info', 'All proxy services stopped.');
     }
