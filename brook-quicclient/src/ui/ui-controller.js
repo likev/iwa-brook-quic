@@ -81,10 +81,11 @@ export class UiController {
 
     this.btnCopyLogs?.addEventListener('click', async () => {
       const stats = this.lastStats || {};
-      const logText = this.logStream.getFormattedLogs();
+      const logText = this.logStream.getFormattedLogs(true);
+      const totalCount = this.logStream.getTotalLogsCount();
       const reportHeader = [
         `================================================================`,
-        `  BROOK QUIC CLIENT IWA - DIAGNOSTIC REPORT & EVENT LOG`,
+        `  BROOK QUIC CLIENT IWA - FULL DIAGNOSTIC REPORT & COMPLETE LOG`,
         `  Generated: ${new Date().toISOString()}`,
         `================================================================`,
         `  Connection Status:  ${this.statusBadge?.textContent || 'STOPPED'}`,
@@ -96,7 +97,7 @@ export class UiController {
         `  Active Streams:     ${this.statActiveSessions?.textContent || '0'}`,
         `  Total Sessions:     ${this.statTotalSessions?.textContent || '0'}`,
         `================================================================`,
-        `\n--- LOG ENTRIES (${this.logStream.logs.length}) ---\n`
+        `\n--- COMPLETE LOG ENTRIES SINCE APP START (${totalCount} entries) ---\n`
       ].join('\n');
 
       const fullReport = reportHeader + logText;

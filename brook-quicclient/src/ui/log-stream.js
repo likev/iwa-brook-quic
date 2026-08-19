@@ -8,10 +8,11 @@ import { formatHexDump } from '../core/byte-utils.js';
 export class LogStream {
   constructor({ container, maxLogs = 500, modalContainer }) {
     this.container = container;
-    this.maxLogs = maxLogs;
+    this.maxDisplayLogs = maxLogs;
     this.modalContainer = modalContainer;
 
-    this.logs = [];
+    this.displayLogs = [];
+    this.allHistoricalLogs = []; // Stores 100% of all logs since app start
     this.filterLevel = 'all'; // 'all', 'info', 'success', 'warning', 'error'
     this.autoScroll = true;
   }
@@ -26,9 +27,13 @@ export class LogStream {
       meta
     };
 
-    this.logs.push(logItem);
-    if (this.logs.length > this.maxLogs) {
-      this.logs.shift();
+    // 1. Record in complete historical log from app start
+    this.allHistoricalLogs.push(logItem);
+
+    // 2. Keep bounded display log buffer for DOM rendering performance
+    this.displayLogs.push(logItem);
+    if (this.displayLogs.length > this.maxDisplayLogs) {
+      this.displayLogs.shift();
     }
 
     if (this._matchesFilter(level)) {
@@ -49,12 +54,17 @@ export class LogStream {
     this.render();
   }
 
-  getFormattedLogs() {
-    return this.logs.map(l => `[${l.timestamp}] ${l.level.toUpperCase().padEnd(7)} ${l.message}`).join('\n');
+  getTotalLogsCount() {
+    return this.allHistoricalLogs.length;
+  }
+
+  getFormattedLogs(fromAppStart = true) {
+    const source = fromAppStart ? this.allHistoricalLogs : this.displayLogs;
+    return source.map(l => `[${l.timestamp}] ${l.level.toUpperCase().padEnd(7)} ${l.message}`).join('\n');
   }
 
   clear() {
-    this.logs = [];
+    this.displayLogs = [];
     if (this.container) {
       DomBuilder.clear(this.container);
     }
@@ -64,7 +74,7 @@ export class LogStream {
     if (!this.container) return;
     DomBuilder.clear(this.container);
 
-    const filtered = this.logs.filter(l => this._matchesFilter(l.level));
+    const filtered = this.displayLogs.filter(l => this._matchesFilter(l.level));
     for (const logItem of filtered) {
       this._renderEntry(logItem);
     }
@@ -103,7 +113,7 @@ export class LogStream {
     this.container.appendChild(row);
 
     // Prune DOM elements if too many
-    while (this.container.children.length > this.maxLogs) {
+    while (this.container.children.length > this.maxDisplayLogs) {
       this.container.removeChild(this.container.firstChild);
     }
   }

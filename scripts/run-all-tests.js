@@ -22,6 +22,7 @@ import { UdpSocketAdapter } from '../brook-quicclient/src/quic/udp-socket-adapte
 import { QuicConnectionManager, QuicSession } from '../brook-quicclient/src/quic/quic-connection-manager.js';
 import { ProxyDispatcher } from '../brook-quicclient/src/server/proxy-dispatcher.js';
 import { TcpListener } from '../brook-quicclient/src/server/tcp-listener.js';
+import { LogStream } from '../brook-quicclient/src/ui/log-stream.js';
 
 const execAsync = promisify(exec);
 
@@ -271,6 +272,18 @@ async function runUnitTests() {
                               successTransferOutcome.terminationReason === 'normal' ||
                               (successTransferOutcome.terminationReason === 'transport_closed' && successTransferOutcome.totalBytesRecv > 0);
   assert(isSuccessTransferred === true, 'Transport closed after data transfer (>0 bytes) is classified as success (success: true)');
+
+  // Test LogStream Historical Log Preservation from App Start
+  const testLogStream = new LogStream({ container: null, maxLogs: 10 });
+  for (let i = 1; i <= 600; i++) {
+    testLogStream.add('info', `Event log #${i}`);
+  }
+  assert(testLogStream.displayLogs.length === 10, 'Display logs buffer is strictly bounded to maxLogs (10)');
+  assert(testLogStream.getTotalLogsCount() === 600, 'Historical logs retains 100% of all logs since app start (600)');
+  const allFormatted = testLogStream.getFormattedLogs(true);
+  assert(allFormatted.includes('Event log #1') && allFormatted.includes('Event log #600'), 'Formatted export includes first (#1) and last (#600) logs from app start');
+  const displayFormatted = testLogStream.getFormattedLogs(false);
+  assert(!displayFormatted.includes('Event log #1') && displayFormatted.includes('Event log #600'), 'Display formatted only contains recent bounded logs');
 
   // Test ProxyDispatcher Per-Host Dial Permit Limiter
   const testDispatcher = new ProxyDispatcher({
