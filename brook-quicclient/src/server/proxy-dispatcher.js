@@ -1,5 +1,7 @@
 /**
  * Proxy Dispatcher: coordinates listeners, protocol detection, and tunnel sessions.
+ * Implements admission control, bounded host dial queues, transactional startup/stop,
+ * deterministic retry outcomes, and one-shot proxy reply state machines.
  */
 
 import { TcpListener } from './tcp-listener.js';
@@ -27,25 +29,35 @@ export class ProxyDispatcher {
     this.onLog = onLog;
 
     this.listeners = new Map(); // name -> TcpListener
-    this.hostDialQueues = new Map(); // host -> Array of resolve callbacks
+    this.hostDialQueues = new Map(); // host -> Array<{resolve, reject}>
     this.hostActiveDials = new Map(); // host -> number
-    this.isRunning = false;
+    this.activeHandlers = new Set();
+    this.isRunning = true;
   }
 
-  async _acquireHostDialPermit(host, maxConcurrent = 2) {
+  async _acquireHostDialPermit(host, maxConcurrent = 8) {
+    if (!this.isRunning) {
+      throw new Error('ProxyDispatcher is stopped');
+    }
     const cleanHost = (host || '').toLowerCase();
     const active = this.hostActiveDials.get(cleanHost) || 0;
     if (active < maxConcurrent) {
       this.hostActiveDials.set(cleanHost, active + 1);
       return;
     }
-    return new Promise(resolve => {
-      let queue = this.hostDialQueues.get(cleanHost);
-      if (!queue) {
-        queue = [];
-        this.hostDialQueues.set(cleanHost, queue);
-      }
-      queue.push(resolve);
+
+    const MAX_HOST_QUEUE_DEPTH = 64;
+    let queue = this.hostDialQueues.get(cleanHost);
+    if (!queue) {
+      queue = [];
+      this.hostDialQueues.set(cleanHost, queue);
+    }
+    if (queue.length >= MAX_HOST_QUEUE_DEPTH) {
+      throw new Error(`Host dial queue full for ${cleanHost} (${queue.length} >= ${MAX_HOST_QUEUE_DEPTH})`);
+    }
+
+    return new Promise((resolve, reject) => {
+      queue.push({ resolve, reject });
     });
   }
 
@@ -54,7 +66,8 @@ export class ProxyDispatcher {
     const queue = this.hostDialQueues.get(cleanHost);
     if (queue && queue.length > 0) {
       const next = queue.shift();
-      next();
+      if (queue.length === 0) this.hostDialQueues.delete(cleanHost);
+      if (next && next.resolve) next.resolve();
     } else {
       const active = this.hostActiveDials.get(cleanHost) || 1;
       if (active <= 1) {
@@ -72,19 +85,7 @@ export class ProxyDispatcher {
   }
 
   /**
-   * Start proxy listener(s).
-   *
-   * Modes:
-   * 1. Dual Mode: Separate SOCKS5 port (1080/10808) and HTTP port (8080)
-   * 2. Single Auto-Detect Mode: Both protocols multiplexed on single port
-   *
-   * @param {Object} config
-   * @param {number} config.socks5Port
-   * @param {number} config.httpPort
-   * @param {boolean} config.enableSocks5
-   * @param {boolean} config.enableHttp
-   * @param {boolean} config.autoDetectMode
-   * @returns {Promise<{ socks5Port: number, httpPort: number }>}
+   * Start proxy listener(s) with atomic rollback on failure.
    */
   async start({
     socks5Port = 10808,
@@ -99,65 +100,82 @@ export class ProxyDispatcher {
     let boundS5Port = socks5Port;
     let boundHttpPort = httpPort;
 
-    if (autoDetectMode) {
-      // Unified Auto-Detect Listener on socks5Port
-      const listener = new TcpListener({
-        localPort: socks5Port,
-        onConnection: (socket) => this._handleClient(socket, 'auto'),
-        onError: (err) => this._log('error', `Unified listener error: ${err.message}`),
-        onClose: () => this._log('info', 'Unified listener closed'),
-        onFallback: (reqPort, actualPort) => {
-          this._log('warning', `⚠️ Chrome blocked fixed port ${reqPort}. Automatically assigned dynamic port ${actualPort}!`);
-        }
-      });
-      await listener.start();
-      boundS5Port = listener.localPort;
-      boundHttpPort = listener.localPort;
-      this.listeners.set('unified', listener);
-      this._log('success', `⚡ Unified Auto-Detect Proxy listening on 127.0.0.1:${listener.localPort}`);
-    } else {
-      // Separate SOCKS5 Listener
-      if (enableSocks5) {
-        const s5Listener = new TcpListener({
+    try {
+      if (autoDetectMode) {
+        // Unified Auto-Detect Listener on socks5Port
+        const listener = new TcpListener({
           localPort: socks5Port,
-          onConnection: (socket) => this._handleClient(socket, 'socks5'),
-          onError: (err) => this._log('error', `SOCKS5 listener error: ${err.message}`),
-          onClose: () => this._log('info', 'SOCKS5 listener closed'),
+          onConnection: (socket, onDone) => this._handleClient(socket, 'auto', onDone),
+          onError: (err) => this._log('error', `Unified listener error: ${err.message}`),
+          onClose: () => this._log('info', 'Unified listener closed'),
           onFallback: (reqPort, actualPort) => {
             this._log('warning', `⚠️ Chrome blocked fixed port ${reqPort}. Automatically assigned dynamic port ${actualPort}!`);
           }
         });
-        await s5Listener.start();
-        boundS5Port = s5Listener.localPort;
-        this.listeners.set('socks5', s5Listener);
-        this._log('success', `🧦 SOCKS5 Proxy listening on 127.0.0.1:${s5Listener.localPort}`);
+        await listener.start();
+        boundS5Port = listener.localPort;
+        boundHttpPort = listener.localPort;
+        this.listeners.set('unified', listener);
+        this._log('success', `⚡ Unified Auto-Detect Proxy listening on 127.0.0.1:${listener.localPort}`);
+      } else {
+        // Separate SOCKS5 Listener
+        if (enableSocks5) {
+          const s5Listener = new TcpListener({
+            localPort: socks5Port,
+            onConnection: (socket, onDone) => this._handleClient(socket, 'socks5', onDone),
+            onError: (err) => this._log('error', `SOCKS5 listener error: ${err.message}`),
+            onClose: () => this._log('info', 'SOCKS5 listener closed'),
+            onFallback: (reqPort, actualPort) => {
+              this._log('warning', `⚠️ Chrome blocked fixed port ${reqPort}. Automatically assigned dynamic port ${actualPort}!`);
+            }
+          });
+          await s5Listener.start();
+          boundS5Port = s5Listener.localPort;
+          this.listeners.set('socks5', s5Listener);
+          this._log('success', `🧦 SOCKS5 Proxy listening on 127.0.0.1:${s5Listener.localPort}`);
+        }
+
+        // Separate HTTP Proxy Listener
+        if (enableHttp) {
+          const httpListener = new TcpListener({
+            localPort: httpPort,
+            onConnection: (socket, onDone) => this._handleClient(socket, 'http', onDone),
+            onError: (err) => this._log('error', `HTTP Proxy listener error: ${err.message}`),
+            onClose: () => this._log('info', 'HTTP Proxy listener closed'),
+            onFallback: (reqPort, actualPort) => {
+              this._log('warning', `⚠️ Chrome blocked fixed port ${reqPort}. Automatically assigned dynamic port ${actualPort}!`);
+            }
+          });
+          await httpListener.start();
+          boundHttpPort = httpListener.localPort;
+          this.listeners.set('http', httpListener);
+          this._log('success', `🌐 HTTP/HTTPS Proxy listening on 127.0.0.1:${httpListener.localPort}`);
+        }
       }
 
-      // Separate HTTP Proxy Listener
-      if (enableHttp) {
-        const httpListener = new TcpListener({
-          localPort: httpPort,
-          onConnection: (socket) => this._handleClient(socket, 'http'),
-          onError: (err) => this._log('error', `HTTP Proxy listener error: ${err.message}`),
-          onClose: () => this._log('info', 'HTTP Proxy listener closed'),
-          onFallback: (reqPort, actualPort) => {
-            this._log('warning', `⚠️ Chrome blocked fixed port ${reqPort}. Automatically assigned dynamic port ${actualPort}!`);
-          }
-        });
-        await httpListener.start();
-        boundHttpPort = httpListener.localPort;
-        this.listeners.set('http', httpListener);
-        this._log('success', `🌐 HTTP/HTTPS Proxy listening on 127.0.0.1:${httpListener.localPort}`);
-      }
+      return {
+        socks5Port: boundS5Port,
+        httpPort: boundHttpPort
+      };
+    } catch (err) {
+      // Rollback any successfully bound listeners on failure
+      await this.stop();
+      throw err;
     }
-
-    return {
-      socks5Port: boundS5Port,
-      httpPort: boundHttpPort
-    };
   }
 
-  async _handleClient(acceptedSocket, expectedProtocol = 'auto') {
+  async _handleClient(acceptedSocket, expectedProtocol = 'auto', onComplete = null) {
+    const handlerPromise = this._processClient(acceptedSocket, expectedProtocol);
+    this.activeHandlers.add(handlerPromise);
+    try {
+      await handlerPromise;
+    } finally {
+      this.activeHandlers.delete(handlerPromise);
+      if (onComplete) onComplete();
+    }
+  }
+
+  async _processClient(acceptedSocket, expectedProtocol = 'auto') {
     let reader = null;
     let writer = null;
     let session = null;
@@ -167,7 +185,7 @@ export class ProxyDispatcher {
       reader = readable.getReader();
       writer = writable.getWriter();
 
-      // Read initial chunk to identify protocol / start handshake with 10s timeout
+      // Read initial chunk to identify protocol with 10s deadline
       let initialChunk = null;
       let readTimer = null;
       try {
@@ -184,7 +202,7 @@ export class ProxyDispatcher {
         }
         initialChunk = readResult.value;
       } catch (readErr) {
-        clearTimeout(readTimer);
+        if (readTimer) clearTimeout(readTimer);
         await reader.cancel().catch(() => {});
         await writer.close().catch(() => {});
         return;
@@ -198,28 +216,41 @@ export class ProxyDispatcher {
       let dstBytes = null;
       let targetStr = '';
       let leftover = new Uint8Array(0);
-      let sendSuccess = null;
-      let sendFailure = null;
+      let rawSendSuccess = null;
+      let rawSendFailure = null;
 
       if (proto === ProtocolType.SOCKS5 || proto === 'socks5') {
-        const res = await Socks5Parser.handleHandshake(initialChunk, reader, writer);
+        const res = await Socks5Parser.handleHandshake(initialChunk, reader, writer, 8000);
         dstBytes = res.dstBytes;
         targetStr = res.targetStr;
         leftover = res.leftover;
-        sendSuccess = res.sendSuccess;
-        sendFailure = res.sendFailure;
+        rawSendSuccess = res.sendSuccess;
+        rawSendFailure = res.sendFailure;
         proto = 'SOCKS5';
       } else if (proto === ProtocolType.HTTP || proto === 'http') {
-        const res = await HttpProxyParser.handleHandshake(initialChunk, reader, writer);
+        const res = await HttpProxyParser.handleHandshake(initialChunk, reader, writer, 8000);
         dstBytes = res.dstBytes;
         targetStr = res.targetStr;
         leftover = res.leftover;
-        sendSuccess = res.sendSuccess;
-        sendFailure = res.sendFailure;
+        rawSendSuccess = res.sendSuccess;
+        rawSendFailure = res.sendFailure;
         proto = res.isConnect ? 'HTTPS CONNECT' : 'HTTP Plain';
       } else {
         throw new Error(`Unrecognized protocol preamble: 0x${initialChunk[0].toString(16)}`);
       }
+
+      // One-shot state machine for proxy success/failure responses across retries
+      let proxyReplied = false;
+      const sendSuccessOnce = async () => {
+        if (proxyReplied) return;
+        proxyReplied = true;
+        if (rawSendSuccess) await rawSendSuccess();
+      };
+      const sendFailureOnce = async (code) => {
+        if (proxyReplied) return;
+        proxyReplied = true;
+        if (rawSendFailure) await rawSendFailure(code);
+      };
 
       session = this.sessionTracker.createSession({
         protocol: proto,
@@ -245,6 +276,10 @@ export class ProxyDispatcher {
 
       try {
         for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+          if (!this.isRunning) {
+            throw new Error('ProxyDispatcher was stopped during dial attempt');
+          }
+
           // Resolve domain name to IPv4 locally via Brook DNS resolver (Anycast round-robin distribution)
           let forwardDstBytes = dstBytes;
           const resolvedIp = await DnsResolver.resolveIpv4(host, this.quicManager, this.password, {
@@ -280,8 +315,10 @@ export class ProxyDispatcher {
 
           // Fast 2.0s dial timeout on initial attempt, 2.2s on retry 2, 2.5s on retry 3
           const dialTimeoutMs = attempt === 1 ? 2000 : (attempt === 2 ? 2200 : 2500);
+          let outcome = null;
+
           try {
-            await BrookTunnel.run({
+            outcome = await BrookTunnel.run({
               clientReader: reader,
               clientWriter: writer,
               quicManager: quicSession,
@@ -292,8 +329,8 @@ export class ProxyDispatcher {
               clockOffsetSec: this.clockOffsetSec,
               targetStr,
               sessionId: session.id,
-              sendSuccess,
-              sendFailure: attempt === MAX_ATTEMPTS ? sendFailure : null,
+              sendSuccess: sendSuccessOnce,
+              sendFailure: attempt === MAX_ATTEMPTS ? sendFailureOnce : null,
               dialTimeoutMs,
               onClientDataRead: () => {
                 clientDataConsumed = true;
@@ -303,20 +340,33 @@ export class ProxyDispatcher {
               },
               onClose: () => {
                 releaseHostPermitOnce();
-                if (session) {
-                  this.sessionTracker.closeSession(session.id);
-                }
                 quicSession.close();
               },
               onLog: (lvl, msg) => this._log(lvl, msg)
             });
-            tunnelError = null;
-            break; // Tunnel completed successfully
+
+            if (outcome.success) {
+              tunnelError = null;
+              break; // Tunnel completed successfully
+            } else {
+              tunnelError = outcome.error || new Error(`Brook tunnel failed (${outcome.kind})`);
+              quicSession.close();
+
+              // Do not retry if client explicitly closed, or if payload data was already transmitted/consumed
+              const bytesReceived = session ? session.bytesReceived : 0;
+              if (clientDataConsumed || proxyReplied || bytesReceived > 0 || outcome.kind === 'client_abort' || outcome.kind === 'client_read_error' || outcome.kind === 'rx_overflow') {
+                break;
+              }
+
+              if (attempt < MAX_ATTEMPTS) {
+                this._log('warning', `[#${session.id}] ⚠️ [Brook] Dial attempt ${attempt} for ${targetStr} failed (${outcome.kind}). Retrying with fresh QUIC session (${attempt + 1}/${MAX_ATTEMPTS})...`);
+              }
+            }
           } catch (err) {
             tunnelError = err;
             quicSession.close();
-            // Do not retry if client explicitly closed, or if payload data was already transmitted/consumed
-            if (clientDataConsumed || err.message.includes('client_closed') || err.message.includes('client_abort') || err.message.includes('client_write_error') || (session && session.bytesRecv > 0)) {
+            const bytesReceived = session ? session.bytesReceived : 0;
+            if (clientDataConsumed || proxyReplied || bytesReceived > 0 || err.message.includes('client_closed') || err.message.includes('client_abort') || err.message.includes('client_write_error')) {
               break;
             }
             if (attempt < MAX_ATTEMPTS) {
@@ -327,16 +377,16 @@ export class ProxyDispatcher {
 
         if (tunnelError) {
           releaseHostPermitOnce();
-          if (sendFailure) await sendFailure(0x05);
+          await sendFailureOnce(0x05);
           throw tunnelError;
         }
       } finally {
         releaseHostPermitOnce();
+        if (session) {
+          this.sessionTracker.closeSession(session.id);
+        }
       }
     } catch (err) {
-      if (session) {
-        this.sessionTracker.closeSession(session.id);
-      }
       this._log('warning', `Proxy session error: ${err.message}`);
 
       try { if (reader) { await reader.cancel().catch(() => {}); reader.releaseLock(); } } catch (e) {}
@@ -347,11 +397,31 @@ export class ProxyDispatcher {
 
   async stop() {
     this.isRunning = false;
+
+    // 1. Drain and reject all pending host dial queues
+    for (const [host, queue] of this.hostDialQueues.entries()) {
+      while (queue.length > 0) {
+        const next = queue.shift();
+        if (next && next.reject) {
+          next.reject(new Error('ProxyDispatcher is stopped'));
+        }
+      }
+    }
+    this.hostDialQueues.clear();
+    this.hostActiveDials.clear();
+
+    // 2. Stop all listeners
     for (const [name, listener] of this.listeners.entries()) {
       try {
         await listener.stop();
       } catch (e) {}
     }
     this.listeners.clear();
+
+    // 3. Await active handlers
+    if (this.activeHandlers.size > 0) {
+      await Promise.allSettled(Array.from(this.activeHandlers));
+      this.activeHandlers.clear();
+    }
   }
 }

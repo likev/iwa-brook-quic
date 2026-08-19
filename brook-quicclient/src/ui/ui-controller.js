@@ -284,7 +284,10 @@ export class UiController {
 
     if (this.emptySessionNotice) this.emptySessionNotice.classList.add('hidden');
 
-    for (const s of sessions) {
+    const MAX_DISPLAYED_SESSIONS = 25;
+    const displayed = sessions.slice(0, MAX_DISPLAYED_SESSIONS);
+
+    for (const s of displayed) {
       const durationSec = Math.round((Date.now() - s.startTime) / 1000);
       const row = DomBuilder.el('tr', {
         classes: ['session-row'],

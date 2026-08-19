@@ -1,7 +1,7 @@
 {
   "name": "Brook QUIC Client IWA",
   "short_name": "BrookQUIC",
-  "version": "1.16.0",
+  "version": "1.17.0",
   "update_manifest_url": "https://t.iread.fun/downloads/iwa/dist/brook-quicclient-update-manifest.json",
   "id": "/",
   "start_url": "/",

@@ -1,6 +1,7 @@
 /**
  * HTTP Proxy Protocol Parser (RFC 7230 / RFC 7231).
  * Supports both HTTP CONNECT tunneling (for HTTPS) and HTTP forward proxy requests.
+ * Includes deadline protection, max header caps, and one-shot safe reply functions.
  */
 
 import { encodeAddress, parseHostPort } from '../core/byte-utils.js';
@@ -24,10 +25,12 @@ export class HttpProxyParser {
    * @param {Uint8Array} initialChunk - First chunk from TCP client
    * @param {ReadableStreamDefaultReader} reader - Stream reader for subsequent chunks if needed
    * @param {WritableStreamDefaultWriter} writer - Stream writer to send HTTP replies
+   * @param {number} [timeoutMs=8000] - Total negotiation timeout in ms
    * @returns {Promise<{ dstBytes: Uint8Array, targetStr: string, leftover: Uint8Array, isConnect: boolean, sendSuccess: () => Promise<void>, sendFailure: (status?: number) => Promise<void> }>}
    */
-  static async handleHandshake(initialChunk, reader, writer) {
+  static async handleHandshake(initialChunk, reader, writer, timeoutMs = 8000) {
     let buf = initialChunk;
+    const startTime = Date.now();
 
     // Read until we find the end of HTTP headers (\r\n\r\n or \n\n) directly in raw bytes
     let headerBytesLen = findHeaderEnd(buf);
@@ -40,13 +43,30 @@ export class HttpProxyParser {
         throw new Error('HTTP header too large (> 8KB)');
       }
 
-      const { value, done } = await reader.read();
-      if (done || !value) throw new Error('Client disconnected during HTTP header negotiation');
-      const merged = new Uint8Array(buf.length + value.length);
-      merged.set(buf, 0);
-      merged.set(value, buf.length);
-      buf = merged;
-      headerBytesLen = findHeaderEnd(buf);
+      const remainingMs = timeoutMs - (Date.now() - startTime);
+      if (remainingMs <= 0) {
+        throw new Error('Client timed out while sending HTTP proxy headers');
+      }
+
+      let timer = null;
+      try {
+        const readPromise = reader.read();
+        const timeoutPromise = new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error('HTTP header read chunk timed out')), remainingMs);
+        });
+        const { value, done } = await Promise.race([readPromise, timeoutPromise]);
+        clearTimeout(timer);
+
+        if (done || !value) throw new Error('Client disconnected during HTTP header negotiation');
+        const merged = new Uint8Array(buf.length + value.length);
+        merged.set(buf, 0);
+        merged.set(value, buf.length);
+        buf = merged;
+        headerBytesLen = findHeaderEnd(buf);
+      } catch (err) {
+        if (timer) clearTimeout(timer);
+        throw err;
+      }
     }
 
     const headerBytes = buf.subarray(0, headerBytesLen);
@@ -103,38 +123,43 @@ export class HttpProxyParser {
           port = parsed.port;
         } else {
           try {
-            await writer.write(new TextEncoder().encode('HTTP/1.1 400 Bad Request\r\n\r\nHost header required\r\n'));
+            await writer.write(new TextEncoder().encode('HTTP/1.1 400 Bad Request (Missing Host Header)\r\n\r\n'));
           } catch (e) {}
-          throw new Error('Plain HTTP proxy request missing Host header and absolute URI');
+          throw new Error('HTTP plain proxy request missing Host header');
         }
       }
 
-      const restOfHeaders = headerStr.substring(firstLineEnd);
-      const rewrittenFirstLine = `${method} ${path} ${parts[2] || 'HTTP/1.1'}`;
-      const rewrittenHeaders = rewrittenFirstLine + restOfHeaders;
-      const rewrittenBytes = new TextEncoder().encode(rewrittenHeaders);
+      const version = parts[2] || 'HTTP/1.1';
+      const newFirstLine = `${method} ${path} ${version}`;
+      const rewrittenHeaders = newFirstLine + headerStr.substring(firstLineEnd);
+      const rewrittenHeaderBytes = new TextEncoder().encode(rewrittenHeaders);
 
-      const bodyBytes = buf.slice(headerBytesLen);
-
-      leftover = new Uint8Array(rewrittenBytes.length + bodyBytes.length);
-      leftover.set(rewrittenBytes, 0);
-      leftover.set(bodyBytes, rewrittenBytes.length);
+      const bodyLeftover = buf.slice(headerBytesLen);
+      const mergedLeftover = new Uint8Array(rewrittenHeaderBytes.length + bodyLeftover.length);
+      mergedLeftover.set(rewrittenHeaderBytes, 0);
+      mergedLeftover.set(bodyLeftover, rewrittenHeaderBytes.length);
+      leftover = mergedLeftover;
     }
 
     const dstBytes = encodeAddress(host, port);
     const targetStr = `${host}:${port}`;
 
+    let replySent = false;
+
     const sendSuccess = async () => {
+      if (replySent) return;
+      replySent = true;
       if (isConnect) {
-        const reply = new TextEncoder().encode('HTTP/1.1 200 Connection Established\r\nProxy-Agent: Brook-IWA/1.15.0\r\n\r\n');
-        await writer.write(reply);
+        await writer.write(new TextEncoder().encode('HTTP/1.1 200 Connection Established\r\nProxy-Agent: Brook-QUIC-IWA\r\n\r\n'));
       }
     };
 
-    const sendFailure = async (status = 502) => {
+    const sendFailure = async (statusCode = 502) => {
+      if (replySent) return;
+      replySent = true;
       try {
-        const reply = new TextEncoder().encode(`HTTP/1.1 ${status} Bad Gateway\r\nProxy-Agent: Brook-IWA/1.15.0\r\nContent-Type: text/plain\r\n\r\nProxy connect failed\r\n`);
-        await writer.write(reply);
+        const msg = statusCode === 504 ? 'Gateway Timeout' : 'Bad Gateway';
+        await writer.write(new TextEncoder().encode(`HTTP/1.1 ${statusCode} ${msg}\r\nProxy-Agent: Brook-QUIC-IWA\r\nConnection: close\r\n\r\n`));
       } catch (e) {}
     };
 

@@ -29,7 +29,7 @@ async function bootstrap() {
     modalContainer
   });
 
-  logStream.add('info', '🚀 Brook QUIC Client IWA v1.16.0 initialized');
+  logStream.add('info', '🚀 Brook QUIC Client IWA v1.17.0 initialized');
 
   // Initialize Session Tracker & Telemetry
   sessionTracker = new SessionTracker({
@@ -51,65 +51,79 @@ async function bootstrap() {
         logStream.add('warning', '⚠️ Direct Sockets requires an Isolated Web App context (isolated-app://) or Chrome IWA flags.');
       }
 
-      // 1. Auto-synchronize network clock drift
-      const clockDriftSec = await QuicConnectionManager.measureClockDrift();
-      if (Math.abs(clockDriftSec) > 1) {
-        logStream.add('info', `⏱️ Network time sync: local clock drift is ${clockDriftSec > 0 ? '+' : ''}${clockDriftSec}s (auto-compensated)`);
-      }
+      try {
+        // 1. Auto-synchronize network clock drift
+        const clockDriftSec = await QuicConnectionManager.measureClockDrift();
+        if (Math.abs(clockDriftSec) > 1) {
+          logStream.add('info', `⏱️ Network time sync: local clock drift is ${clockDriftSec > 0 ? '+' : ''}${clockDriftSec}s (auto-compensated)`);
+        }
 
-      // 2. Setup QUIC Connection Manager
-      quicManager = new QuicConnectionManager({
-        serverHost: config.serverHost,
-        serverPort: config.serverPort,
-        alpn: ['h3'],
-        onStateChange: (state, details) => {
-          if (uiController) {
-            uiController.updateConnectionState(state, details);
+        // 2. Setup QUIC Connection Manager
+        quicManager = new QuicConnectionManager({
+          serverHost: config.serverHost,
+          serverPort: config.serverPort,
+          alpn: ['h3'],
+          onStateChange: (state, details) => {
+            if (uiController) {
+              uiController.updateConnectionState(state, details);
+            }
+          },
+          onLog: (lvl, msg, meta) => {
+            logStream.add(lvl, msg, meta);
           }
-        },
-        onLog: (lvl, msg, meta) => {
-          logStream.add(lvl, msg, meta);
+        });
+
+        // Connect to Brook QUIC server
+        await quicManager.connect();
+
+        // 3. Setup Proxy Dispatcher
+        proxyDispatcher = new ProxyDispatcher({
+          quicManager,
+          sessionTracker,
+          password: config.password,
+          withoutBrook: config.withoutBrook,
+          clockOffsetSec: clockDriftSec,
+          onLog: (lvl, msg, meta) => {
+            logStream.add(lvl, msg, meta);
+          }
+        });
+
+        // 4. Start Inbound Listeners
+        const boundPorts = await proxyDispatcher.start({
+          socks5Port: config.socks5Port,
+          httpPort: config.httpPort,
+          enableSocks5: true,
+          enableHttp: true,
+          autoDetectMode: config.autoDetectMode
+        });
+
+        if (boundPorts && uiController) {
+          uiController.updateBoundPorts(boundPorts);
         }
-      });
-
-      // 2. Connect to Brook QUIC server
-      await quicManager.connect();
-
-      // 3. Setup Proxy Dispatcher
-      proxyDispatcher = new ProxyDispatcher({
-        quicManager,
-        sessionTracker,
-        password: config.password,
-        withoutBrook: config.withoutBrook,
-        clockOffsetSec: clockDriftSec,
-        onLog: (lvl, msg, meta) => {
-          logStream.add(lvl, msg, meta);
+      } catch (err) {
+        logStream.add('error', `❌ Failed to start proxy: ${err.message}`);
+        // Transactional rollback on startup failure
+        if (proxyDispatcher) {
+          try { await proxyDispatcher.stop(); } catch (e) {}
+          proxyDispatcher = null;
         }
-      });
-
-      // 4. Start Inbound Listeners
-      const boundPorts = await proxyDispatcher.start({
-        socks5Port: config.socks5Port,
-        httpPort: config.httpPort,
-        enableSocks5: true,
-        enableHttp: true,
-        autoDetectMode: config.autoDetectMode
-      });
-
-      if (boundPorts && uiController) {
-        uiController.updateBoundPorts(boundPorts);
+        if (quicManager) {
+          try { await quicManager.close(); } catch (e) {}
+          quicManager = null;
+        }
+        throw err;
       }
     },
     onStop: async () => {
       logStream.add('warning', 'Stopping all proxy listeners and closing QUIC session...');
 
       if (proxyDispatcher) {
-        await proxyDispatcher.stop();
+        try { await proxyDispatcher.stop(); } catch (e) {}
         proxyDispatcher = null;
       }
 
       if (quicManager) {
-        await quicManager.close();
+        try { await quicManager.close(); } catch (e) {}
         quicManager = null;
       }
 

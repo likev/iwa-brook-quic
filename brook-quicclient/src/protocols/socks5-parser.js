@@ -1,5 +1,6 @@
 /**
  * SOCKS5 Protocol Parser (RFC 1928).
+ * Includes deadline protection, max buffer caps, and one-shot safe reply functions.
  */
 
 import { readUInt16BE, formatIpv6 } from '../core/byte-utils.js';
@@ -11,20 +12,45 @@ export class Socks5Parser {
    * @param {Uint8Array} initialChunk - First chunk read from TCP client
    * @param {ReadableStreamDefaultReader} reader - Stream reader for subsequent chunks if needed
    * @param {WritableStreamDefaultWriter} writer - Stream writer to send SOCKS5 replies
+   * @param {number} [timeoutMs=8000] - Total negotiation timeout in ms
    * @returns {Promise<{ dstBytes: Uint8Array, targetStr: string, leftover: Uint8Array, sendSuccess: () => Promise<void>, sendFailure: (code?: number) => Promise<void> }>}
    */
-  static async handleHandshake(initialChunk, reader, writer) {
+  static async handleHandshake(initialChunk, reader, writer, timeoutMs = 8000) {
     let buf = initialChunk;
+    const startTime = Date.now();
 
-    // Helper to ensure buffer has at least minLen bytes
+    // Helper to ensure buffer has at least minLen bytes with deadline protection
     async function ensureBytes(minLen) {
+      const MAX_SOCKS5_BUF = 1024;
       while (buf.length < minLen) {
-        const { value, done } = await reader.read();
-        if (done || !value) throw new Error(`Client disconnected during SOCKS5 negotiation (expected ${minLen} bytes, got ${buf.length})`);
-        const merged = new Uint8Array(buf.length + value.length);
-        merged.set(buf, 0);
-        merged.set(value, buf.length);
-        buf = merged;
+        if (buf.length > MAX_SOCKS5_BUF) {
+          throw new Error(`SOCKS5 buffer exceeded limit (${buf.length} > ${MAX_SOCKS5_BUF})`);
+        }
+        const remainingMs = timeoutMs - (Date.now() - startTime);
+        if (remainingMs <= 0) {
+          throw new Error(`SOCKS5 handshake negotiation timed out (expected ${minLen} bytes, got ${buf.length})`);
+        }
+
+        let timer = null;
+        try {
+          const readPromise = reader.read();
+          const timeoutPromise = new Promise((_, reject) => {
+            timer = setTimeout(() => reject(new Error('SOCKS5 read chunk timed out')), remainingMs);
+          });
+          const { value, done } = await Promise.race([readPromise, timeoutPromise]);
+          clearTimeout(timer);
+
+          if (done || !value) {
+            throw new Error(`Client disconnected during SOCKS5 negotiation (expected ${minLen} bytes, got ${buf.length})`);
+          }
+          const merged = new Uint8Array(buf.length + value.length);
+          merged.set(buf, 0);
+          merged.set(value, buf.length);
+          buf = merged;
+        } catch (err) {
+          if (timer) clearTimeout(timer);
+          throw err;
+        }
       }
     }
 
@@ -50,7 +76,9 @@ export class Socks5Parser {
     }
     if (buf[1] !== 0x01) {
       // Send Command Not Supported error (0x07)
-      await writer.write(new Uint8Array([0x05, 0x07, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]));
+      try {
+        await writer.write(new Uint8Array([0x05, 0x07, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]));
+      } catch (e) {}
       throw new Error(`Unsupported SOCKS5 command: 0x${buf[1].toString(16)} (only CONNECT 0x01 is supported)`);
     }
 
@@ -82,7 +110,9 @@ export class Socks5Parser {
       const port = readUInt16BE(buf, 20);
       targetHost = `[${ipv6}]:${port}`;
     } else {
-      await writer.write(new Uint8Array([0x05, 0x08, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]));
+      try {
+        await writer.write(new Uint8Array([0x05, 0x08, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]));
+      } catch (e) {}
       throw new Error(`Unsupported ATYP: 0x${atyp.toString(16)}`);
     }
 
@@ -91,7 +121,11 @@ export class Socks5Parser {
     const dstBytes = buf.slice(3, totalReqLen);
     const leftover = buf.slice(totalReqLen);
 
+    let replySent = false;
+
     const sendSuccess = async () => {
+      if (replySent) return;
+      replySent = true;
       await writer.write(new Uint8Array([
         0x05, 0x00, 0x00, 0x01,
         0x00, 0x00, 0x00, 0x00,
@@ -100,6 +134,8 @@ export class Socks5Parser {
     };
 
     const sendFailure = async (code = 0x05) => {
+      if (replySent) return;
+      replySent = true;
       try {
         await writer.write(new Uint8Array([
           0x05, code, 0x00, 0x01,

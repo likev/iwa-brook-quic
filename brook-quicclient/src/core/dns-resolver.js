@@ -110,6 +110,11 @@ export class DnsResolver {
     }
   }
 
+  static clear() {
+    this.cache.clear();
+    this.pending.clear();
+  }
+
   static async _resolveViaBrook(host, quicManager, password, { timeoutMs = 2000, withoutBrook = false, clockOffsetSec = 0 } = {}) {
     let session = null;
     try {
@@ -169,9 +174,13 @@ export class DnsResolver {
           }
         });
 
-        session.sendStreamData(streamId, cn, false).catch(() => {});
-        session.sendStreamData(streamId, header, false).catch(() => {});
-        session.sendStreamData(streamId, sealedDns, false).catch(() => {});
+        session.sendStreamData(streamId, cn, false)
+          .then(() => session.sendStreamData(streamId, header, false))
+          .then(() => session.sendStreamData(streamId, sealedDns, false))
+          .catch((err) => {
+            clearTimeout(timer);
+            reject(err);
+          });
       });
 
       if (ips && ips.length > 0) {

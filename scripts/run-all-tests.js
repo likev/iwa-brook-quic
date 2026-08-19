@@ -383,6 +383,120 @@ async function runUnitTests() {
   datagramSession.feedDatagram(new Uint8Array([0x40, 1, 2, 3]), '127.0.0.1', 4433);
   assert(datagramSession.isAlive() === true, 'feedDatagram updates lastPacketReceivedTime and restores liveness');
   assert(Date.now() - datagramSession.lastPacketReceivedTime < 50, 'lastPacketReceivedTime is updated to current timestamp on any inbound packet');
+
+  // Test Review 7: BrookTunnel Structured Outcome on Target Refusal
+  let refusalCb = null;
+  const mockRefusalSession = {
+    allocateStreamId: () => 0,
+    registerStream: (id, cb) => { refusalCb = cb; },
+    unregisterStream: () => {},
+    ensureConnected: async () => {},
+    sendStreamData: async () => {}
+  };
+  let cancelRefusalReader = null;
+  const refusalReader = {
+    read: async () => new Promise(r => { cancelRefusalReader = r; }),
+    cancel: async () => { if (cancelRefusalReader) cancelRefusalReader({ done: true }); },
+    releaseLock: () => {}
+  };
+  const refusalWriter = { write: async () => {}, close: async () => {}, releaseLock: () => {} };
+  const refusalPromise = BrookTunnel.run({
+    clientReader: refusalReader,
+    clientWriter: refusalWriter,
+    quicManager: mockRefusalSession,
+    dstBytes: new Uint8Array([0x01, 1, 1, 1, 1, 0, 80]),
+    password: '271828brook',
+    targetStr: '1.1.1.1:80',
+    sessionId: 'test-refusal'
+  });
+  await new Promise(r => setTimeout(r, 10));
+  refusalCb.onData(new Uint8Array(12).fill(0xcc), false); // Server nonce
+  await new Promise(r => setTimeout(r, 10));
+  refusalCb.onData(new Uint8Array(0), true); // Server FIN with 0 payload bytes (target dial refused)
+  const refusalOutcome = await refusalPromise;
+  assert(refusalOutcome.success === false, 'BrookTunnel reports success: false on 0-byte target refusal');
+  assert(refusalOutcome.kind === 'target_dial_refused', `BrookTunnel identifies refusal kind correctly (${refusalOutcome.kind})`);
+
+  // Test Review 7: BrookTunnel Bounded Receive Buffer Overflow Protection
+  let overflowCb = null;
+  const mockOverflowSession = {
+    allocateStreamId: () => 0,
+    registerStream: (id, cb) => { overflowCb = cb; },
+    unregisterStream: () => {},
+    ensureConnected: async () => {},
+    sendStreamData: async () => {}
+  };
+  let cancelOverflowReader = null;
+  const overflowReader = {
+    read: async () => new Promise(r => { cancelOverflowReader = r; }),
+    cancel: async () => { if (cancelOverflowReader) cancelOverflowReader({ done: true }); },
+    releaseLock: () => {}
+  };
+  const overflowWriter = { write: async () => {}, close: async () => {}, releaseLock: () => {} };
+  const overflowPromise = BrookTunnel.run({
+    clientReader: overflowReader,
+    clientWriter: overflowWriter,
+    quicManager: mockOverflowSession,
+    dstBytes: new Uint8Array([0x01, 1, 1, 1, 1, 0, 80]),
+    password: '271828brook',
+    targetStr: '1.1.1.1:80',
+    sessionId: 'test-rx-overflow'
+  });
+  await new Promise(r => setTimeout(r, 10));
+  // Send a chunk larger than 2MB
+  const largeChunk = new Uint8Array(2.5 * 1024 * 1024);
+  overflowCb.onData(largeChunk, false);
+  const overflowOutcome = await overflowPromise;
+  assert(overflowOutcome.success === false, 'BrookTunnel fails on rx buffer overflow');
+  assert(overflowOutcome.kind === 'rx_overflow', `BrookTunnel termination reason is rx_overflow (${overflowOutcome.kind})`);
+
+  // Test Review 7: ProxyDispatcher Host Dial Queue Depth Cap & Stop Draining
+  const depthDispatcher = new ProxyDispatcher({
+    quicManager: null,
+    sessionTracker: { createSession: () => ({ id: 'test' }), recordBytes: () => {}, closeSession: () => {} },
+    password: 'test'
+  });
+  depthDispatcher.isRunning = true;
+  await depthDispatcher._acquireHostDialPermit('overflow.test', 1);
+  const queuePromises = [];
+  for (let i = 0; i < 64; i++) {
+    queuePromises.push(depthDispatcher._acquireHostDialPermit('overflow.test', 1));
+  }
+  let depthCapRejected = false;
+  try {
+    await depthDispatcher._acquireHostDialPermit('overflow.test', 1); // 65th should throw
+  } catch (err) {
+    if (err.message.includes('full')) depthCapRejected = true;
+  }
+  assert(depthCapRejected, 'ProxyDispatcher rejects when host dial queue depth exceeds 64');
+  await depthDispatcher.stop();
+  let stopRejectionCount = 0;
+  for (const p of queuePromises) {
+    try { await p; } catch (e) { stopRejectionCount++; }
+  }
+  assert(stopRejectionCount === 64, 'ProxyDispatcher stop() drains and rejects all waiting host dial permits');
+
+  // Test Review 7: UdpSocketAdapter Strict Queue Bound
+  const boundedUdp = new UdpSocketAdapter({ remoteAddress: '127.0.0.1', remotePort: 4433 });
+  boundedUdp.writer = { write: async () => new Promise(() => {}) }; // Stalled writer
+  // Fill with 1024 control packets
+  for (let i = 0; i < 1024; i++) {
+    boundedUdp.sendQueue.push(new Uint8Array([0xC0, 1])); // Control packet
+  }
+  let queueSaturatedError = false;
+  try {
+    await boundedUdp.send(new Uint8Array([0x40, 1])); // Non-control packet when full of control
+  } catch (err) {
+    if (err.message.includes('saturated')) queueSaturatedError = true;
+  }
+  assert(queueSaturatedError, 'UdpSocketAdapter throws when send queue is saturated with control frames');
+  await boundedUdp.close();
+
+  // Test Review 7: DnsResolver clear()
+  DnsResolver._setCache('to-clear.com', [{ ip: '1.2.3.4', ttl: 300 }], 300);
+  assert(DnsResolver.cache.has('to-clear.com'), 'DnsResolver has cached entry');
+  DnsResolver.clear();
+  assert(!DnsResolver.cache.has('to-clear.com'), 'DnsResolver.clear() empties cache and pending maps');
 }
 
 // -------------------------------------------------------------

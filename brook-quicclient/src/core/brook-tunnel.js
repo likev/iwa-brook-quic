@@ -1,7 +1,8 @@
 /**
  * Brook Tunnel Orchestrator: pipes data between local TCP client and remote Brook QUIC stream.
  * Supports full-duplex streaming with independent half-close coordination,
- * early handshake timeout (10s), speculative socket pruning (15s), and rich protocol logging.
+ * early handshake timeout, speculative socket pruning, bounded receive/transmit buffers,
+ * deterministic structured outcome reporting, and robust idempotent cleanup.
  */
 
 import { generateNonce, deriveKey } from './brook-crypto.js';
@@ -22,9 +23,15 @@ export class BrookTunnel {
    * @param {number} options.clockOffsetSec - Network clock drift offset in seconds
    * @param {string} options.targetStr - Target host string (for logging/metrics)
    * @param {number|string} options.sessionId - Session ID for logging
+   * @param {Function} options.sendSuccess - One-shot callback to confirm connection to client
+   * @param {Function} options.sendFailure - Callback to signal proxy failure
+   * @param {number} options.dialTimeoutMs - Timeout for server dial / nonce receipt
+   * @param {Function} options.onHandshakeDone - Callback when server handshake completes
+   * @param {Function} options.onClientDataRead - Callback when client sends payload data
    * @param {Function} options.onBytes - Callback for throughput accounting (sent, received)
    * @param {Function} options.onClose - Callback when session terminates
    * @param {Function} options.onLog - Logging callback
+   * @returns {Promise<{ success: boolean, kind: string, bytesSent: number, bytesReceived: number, serverHandshakeDone: boolean, error?: Error }>}
    */
   static async run({
     clientReader,
@@ -54,12 +61,17 @@ export class BrookTunnel {
     let clientReadClosed = false;
     let serverRxClosed = false;
     let hasExchangedData = false;
+    let successSent = false;
 
     let totalBytesSent = 0;
     let totalBytesRecv = 0;
 
     let resolveCompletion = null;
     const completionPromise = new Promise(r => { resolveCompletion = r; });
+
+    let cleanupPromise = null;
+    let terminationReason = 'normal';
+    let terminationError = null;
 
     // 1. Prepare Cryptographic Context
     const cn = generateNonce();
@@ -73,18 +85,20 @@ export class BrookTunnel {
     let serverHandshakeDone = false;
     let expectedPayloadLen = -1;
 
-    // Serialized FIFO queue for downstream processing to prevent race conditions on sn
+    // Bounded Serialized FIFO queue for downstream processing (2MB hard buffer cap)
+    const MAX_RX_BUFFER_BYTES = 2 * 1024 * 1024;
+    let rxQueuedBytes = 0;
     const rxQueue = [];
     let isProcessingRx = false;
 
     // 2. Timers:
-    // A. Brook Server Dial Verification Timer (fail fast at 3.5s if no sn returned)
+    // A. Brook Server Dial Verification Timer (fail fast if no sn returned)
     let handshakeTimer = setTimeout(() => {
       if (!serverHandshakeDone && !isTerminated) {
         if (onLog) {
           onLog('warning', `${logTag} ⚠️ [Brook] Server dial response pending for ${targetStr} (${(dialTimeoutMs / 1000).toFixed(1)}s). Session stalled or dropped.`);
         }
-        cleanup('handshake_timeout');
+        cleanup('handshake_timeout', new Error(`Server dial timed out after ${dialTimeoutMs}ms`));
       }
     }, dialTimeoutMs);
 
@@ -104,46 +118,61 @@ export class BrookTunnel {
       }
     };
 
-    const cleanup = async (reason = 'normal') => {
-      if (isTerminated) return;
+    const cleanup = (reason = 'normal', err = null) => {
+      if (cleanupPromise) return cleanupPromise;
       isTerminated = true;
+      terminationReason = reason;
+      if (err && !terminationError) terminationError = err;
 
-      if (handshakeTimer) {
-        clearTimeout(handshakeTimer);
-        handshakeTimer = null;
-      }
-      if (idleTimer) {
-        clearTimeout(idleTimer);
-        idleTimer = null;
-      }
+      cleanupPromise = (async () => {
+        if (handshakeTimer) {
+          clearTimeout(handshakeTimer);
+          handshakeTimer = null;
+        }
+        if (idleTimer) {
+          clearTimeout(idleTimer);
+          idleTimer = null;
+        }
 
-      quicManager.unregisterStream(streamId);
+        quicManager.unregisterStream(streamId);
 
-      // If dial never succeeded, inform client with error
-      if (!serverHandshakeDone && sendFailure) {
+        // If dial never succeeded and client was not notified, signal error
+        if (!serverHandshakeDone && !successSent && sendFailure) {
+          try {
+            await sendFailure(0x05);
+            sendFailure = null;
+          } catch (e) {}
+        }
+
+        // Bounded client stream cleanup
         try {
-          await sendFailure(0x05);
-          sendFailure = null;
+          await Promise.race([
+            clientReader.cancel().catch(() => {}),
+            new Promise(r => setTimeout(r, 500))
+          ]);
+          clientReader.releaseLock();
         } catch (e) {}
-      }
 
-      try {
-        await clientReader.cancel().catch(() => {});
-        clientReader.releaseLock();
-      } catch (e) {}
+        try {
+          await Promise.race([
+            clientWriter.close().catch(() => {}),
+            new Promise(r => setTimeout(r, 500))
+          ]);
+          clientWriter.releaseLock();
+        } catch (e) {}
 
-      try {
-        await clientWriter.close().catch(() => {});
-        clientWriter.releaseLock();
-      } catch (e) {}
+        const durationSec = ((Date.now() - tunnelStartTime) / 1000).toFixed(2);
+        if (onLog && hasExchangedData) {
+          onLog('info', `${logTag} 🛑 Tunnel finished for ${targetStr} (Up: ${totalBytesSent}B, Down: ${totalBytesRecv}B, ${durationSec}s, reason: ${reason})`);
+        }
 
-      const durationSec = ((Date.now() - tunnelStartTime) / 1000).toFixed(2);
-      if (onLog && hasExchangedData) {
-        onLog('info', `${logTag} 🛑 Tunnel finished for ${targetStr} (Up: ${totalBytesSent}B, Down: ${totalBytesRecv}B, ${durationSec}s)`);
-      }
+        if (onClose) {
+          try { onClose(); } catch (e) {}
+        }
+        if (resolveCompletion) resolveCompletion();
+      })();
 
-      if (onClose) onClose();
-      if (resolveCompletion) resolveCompletion();
+      return cleanupPromise;
     };
 
     const checkFullClose = () => {
@@ -158,7 +187,11 @@ export class BrookTunnel {
 
       try {
         while (rxQueue.length > 0 && !isTerminated) {
-          const { data, fin } = rxQueue.shift();
+          const item = rxQueue.shift();
+          const { data, fin } = item;
+          if (data) {
+            rxQueuedBytes -= data.length;
+          }
 
           if (data && data.length > 0) {
             if (rxOffset > 0) {
@@ -189,7 +222,8 @@ export class BrookTunnel {
               }
 
               // Confirm SOCKS5 / HTTP success to browser now that dial has begun
-              if (sendSuccess) {
+              if (sendSuccess && !successSent) {
+                successSent = true;
                 try {
                   await sendSuccess();
                   sendSuccess = null;
@@ -221,7 +255,7 @@ export class BrookTunnel {
                   expectedPayloadLen = openLength(sk, sn, chunk18);
                 } catch (err) {
                   if (onLog) onLog('error', `${logTag} Frame length decrypt failed on stream ${streamId}: ${err.message}`);
-                  cleanup('decrypt_error');
+                  cleanup('decrypt_error', err);
                   return;
                 }
               }
@@ -239,7 +273,7 @@ export class BrookTunnel {
                   plainPayload = openPayload(sk, sn, payloadAndTag);
                 } catch (err) {
                   if (onLog) onLog('error', `${logTag} Payload decrypt failed on stream ${streamId}: ${err.message}`);
-                  cleanup('decrypt_error');
+                  cleanup('decrypt_error', err);
                   return;
                 }
 
@@ -257,7 +291,7 @@ export class BrookTunnel {
                     resetIdleTimer(180000);
                     if (onBytes) onBytes(0, plainPayload.length);
                   } catch (err) {
-                    cleanup('client_write_error');
+                    cleanup('client_write_error', err);
                     return;
                   }
                 }
@@ -279,7 +313,7 @@ export class BrookTunnel {
               if (onLog) {
                 onLog('warning', `${logTag} ⚠️ [Brook] Target ${targetStr} closed connection with 0 bytes (dial refused or dropped)`);
               }
-              cleanup('target_dial_refused');
+              cleanup('target_dial_refused', new Error('Target connection refused (0 bytes)'));
               return;
             }
 
@@ -291,7 +325,7 @@ export class BrookTunnel {
           }
         }
       } catch (err) {
-        cleanup('rx_error');
+        cleanup('rx_error', err);
       } finally {
         isProcessingRx = false;
       }
@@ -302,18 +336,25 @@ export class BrookTunnel {
       quicManager.registerStream(streamId, {
         onData: (data, fin) => {
           if (isTerminated) return;
+          const dataLen = data ? data.length : 0;
+          if (rxQueuedBytes + dataLen > MAX_RX_BUFFER_BYTES) {
+            if (onLog) onLog('error', `${logTag} Downstream receive buffer overflow (${rxQueuedBytes + dataLen} > ${MAX_RX_BUFFER_BYTES}). Terminating tunnel.`);
+            cleanup('rx_overflow', new Error('Downstream receive buffer overflow'));
+            return;
+          }
+          rxQueuedBytes += dataLen;
           rxQueue.push({ data, fin });
           processRxQueue();
         },
         onClose: () => {
           serverRxClosed = true;
           if (rxQueue.length === 0 && !isProcessingRx) {
-            checkFullClose();
+            cleanup('transport_closed');
           }
         },
         onError: (err) => {
           if (onLog) onLog('error', `${logTag} QUIC stream ${streamId} error: ${err.message}`);
-          cleanup('stream_error');
+          cleanup('stream_error', err);
         }
       });
 
@@ -352,7 +393,7 @@ export class BrookTunnel {
         try {
           readResult = await clientReader.read();
         } catch (err) {
-          cleanup(serverHandshakeDone ? 'client_read_error' : 'client_abort');
+          cleanup(serverHandshakeDone ? 'client_read_error' : 'client_abort', err);
           break;
         }
 
@@ -391,7 +432,7 @@ export class BrookTunnel {
             }
           }
           if (writeFailed) {
-            cleanup('upstream_write_failed');
+            cleanup('upstream_write_failed', new Error('Failed to send stream data to QUIC session'));
             break;
           }
         }
@@ -403,8 +444,24 @@ export class BrookTunnel {
       }
     } catch (err) {
       if (onLog) onLog('error', `${logTag} Tunnel error for ${targetStr}: ${err.message}`);
+      cleanup('tunnel_error', err);
     } finally {
-      cleanup('loop_exit');
+      await (cleanupPromise || cleanup('loop_exit'));
     }
+
+    const isSuccess = terminationReason === 'both_closed' ||
+                      terminationReason === 'normal' ||
+                      terminationReason === 'server_fin_timeout' ||
+                      (terminationReason === 'client_abort' && serverHandshakeDone) ||
+                      (terminationReason === 'client_read_error' && serverHandshakeDone && totalBytesRecv > 0);
+
+    return {
+      success: isSuccess,
+      kind: terminationReason,
+      bytesSent: totalBytesSent,
+      bytesReceived: totalBytesRecv,
+      serverHandshakeDone,
+      error: terminationError
+    };
   }
 }

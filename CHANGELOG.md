@@ -4,6 +4,29 @@ All notable changes to the **Isolated Web Apps (IWAs) Direct Sockets Suite & Bro
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.17.0] - 2026-08-19
+
+### Fixed
+- **Structured Outcome Reporting & Retry Integrity**: `BrookTunnel.run()` now returns explicit structured outcome objects (`{ success, kind, bytesSent, bytesReceived, serverHandshakeDone, error }`), eliminating ambiguous promise resolutions where target refusals or dial timeouts were mistakenly treated as successful completions.
+- **One-Shot Proxy Reply State Machine**: `ProxyDispatcher` wraps `sendSuccess` and `sendFailure` in a state machine preventing duplicate or misplaced SOCKS5 / HTTP success replies across retry attempts.
+- **Correct Response Byte Property Tracking**: Fixed `bytesRecv` to `bytesReceived` check on `SessionTracker` to strictly prevent request retries once downstream data has reached the browser.
+- **Authoritative Transport Close Coordination**: When a `QuicSession` or UDP transport closes, stream handlers authoritatively trigger `cleanup('transport_closed')`, cancelling client stream readers and closing writers within a bounded 500ms timeout rather than waiting indefinitely.
+- **Downstream Receive Backpressure & Hard Buffer Cap**: Enforced a 2MB hard receive queue limit (`MAX_RX_BUFFER_BYTES = 2MB`) in `BrookTunnel`. If a slow browser client stops reading, excessive buffer growth is caught and terminated with `rx_overflow` instead of memory exhaustion.
+- **Coalesced UDP Send Queue Backpressure**: Replaced per-packet timer waiters with a map of coalesced drain waiters in `UdpSocketAdapter`, strictly enforcing the 1024 packet cap even under control-frame heavy bursts.
+- **Global Admission Control & Queue Depth Caps**: Added hard capacity limits across all layers:
+  - `TcpListener`: capped at 512 active sockets, with automatic Socket Set tracking and parallel batch closure on `stop()`.
+  - `ProxyDispatcher`: capped host dial queues at depth 64 (`MAX_HOST_QUEUE_DEPTH`), draining and rejecting all waiters on shutdown.
+  - `QuicConnectionManager`: capped handshake permit queues at depth 64 (`MAX_HANDSHAKE_QUEUE`).
+- **Complete Handshake Negotiation Deadlines**: Implemented a 10s negotiation deadline in `Socks5Parser` and `HttpProxyParser` ensuring partial or stalled client handshakes cannot hold sockets open indefinitely.
+- **Transactional Startup & Rollback**: `app.js` and `ProxyDispatcher.start()` now roll back and clean up all listeners and QUIC managers if any step of startup fails, preventing orphaned sockets and timer leaks.
+- **UI Main-Thread Performance Optimization**: Capped active session table rendering in `UiController` to the top 25 most recent sessions, preventing main-thread layout thrashing during heavy concurrency.
+- **DNS Resolver Immediate Error Propagation & Reset**: Upstream DNS sends fail immediately on stream write errors, and added `DnsResolver.clear()` for teardown.
+
+### Tests
+- Expanded test suite to **75 automated tests (100% pass rate)** covering structured outcomes on target refusal, rx buffer overflow, host dial queue caps and stop draining, UDP control queue saturation, DNS cache clear, and live 20-site concurrent proxy stress testing.
+
+---
+
 ## [v1.16.0] - 2026-08-17
 
 ### Added

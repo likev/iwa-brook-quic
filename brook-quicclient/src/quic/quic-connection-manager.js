@@ -353,6 +353,10 @@ export class QuicConnectionManager {
       this.activeHandshakes++;
       return;
     }
+    const MAX_HANDSHAKE_QUEUE = 64;
+    if (this.handshakeQueue.length >= MAX_HANDSHAKE_QUEUE) {
+      throw new Error('QUIC handshake queue is full');
+    }
     return new Promise((resolve, reject) => {
       const entry = { resolve, reject };
       if (priority) {

@@ -1,6 +1,7 @@
 /**
  * Direct Sockets UDPSocket transport adapter for browser QUIC engine.
- * Includes FIFO send queue with true streaming backpressure handling and control packet priority.
+ * Includes FIFO send queue with coalesced backpressure handling,
+ * hard bounded queues, and control packet prioritization.
  */
 
 export class UdpSocketAdapter {
@@ -18,7 +19,7 @@ export class UdpSocketAdapter {
 
     this.sendQueue = [];
     this.isDraining = false;
-    this.drainWaiters = [];
+    this.drainWaiters = new Map(); // targetWatermark -> Array<resolve>
 
     this.bytesSent = 0;
     this.bytesReceived = 0;
@@ -79,34 +80,37 @@ export class UdpSocketAdapter {
       return Promise.resolve();
     }
     return new Promise(resolve => {
+      let list = this.drainWaiters.get(targetWatermark);
+      if (!list) {
+        list = [];
+        this.drainWaiters.set(targetWatermark, list);
+      }
+
       let timer = null;
-      const waiter = {
-        targetWatermark,
-        resolve: () => {
-          if (timer) clearTimeout(timer);
-          resolve();
-        }
+      const resolver = () => {
+        if (timer) clearTimeout(timer);
+        resolve();
       };
+
       timer = setTimeout(() => {
-        const idx = this.drainWaiters.indexOf(waiter);
-        if (idx >= 0) this.drainWaiters.splice(idx, 1);
+        const idx = list.indexOf(resolver);
+        if (idx >= 0) list.splice(idx, 1);
+        if (list.length === 0) this.drainWaiters.delete(targetWatermark);
         resolve();
       }, timeoutMs);
-      this.drainWaiters.push(waiter);
+
+      list.push(resolver);
     });
   }
 
   _notifyDrain() {
-    if (this.drainWaiters && this.drainWaiters.length > 0) {
-      const remaining = [];
-      for (const waiter of this.drainWaiters) {
-        if (this.isClosed || this.sendQueue.length <= waiter.targetWatermark) {
-          waiter.resolve();
-        } else {
-          remaining.push(waiter);
+    for (const [watermark, list] of this.drainWaiters.entries()) {
+      if (this.isClosed || this.sendQueue.length <= watermark) {
+        this.drainWaiters.delete(watermark);
+        for (const resolve of list) {
+          resolve();
         }
       }
-      this.drainWaiters = remaining;
     }
   }
 
@@ -122,10 +126,13 @@ export class UdpSocketAdapter {
 
     if (this.sendQueue.length >= MAX_QUEUE_SIZE) {
       if (isControlPacket) {
-        // Evict an expendable short-header packet (1-RTT data/ACK) to prioritize handshake/control
+        // Evict oldest short-header non-control packet (1-RTT data) to prioritize handshake/control
         const nonControlIndex = this.sendQueue.findIndex(pkt => pkt.length > 0 && (pkt[0] & 0x80) === 0);
         if (nonControlIndex >= 0) {
           this.sendQueue.splice(nonControlIndex, 1);
+        } else {
+          // If queue is 100% control packets, drop oldest control packet to strictly enforce hard cap
+          this.sendQueue.shift();
         }
       } else {
         // For non-control data packets, evict oldest short-header packet; never evict long-header control packets
@@ -133,8 +140,7 @@ export class UdpSocketAdapter {
         if (nonControlIndex >= 0) {
           this.sendQueue.splice(nonControlIndex, 1);
         } else {
-          // If queue is completely filled with control packets, do not queue extra non-control packet
-          return;
+          throw new Error('UDP socket send queue saturated with control frames');
         }
       }
     }
@@ -142,7 +148,7 @@ export class UdpSocketAdapter {
     this.sendQueue.push(u8);
     this._drainSendQueue();
 
-    // Apply true asynchronous backpressure when queue exceeds high watermark
+    // Apply asynchronous backpressure when queue exceeds high watermark
     if (this.sendQueue.length > HIGH_WATERMARK) {
       await this._waitForDrain(HIGH_WATERMARK);
     }
