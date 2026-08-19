@@ -4,6 +4,15 @@ All notable changes to the **Isolated Web Apps (IWAs) Direct Sockets Suite & Bro
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.30.3] - 2026-08-19
+
+### Fixed (Eliminated NS_ERROR_NET_PARTIAL_TRANSFER & Stream Truncation)
+- **Eliminated Premature Idle/Abort Cutoffs**: Removed premature 2s/5s/15s timeout timers during active streaming downloads and client request upload completion in `BrookTunnel`. Standardized all active keep-alive timers to 60s, allowing streaming HTTP/2 SSE, GraphQL queries, and large file downloads to finish completely.
+- **Removed 2-Second Force-Kill on QUIC Stream Close**: Removed the hardcoded 2000ms deadline in `quicManager.registerStream.onClose()`. The downstream queue now naturally drains all in-flight decrypted frames to the client without truncation.
+- **Safe Half-Close & Write Operation Coordination**: Guaranteed that `clientWriter.write()` is never interrupted or raced against `close()`/`cancel()`, cleanly closing the write half (EOF) on server FIN without triggering TCP RST in Firefox.
+
+---
+
 ## [v1.30.2] - 2026-08-19
 
 ### Fixed & Unblocked (Eliminated Concurrency Bottlenecks)

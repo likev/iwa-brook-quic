@@ -83,9 +83,11 @@ export class BrookTunnel {
 
     let isTerminated = false;
     let clientReadClosed = false;
+    let clientWriteClosed = false;
     let serverRxClosed = false;
     let hasExchangedData = false;
     let successSent = false;
+    let activeWritePromise = null;
 
     let totalBytesSent = 0;
     let totalBytesRecv = 0;
@@ -174,6 +176,12 @@ export class BrookTunnel {
           rxQueuedBytes = 0;
         }
 
+        // Await active write promise before attempting to close writer
+        if (activeWritePromise) {
+          try { await activeWritePromise.catch(() => {}); } catch (e) {}
+          activeWritePromise = null;
+        }
+
         // If dial never succeeded and client was not notified, signal error
         if (!serverHandshakeDone && !successSent && sendFailure && closeClientStreams) {
           try {
@@ -192,12 +200,15 @@ export class BrookTunnel {
             ]);
           } catch (e) {}
 
-          try {
-            await Promise.race([
-              clientWriter.close().catch(() => {}),
-              new Promise(r => setTimeout(r, 500))
-            ]);
-          } catch (e) {}
+          if (!clientWriteClosed) {
+            clientWriteClosed = true;
+            try {
+              await Promise.race([
+                clientWriter.close().catch(() => {}),
+                new Promise(r => setTimeout(r, 500))
+              ]);
+            } catch (e) {}
+          }
         }
 
         const durationSec = ((Date.now() - tunnelStartTime) / 1000).toFixed(2);
@@ -334,12 +345,15 @@ export class BrookTunnel {
                   totalBytesRecv += plainPayload.length;
                   try {
                     const t0 = (typeof performance !== 'undefined') ? performance.now() : Date.now();
-                    await clientWriter.write(plainPayload);
+                    activeWritePromise = clientWriter.write(plainPayload);
+                    await activeWritePromise;
+                    activeWritePromise = null;
                     const waitMs = ((typeof performance !== 'undefined') ? performance.now() : Date.now()) - t0;
                     BrookTunnel.globalMetrics.recordWriterWait(waitMs);
-                    resetIdleTimer(30000);
+                    resetIdleTimer(60000);
                     if (onBytes) onBytes(0, plainPayload.length);
                   } catch (err) {
+                    activeWritePromise = null;
                     cleanup('client_write_error', err);
                     return;
                   }
@@ -353,12 +367,13 @@ export class BrookTunnel {
               onLog('warning', `${logTag} ⚠️ Brook server closed stream before sending server nonce for ${targetStr}. Possible client clock drift (diff > 60s) or invalid password.`);
             }
             serverRxClosed = true;
-            try {
-              await Promise.race([
-                clientWriter.close().catch(() => {}),
-                new Promise(r => setTimeout(r, 1000))
-              ]);
-            } catch (e) {}
+
+            if (!clientWriteClosed) {
+              clientWriteClosed = true;
+              try {
+                await clientWriter.close().catch(() => {});
+              } catch (e) {}
+            }
 
             // If target closed with 0 bytes, fail fast immediately (target dial refused, dropped, or redundant pre-connect)
             if (totalBytesRecv === 0) {
@@ -370,9 +385,9 @@ export class BrookTunnel {
             }
 
             checkFullClose();
-            if (serverRxClosed && !clientReadClosed) {
-              // Bounded half-close: Allow client up to 5s to finish reading remaining response without holding session open
-              resetIdleTimer(5000);
+            if (serverRxClosed && !clientReadClosed && !isTerminated) {
+              // Standard bounded half-close: allow client ample time (30s) to read remaining response
+              resetIdleTimer(30000);
             }
             return;
           }
@@ -403,19 +418,10 @@ export class BrookTunnel {
         onClose: () => {
           serverRxClosed = true;
           if (rxQueue.length === 0 && !isProcessingRx) {
-            cleanup('transport_closed');
-          } else {
-            // Schedule cleanup after in-flight receive processing finishes (bounded by 2000ms safety deadline)
-            const checkDone = setInterval(() => {
-              if (!isProcessingRx || isTerminated) {
-                clearInterval(checkDone);
-                if (!isTerminated) cleanup('transport_closed');
-              }
-            }, 50);
-            setTimeout(() => {
-              clearInterval(checkDone);
-              if (!isTerminated) cleanup('transport_closed');
-            }, 2000);
+            checkFullClose();
+            if (!isTerminated && !clientReadClosed) {
+              resetIdleTimer(30000);
+            }
           }
         },
         onError: (err) => {
@@ -425,7 +431,7 @@ export class BrookTunnel {
       });
 
       // 4. Initiate Brook Client Handshake
-      resetIdleTimer(15000);
+      resetIdleTimer(60000);
       await quicManager.ensureConnected();
 
       // Step A: Send client nonce (12B)
@@ -494,8 +500,8 @@ export class BrookTunnel {
             } catch (e) {}
             checkFullClose();
             if (!isTerminated && !serverRxClosed) {
-              // Client closed its write side; give server at most 2s to complete response
-              resetIdleTimer(2000);
+              // Client closed its write side; allow server normal keep-alive time to complete response
+              resetIdleTimer(60000);
             }
             break;
           }
@@ -506,7 +512,7 @@ export class BrookTunnel {
               onClientDataRead();
             }
             hasExchangedData = true;
-            resetIdleTimer(serverRxClosed ? 5000 : (totalBytesRecv > 0 ? 30000 : 15000));
+            resetIdleTimer(60000);
             const CHUNK_SIZE = 16384;
             let writeFailed = false;
             for (let offset = 0; offset < value.length; offset += CHUNK_SIZE) {
