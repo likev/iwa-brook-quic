@@ -242,9 +242,9 @@ export class QuicConnectionManager {
     this.udpAdapter = null;
     this.sessionsByCid = new Map(); // cidHex -> QuicSession
     this.warmPool = []; // Standby connected sessions ready to handle burst traffic with 0ms latency
-    this.targetPoolSize = 12; // Healthy standby warm sessions pool
+    this.targetPoolSize = 24; // Healthy standby warm sessions pool (doubled for high concurrency)
     this.activeHandshakes = 0;
-    this.maxConcurrentHandshakes = 6;
+    this.maxConcurrentHandshakes = 8;
     this.handshakeQueue = [];
     this._isRefilling = false;
     this._hygieneTimer = null;
@@ -453,7 +453,7 @@ export class QuicConnectionManager {
 
     try {
       while (this.warmPool.length < this.targetPoolSize && !this.isClosed) {
-        const needed = Math.min(2, this.targetPoolSize - this.warmPool.length);
+        const needed = Math.min(4, this.targetPoolSize - this.warmPool.length);
         if (needed <= 0) break;
 
         const refillTasks = Array.from({ length: needed }).map(async () => {

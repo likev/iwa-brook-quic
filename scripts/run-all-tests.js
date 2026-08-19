@@ -150,26 +150,26 @@ async function runUnitTests() {
     serverPort: 4433,
     alpn: 'h3'
   });
-  assert(mockMgr.targetPoolSize === 12, `Warm pool target size is configured to 12 (${mockMgr.targetPoolSize})`);
-  assert(mockMgr.maxConcurrentHandshakes === 6, `Handshake concurrency is bounded to 6 (${mockMgr.maxConcurrentHandshakes})`);
+  assert(mockMgr.targetPoolSize === 24, `Warm pool target size is configured to 24 (${mockMgr.targetPoolSize})`);
+  assert(mockMgr.maxConcurrentHandshakes === 8, `Handshake concurrency is bounded to 8 (${mockMgr.maxConcurrentHandshakes})`);
 
-  // Acquire 6 permits
-  for (let i = 0; i < 6; i++) {
+  // Acquire 8 permits
+  for (let i = 0; i < 8; i++) {
     await mockMgr._acquireHandshakePermit();
   }
-  assert(mockMgr.activeHandshakes === 6, 'Active handshakes reached limit (6)');
+  assert(mockMgr.activeHandshakes === 8, 'Active handshakes reached limit (8)');
 
-  // 7th permit should queue
-  let permit7Granted = false;
-  mockMgr._acquireHandshakePermit().then(() => { permit7Granted = true; });
-  assert(!permit7Granted, '7th concurrent handshake is queued by rate limiter');
+  // 9th permit should queue
+  let permit9Granted = false;
+  mockMgr._acquireHandshakePermit().then(() => { permit9Granted = true; });
+  assert(!permit9Granted, '9th concurrent handshake is queued by rate limiter');
   assert(mockMgr.handshakeQueue.length === 1, 'Handshake queue length is 1');
 
   // Release one permit
   mockMgr._releaseHandshakePermit();
   await new Promise(r => setTimeout(r, 10));
-  assert(permit7Granted, 'Queued handshake is immediately unblocked when permit is released');
-  for (let i = 0; i < 6; i++) {
+  assert(permit9Granted, 'Queued handshake is immediately unblocked when permit is released');
+  for (let i = 0; i < 8; i++) {
     mockMgr._releaseHandshakePermit();
   }
   assert(mockMgr.activeHandshakes === 0, 'All handshake permits released successfully');
@@ -181,7 +181,7 @@ async function runUnitTests() {
   failMgr.warmPool.push({ isAlive: () => true, close: () => { warmClosed = true; } });
   failMgr.registerCid('0102030405060708', { isAlive: () => true, close: () => { activeClosed = true; } });
   let queuedPermitRejected = false;
-  failMgr.activeHandshakes = 6;
+  failMgr.activeHandshakes = 8;
   failMgr._acquireHandshakePermit().catch((err) => { queuedPermitRejected = true; });
   failMgr._handleTransportFailure(new Error('Simulated UDP error'));
   await new Promise(r => setTimeout(r, 10));
@@ -232,6 +232,20 @@ async function runUnitTests() {
   testPoolMgr.warmPool.push(liveSess1);
   testPoolMgr.unregisterSession(liveSess1);
   assert(testPoolMgr.warmPool.length === 0, 'unregisterSession removes session immediately from pool');
+
+  // Test forceFresh: true bypasses warmPool
+  testPoolMgr.warmPool.push(liveSess1);
+  let forceFreshAttempted = false;
+  try {
+    // When forceFresh is true, it skips liveSess1 and attempts to connect a new session
+    await testPoolMgr.createSession({ forceFresh: true });
+  } catch (err) {
+    // Expected in unit test because real UDP socket is not connected
+    forceFreshAttempted = true;
+  }
+  assert(forceFreshAttempted === true, 'createSession({ forceFresh: true }) skips standby warm pool');
+  assert(testPoolMgr.warmPool.length === 1, 'Standby warm pool is preserved when forceFresh is requested');
+  testPoolMgr.warmPool = [];
 
   // Test BrookTunnel Accurate Outcome Classification (Review8 P0)
   // Target dial refused with 0 bytes must NOT be classified as success

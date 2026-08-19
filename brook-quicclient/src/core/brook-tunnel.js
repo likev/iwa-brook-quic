@@ -367,7 +367,21 @@ export class BrookTunnel {
         },
         onClose: () => {
           serverRxClosed = true;
-          cleanup('transport_closed');
+          if (rxQueue.length === 0 && !isProcessingRx) {
+            cleanup('transport_closed');
+          } else {
+            // Schedule cleanup after in-flight receive processing finishes (bounded by 2000ms safety deadline)
+            const checkDone = setInterval(() => {
+              if (!isProcessingRx || isTerminated) {
+                clearInterval(checkDone);
+                if (!isTerminated) cleanup('transport_closed');
+              }
+            }, 50);
+            setTimeout(() => {
+              clearInterval(checkDone);
+              if (!isTerminated) cleanup('transport_closed');
+            }, 2000);
+          }
         },
         onError: (err) => {
           if (onLog) onLog('error', `${logTag} QUIC stream ${streamId} error: ${err.message}`);

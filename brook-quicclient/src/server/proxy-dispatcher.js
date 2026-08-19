@@ -369,11 +369,13 @@ export class ProxyDispatcher {
         this._log('warning', `Proxy session error: ${err.message}`);
       }
 
-      try { if (reader) { await reader.cancel().catch(() => {}); reader.releaseLock(); } } catch (e) {}
-      try { if (writer) { await writer.close().catch(() => {}); writer.releaseLock(); } } catch (e) {}
+      try { if (reader) await reader.cancel().catch(() => {}); } catch (e) {}
+      try { if (writer) await writer.close().catch(() => {}); } catch (e) {}
       try { await acceptedSocket.close().catch(() => {}); } catch (e) {}
     } finally {
       releaseHostPermitOnce();
+      try { if (reader) reader.releaseLock(); } catch (e) {}
+      try { if (writer) writer.releaseLock(); } catch (e) {}
       if (session) {
         this.sessionTracker.closeSession(session.id);
       }

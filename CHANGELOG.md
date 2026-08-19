@@ -4,6 +4,15 @@ All notable changes to the **Isolated Web Apps (IWAs) Direct Sockets Suite & Bro
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.27.0] - 2026-08-19
+
+### Changed & Fixed
+- **2x Standby Pool Capacity**: Doubled `targetPoolSize` to 24 warm sessions and increased `maxConcurrentHandshakes` to 8 with 4-session batch refills, providing 0ms connection acquisition for high-concurrency browser page loads.
+- **Safe In-Flight Stream Drain on Transport Close**: In `BrookTunnel`, `onClose` now allows queued downstream payload chunks to finish draining to the client before final cleanup, guarded by a 2000ms safety deadline.
+- **Centralized Stream Lock Release**: Moved `reader.releaseLock()` and `writer.releaseLock()` to the `finally` block in `ProxyDispatcher`, ensuring clean stream lock release on both normal completions and error terminations.
+
+---
+
 ## [v1.26.0] - 2026-08-19
 
 ### Changed & Fixed
