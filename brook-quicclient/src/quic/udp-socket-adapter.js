@@ -221,38 +221,35 @@ export class UdpSocketAdapter {
     }
   }
 
-  async close() {
+  close() {
     if (this.isClosed) return;
     this.isClosed = true;
     this.sendQueue = [];
     this._notifyDrain();
 
-    try {
-      if (this.reader) {
-        await this.reader.cancel().catch(() => {});
-        this.reader.releaseLock();
-      }
-    } catch (e) {}
-
-    try {
-      if (this.writer) {
-        await this.writer.close().catch(() => {});
-        this.writer.releaseLock();
-      }
-    } catch (e) {}
-
-    try {
-      if (this.socket) {
-        await this.socket.close().catch(() => {});
-      }
-    } catch (e) {}
-
+    const r = this.reader;
+    const w = this.writer;
+    const s = this.socket;
     this.reader = null;
     this.writer = null;
     this.socket = null;
 
+    if (r) {
+      try { r.cancel().catch(() => {}); } catch (e) {}
+      try { r.releaseLock(); } catch (e) {}
+    }
+
+    if (w) {
+      try { w.abort().catch(() => {}); } catch (e) {}
+      try { w.releaseLock(); } catch (e) {}
+    }
+
+    if (s && typeof s.close === 'function') {
+      try { s.close().catch(() => {}); } catch (e) {}
+    }
+
     if (this.onClose) {
-      this.onClose();
+      try { this.onClose(); } catch (e) {}
     }
   }
 }

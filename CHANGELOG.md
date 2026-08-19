@@ -4,6 +4,15 @@ All notable changes to the **Isolated Web Apps (IWAs) Direct Sockets Suite & Bro
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.30.2] - 2026-08-19
+
+### Fixed & Unblocked (Eliminated Concurrency Bottlenecks)
+- **Removed Artificial Per-Host Dial Queue**: Completely removed the 8-connection per-host rate limiter and queue in `ProxyDispatcher`. Requests to any host (`example.com`, CDNs, APIs) now proceed with 100% unrestricted concurrency, eliminating stalling and timeout issues when multiple tabs or pooled connections are open.
+- **Synchronous & Clean UDPSocket Teardown**: Updated `UdpSocketAdapter.close()` to immediately abort writers, cancel readers, and release locks synchronously, preventing socket descriptor leaks and hanging promises in Chrome Direct Sockets.
+- **Expanded Handshake Concurrency**: Scaled `maxConcurrentHandshakes` to 256 with an expanded queue buffer (2048), handling high-density bursts of parallel subresource requests without dropping or stalling connections.
+
+---
+
 ## [v1.30.1] - 2026-08-19
 
 ### Fixed & Enhanced

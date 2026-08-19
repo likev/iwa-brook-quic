@@ -269,7 +269,7 @@ export class QuicConnectionManager {
     this.state = ConnectionState.DISCONNECTED;
     this.activeSessions = new Set(); // Active connected sessions currently serving tunnels
     this.activeHandshakes = 0;
-    this.maxConcurrentHandshakes = 16;
+    this.maxConcurrentHandshakes = 256;
     this.handshakeQueue = [];
     this.isClosed = false;
   }
@@ -414,7 +414,7 @@ export class QuicConnectionManager {
       this.activeHandshakes++;
       return;
     }
-    const MAX_HANDSHAKE_QUEUE = 64;
+    const MAX_HANDSHAKE_QUEUE = 2048;
     if (this.handshakeQueue.length >= MAX_HANDSHAKE_QUEUE) {
       throw new Error('QUIC handshake queue is full');
     }

@@ -29,70 +29,21 @@ export class ProxyDispatcher {
     this.onLog = onLog;
 
     this.listeners = new Map(); // name -> TcpListener
-    this.hostDialQueues = new Map(); // host -> Array<{resolve, reject}>
-    this.hostActiveDials = new Map(); // host -> number
     this.activeHandlers = new Set();
     this.totalRetries = 0;
     this.isRunning = true;
   }
 
   getHostQueueTotal() {
-    let total = 0;
-    for (const q of this.hostDialQueues.values()) {
-      total += q.length;
-    }
-    return total;
+    return 0;
   }
 
   getStats() {
     return {
-      hostQueueTotal: this.getHostQueueTotal(),
+      hostQueueTotal: 0,
       activeTunnels: this.activeHandlers.size,
       retries: this.totalRetries
     };
-  }
-
-  async _acquireHostDialPermit(host, maxConcurrent = 8) {
-    if (!this.isRunning) {
-      throw new Error('ProxyDispatcher is stopped');
-    }
-    const cleanHost = (host || '').toLowerCase();
-    const active = this.hostActiveDials.get(cleanHost) || 0;
-    if (active < maxConcurrent) {
-      this.hostActiveDials.set(cleanHost, active + 1);
-      return;
-    }
-
-    const MAX_HOST_QUEUE_DEPTH = 64;
-    let queue = this.hostDialQueues.get(cleanHost);
-    if (!queue) {
-      queue = [];
-      this.hostDialQueues.set(cleanHost, queue);
-    }
-    if (queue.length >= MAX_HOST_QUEUE_DEPTH) {
-      throw new Error(`Host dial queue full for ${cleanHost} (${queue.length} >= ${MAX_HOST_QUEUE_DEPTH})`);
-    }
-
-    return new Promise((resolve, reject) => {
-      queue.push({ resolve, reject });
-    });
-  }
-
-  _releaseHostDialPermit(host) {
-    const cleanHost = (host || '').toLowerCase();
-    const queue = this.hostDialQueues.get(cleanHost);
-    if (queue && queue.length > 0) {
-      const next = queue.shift();
-      if (queue.length === 0) this.hostDialQueues.delete(cleanHost);
-      if (next && next.resolve) next.resolve();
-    } else {
-      const active = this.hostActiveDials.get(cleanHost) || 1;
-      if (active <= 1) {
-        this.hostActiveDials.delete(cleanHost);
-      } else {
-        this.hostActiveDials.set(cleanHost, active - 1);
-      }
-    }
   }
 
   _log(level, message, meta = null) {
@@ -196,7 +147,6 @@ export class ProxyDispatcher {
     let reader = null;
     let writer = null;
     let session = null;
-    let releaseHostPermitOnce = () => {};
 
     try {
       const { readable, writable, remoteAddress, remotePort } = await acceptedSocket.opened;
@@ -276,18 +226,6 @@ export class ProxyDispatcher {
         clientAddr: `${remoteAddress || '127.0.0.1'}:${remotePort || 0}`
       });
 
-      const { host, port } = parseHostPort(targetStr, 80);
-
-      // Acquire per-host dial permit to pace burst connections (max 8 concurrent active connections per host)
-      await this._acquireHostDialPermit(host, 8);
-      let hostPermitReleased = false;
-      releaseHostPermitOnce = () => {
-        if (!hostPermitReleased) {
-          hostPermitReleased = true;
-          this._releaseHostDialPermit(host);
-        }
-      };
-
       let tunnelError = null;
       let clientDataConsumed = false;
       const MAX_ATTEMPTS = 3;
@@ -337,7 +275,6 @@ export class ProxyDispatcher {
               this.sessionTracker.recordBytes(session.id, sent, recv);
             },
             onClose: () => {
-              releaseHostPermitOnce();
               if (quicSession) {
                 quicSession.close();
               }
@@ -374,7 +311,6 @@ export class ProxyDispatcher {
       }
 
       if (tunnelError) {
-        releaseHostPermitOnce();
         await sendFailureOnce(0x05);
         // Normal keep-alive socket expiration or clean transport closure after data exchange is not a critical error
         if ((tunnelError.message.includes('idle_timeout') || tunnelError.message.includes('transport_closed')) && session && session.bytesReceived > 0) {
@@ -392,7 +328,6 @@ export class ProxyDispatcher {
       try { if (writer) await writer.close().catch(() => {}); } catch (e) {}
       try { await acceptedSocket.close().catch(() => {}); } catch (e) {}
     } finally {
-      releaseHostPermitOnce();
       try { if (reader) reader.releaseLock(); } catch (e) {}
       try { if (writer) writer.releaseLock(); } catch (e) {}
       if (session) {
@@ -404,19 +339,7 @@ export class ProxyDispatcher {
   async stop() {
     this.isRunning = false;
 
-    // 1. Drain and reject all pending host dial queues
-    for (const [host, queue] of this.hostDialQueues.entries()) {
-      while (queue.length > 0) {
-        const next = queue.shift();
-        if (next && next.reject) {
-          next.reject(new Error('ProxyDispatcher is stopped'));
-        }
-      }
-    }
-    this.hostDialQueues.clear();
-    this.hostActiveDials.clear();
-
-    // 2. Stop all listeners
+    // 1. Stop all listeners
     for (const [name, listener] of this.listeners.entries()) {
       try {
         await listener.stop();
@@ -424,7 +347,7 @@ export class ProxyDispatcher {
     }
     this.listeners.clear();
 
-    // 3. Await active handlers
+    // 2. Await active handlers
     if (this.activeHandlers.size > 0) {
       await Promise.allSettled(Array.from(this.activeHandlers));
       this.activeHandlers.clear();

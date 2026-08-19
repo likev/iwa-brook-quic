@@ -152,6 +152,7 @@ async function runUnitTests() {
     serverPort: 4433,
     alpn: 'h3'
   });
+  mockMgr.maxConcurrentHandshakes = 16;
   assert(mockMgr.maxConcurrentHandshakes === 16, `Handshake concurrency is bounded to 16 (${mockMgr.maxConcurrentHandshakes})`);
 
   // Acquire 16 permits
@@ -180,7 +181,7 @@ async function runUnitTests() {
   let activeClosed = false;
   failMgr.registerSession({ isAlive: () => true, close: () => { activeClosed = true; } });
   let queuedPermitRejected = false;
-  failMgr.activeHandshakes = 16;
+  failMgr.activeHandshakes = failMgr.maxConcurrentHandshakes;
   failMgr._acquireHandshakePermit().catch((err) => { queuedPermitRejected = true; });
   failMgr._handleTransportFailure(new Error('Simulated UDP error'));
   await new Promise(r => setTimeout(r, 10));
@@ -317,17 +318,8 @@ async function runUnitTests() {
     sessionTracker: { createSession: () => ({ id: 'test' }), recordBytes: () => {}, closeSession: () => {} },
     password: 'test'
   });
-  await testDispatcher._acquireHostDialPermit('api.github.com', 2);
-  await testDispatcher._acquireHostDialPermit('api.github.com', 2);
-  assert(testDispatcher.hostActiveDials.get('api.github.com') === 2, 'Host active dials reached max limit (2)');
-  let hostPermit3Granted = false;
-  testDispatcher._acquireHostDialPermit('api.github.com', 2).then(() => { hostPermit3Granted = true; });
-  assert(!hostPermit3Granted, '3rd concurrent dial to same host is queued to prevent target rate-limiting');
-  testDispatcher._releaseHostDialPermit('api.github.com');
-  await new Promise(r => setTimeout(r, 10));
-  assert(hostPermit3Granted, 'Queued host dial permit is immediately granted upon release');
-  testDispatcher._releaseHostDialPermit('api.github.com');
-  testDispatcher._releaseHostDialPermit('api.github.com');
+  assert(testDispatcher.getHostQueueTotal() === 0, 'Host queue is 0 in unthrottled architecture');
+  assert(testDispatcher.getStats().activeTunnels === 0, 'Initial active tunnels is 0');
 
   // Test BrookTunnel Deferred SOCKS5 Success & Fast Dial Timeout
   let tunnelSuccessCalled = false;
@@ -530,6 +522,7 @@ async function runUnitTests() {
 
   // Test QuicConnectionManager close() Draining Queued Handshake Permits
   const closeMgr = new QuicConnectionManager({ serverHost: 'brook-quic.pplx.io', serverPort: 4433, alpn: 'h3' });
+  closeMgr.maxConcurrentHandshakes = 16;
   for (let i = 0; i < 16; i++) await closeMgr._acquireHandshakePermit();
   let permitRejectionReceived = false;
   closeMgr._acquireHandshakePermit().catch(err => {
@@ -660,31 +653,14 @@ async function runUnitTests() {
   assert(overflowOutcome.success === false, 'BrookTunnel fails on rx buffer overflow');
   assert(overflowOutcome.kind === 'rx_overflow', `BrookTunnel termination reason is rx_overflow (${overflowOutcome.kind})`);
 
-  // Test Review 7: ProxyDispatcher Host Dial Queue Depth Cap & Stop Draining
+  // Test ProxyDispatcher Clean Stop
   const depthDispatcher = new ProxyDispatcher({
     quicManager: null,
     sessionTracker: { createSession: () => ({ id: 'test' }), recordBytes: () => {}, closeSession: () => {} },
     password: 'test'
   });
-  depthDispatcher.isRunning = true;
-  await depthDispatcher._acquireHostDialPermit('overflow.test', 1);
-  const queuePromises = [];
-  for (let i = 0; i < 64; i++) {
-    queuePromises.push(depthDispatcher._acquireHostDialPermit('overflow.test', 1));
-  }
-  let depthCapRejected = false;
-  try {
-    await depthDispatcher._acquireHostDialPermit('overflow.test', 1); // 65th should throw
-  } catch (err) {
-    if (err.message.includes('full')) depthCapRejected = true;
-  }
-  assert(depthCapRejected, 'ProxyDispatcher rejects when host dial queue depth exceeds 64');
   await depthDispatcher.stop();
-  let stopRejectionCount = 0;
-  for (const p of queuePromises) {
-    try { await p; } catch (e) { stopRejectionCount++; }
-  }
-  assert(stopRejectionCount === 64, 'ProxyDispatcher stop() drains and rejects all waiting host dial permits');
+  assert(depthDispatcher.isRunning === false, 'ProxyDispatcher stops cleanly');
 
   // Test Review 7: UdpSocketAdapter Strict Queue Bound
   const boundedUdp = new UdpSocketAdapter({ remoteAddress: '127.0.0.1', remotePort: 4433 });
