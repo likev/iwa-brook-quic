@@ -336,7 +336,8 @@ export class BrookTunnel {
 
             checkFullClose();
             if (serverRxClosed && !clientReadClosed) {
-              setTimeout(() => cleanup('server_fin_timeout'), 1500);
+              // Graceful half-close: Allow client to finish reading remaining response without aborting
+              resetIdleTimer(30000);
             }
             return;
           }

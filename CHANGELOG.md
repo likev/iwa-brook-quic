@@ -4,6 +4,15 @@ All notable changes to the **Isolated Web Apps (IWAs) Direct Sockets Suite & Bro
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.24.0] - 2026-08-19
+
+### Changed & Fixed
+- **Graceful Half-Close Coordination**: Removed premature 1.5s `server_fin_timeout` abort. When the Brook server sends `fin`, downstream `clientWriter.close()` is gracefully closed, allowing Firefox to fully read buffered HTTP/TLS payload chunks and complete TCP half-close without throwing `NS_ERROR_NET_PARTIAL_TRANSFER`.
+- **Eliminated Handshake Refill Storms**: Tuned the standby warm pool to a resilient 8-session target (`targetPoolSize = 8`, `maxConcurrentHandshakes = 4`), refilling in smooth 2-session batches with 50ms pacing. Prevents background handshake traffic bursts from congesting the UDP transport or starving active dial requests.
+- **Full SOCKS5/HTTP Error Cleanliness**: Resolved `NS_ERROR_CONNECTION_REFUSED` by preventing handshake packet drops on burst pre-connects and active website tabs.
+
+---
+
 ## [v1.23.0] - 2026-08-19
 
 ### Changed & Fixed

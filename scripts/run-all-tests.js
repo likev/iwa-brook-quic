@@ -150,26 +150,26 @@ async function runUnitTests() {
     serverPort: 4433,
     alpn: 'h3'
   });
-  assert(mockMgr.targetPoolSize === 35, `Warm pool target size is expanded to 35 (${mockMgr.targetPoolSize})`);
-  assert(mockMgr.maxConcurrentHandshakes === 12, `Handshake concurrency is bounded to 12 (${mockMgr.maxConcurrentHandshakes})`);
+  assert(mockMgr.targetPoolSize === 8, `Warm pool target size is configured to 8 (${mockMgr.targetPoolSize})`);
+  assert(mockMgr.maxConcurrentHandshakes === 4, `Handshake concurrency is bounded to 4 (${mockMgr.maxConcurrentHandshakes})`);
 
-  // Acquire 12 permits
-  for (let i = 0; i < 12; i++) {
+  // Acquire 4 permits
+  for (let i = 0; i < 4; i++) {
     await mockMgr._acquireHandshakePermit();
   }
-  assert(mockMgr.activeHandshakes === 12, 'Active handshakes reached limit (12)');
+  assert(mockMgr.activeHandshakes === 4, 'Active handshakes reached limit (4)');
 
-  // 13th permit should queue
-  let permit13Granted = false;
-  mockMgr._acquireHandshakePermit().then(() => { permit13Granted = true; });
-  assert(!permit13Granted, '13th concurrent handshake is queued by rate limiter');
+  // 5th permit should queue
+  let permit5Granted = false;
+  mockMgr._acquireHandshakePermit().then(() => { permit5Granted = true; });
+  assert(!permit5Granted, '5th concurrent handshake is queued by rate limiter');
   assert(mockMgr.handshakeQueue.length === 1, 'Handshake queue length is 1');
 
   // Release one permit
   mockMgr._releaseHandshakePermit();
   await new Promise(r => setTimeout(r, 10));
-  assert(permit13Granted, 'Queued handshake is immediately unblocked when permit is released');
-  for (let i = 0; i < 12; i++) {
+  assert(permit5Granted, 'Queued handshake is immediately unblocked when permit is released');
+  for (let i = 0; i < 4; i++) {
     mockMgr._releaseHandshakePermit();
   }
   assert(mockMgr.activeHandshakes === 0, 'All handshake permits released successfully');
