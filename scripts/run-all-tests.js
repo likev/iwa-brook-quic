@@ -24,6 +24,7 @@ import { ProxyDispatcher } from '../brook-quicclient/src/server/proxy-dispatcher
 import { TcpListener } from '../brook-quicclient/src/server/tcp-listener.js';
 import { LogStream } from '../brook-quicclient/src/ui/log-stream.js';
 import { SessionTracker } from '../brook-quicclient/src/server/session-tracker.js';
+import { createPortStreamBridge } from '../brook-quicclient/src/workers/worker-tunnel-bridge.js';
 import { runLossRecoveryTests } from './test-loss-recovery.js';
 
 const execAsync = promisify(exec);
@@ -212,6 +213,32 @@ async function runUnitTests() {
   assert(maxConcurrentWrites >= 2 && maxConcurrentWrites <= 4, `UDP adapter pipelines concurrent writes (${maxConcurrentWrites} concurrent in flight)`);
   await pipelineAdapter._waitForDrain(0);
   assert(pipelineAdapter.sendQueue.length === 0, 'Pipelined writes drained completely');
+
+  // Test WorkerTunnelBridge MessagePort Streaming & Zero-Copy Pipeline
+  const { port1: bridgePort1, port2: bridgePort2 } = new MessageChannel();
+  const bridge = createPortStreamBridge(bridgePort2);
+
+  // Send client data from port1 -> bridge
+  const testPayload = new Uint8Array([1, 2, 3, 4, 5]);
+  bridgePort1.postMessage({ type: 'CLIENT_DATA', chunk: testPayload });
+  const readChunk = await bridge.clientReader.read();
+  assert(!readChunk.done && readChunk.value.length === 5 && readChunk.value[0] === 1, 'WorkerTunnelBridge clientReader receives streamed chunk accurately');
+
+  // Send stream data from bridge -> port1
+  let receivedStreamData = null;
+  bridgePort1.onmessage = (e) => {
+    if (e.data.type === 'STREAM_DATA') receivedStreamData = e.data.chunk;
+  };
+  await bridge.clientWriter.write(new Uint8Array([10, 20, 30]));
+  await new Promise(r => setTimeout(r, 10));
+  assert(receivedStreamData && receivedStreamData.length === 3 && receivedStreamData[1] === 20, 'WorkerTunnelBridge clientWriter forwards stream data over MessagePort');
+
+  // Test FIN signal
+  bridgePort1.postMessage({ type: 'CLIENT_FIN' });
+  const finChunk = await bridge.clientReader.read();
+  assert(finChunk.done === true, 'WorkerTunnelBridge clientReader signals stream completion upon CLIENT_FIN');
+  bridge.close();
+  bridgePort1.close();
 
   // Test QuicConnectionManager Handshake Concurrency Limiter
   const mockMgr = new QuicConnectionManager({
