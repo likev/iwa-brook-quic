@@ -517,17 +517,7 @@ export class QuicConnectionManager {
         }
         return null;
       }),
-      // 2. WorldTimeAPI UTC
-      fetchWithTimeout('https://worldtimeapi.org/api/timezone/Etc/UTC', async (resp, rtt, start) => {
-        const json = await resp.json();
-        if (json && json.unixtime) {
-          const serverSec = json.unixtime;
-          const localSec = (start + Math.round(rtt / 2)) / 1000;
-          return Math.round(serverSec - localSec);
-        }
-        return null;
-      }),
-      // 3. HTTP Date header fallback
+      // 2. HTTP Date header fallback
       fetchWithTimeout('https://httpbin.org/ip', async (resp, rtt, start) => {
         const dateHeader = resp.headers.get('date');
         if (dateHeader) {

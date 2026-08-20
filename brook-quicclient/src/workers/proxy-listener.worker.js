@@ -127,13 +127,8 @@ async function handleClientConnection(socket, listenerType, onDone) {
   const sessionId = String(sessionCounter);
   const logTag = `[#${sessionId}]`;
 
-  const reader = socket.readable.getReader();
-  const writer = socket.writable.getWriter();
-
-  let targetStr = 'unknown';
-  let dstBytes = null;
-  let leftover = new Uint8Array(0);
-  let isConnect = false;
+  let reader = null;
+  let writer = null;
 
   const cleanupSession = () => {
     activeSessions.delete(sessionId);
@@ -142,6 +137,14 @@ async function handleClientConnection(socket, listenerType, onDone) {
   };
 
   try {
+    const opened = socket.opened ? (await socket.opened) : socket;
+    reader = opened.readable.getReader();
+    writer = opened.writable.getWriter();
+
+    let targetStr = 'unknown';
+    let dstBytes = null;
+    let leftover = new Uint8Array(0);
+    let isConnect = false;
     // 1. Initial Protocol Detection & Parsing
     const { value: initialChunk, done: initialDone } = await reader.read();
     if (initialDone || !initialChunk || initialChunk.length === 0) {
@@ -263,8 +266,12 @@ async function handleClientConnection(socket, listenerType, onDone) {
     })();
   } catch (err) {
     log('error', `${logTag} Client handshake error: ${err.message}`);
-    try { reader.releaseLock(); } catch (e) {}
-    try { writer.releaseLock(); } catch (e) {}
+    if (reader) {
+      try { reader.releaseLock(); } catch (e) {}
+    }
+    if (writer) {
+      try { writer.releaseLock(); } catch (e) {}
+    }
     cleanupSession();
   }
 }
