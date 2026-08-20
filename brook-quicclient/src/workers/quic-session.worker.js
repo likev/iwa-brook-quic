@@ -80,7 +80,6 @@ async function runQuicTunnel({
   leftover,
   dialTimeoutMs = 8000,
   serverHost,
-  serverIp,
   serverPort,
   alpn = ['h3'],
   password,
@@ -99,14 +98,13 @@ async function runQuicTunnel({
   }
 
   const bridge = createPortStreamBridge(port);
-  const targetUdpIp = serverIp || serverHost;
 
   try {
-    log('info', `Initializing dedicated QUIC session to ${targetUdpIp}:${serverPort} for ${targetStr}`);
+    log('info', `Initializing dedicated QUIC session to ${serverHost}:${serverPort} for ${targetStr}`);
 
-    // 1. Open dedicated Direct Sockets UDPSocket for this connection
+    // 1. Open dedicated Direct Sockets UDPSocket for this connection (Chromium resolves hostnames internally)
     udpAdapter = new UdpSocketAdapter({
-      remoteAddress: targetUdpIp,
+      remoteAddress: serverHost,
       remotePort: serverPort,
       onDatagram: (data, fromAddr, fromPort) => {
         if (quic && !isClosed) {
@@ -272,7 +270,6 @@ self.onmessage = async (event) => {
         leftover: msg.leftover,
         dialTimeoutMs: msg.dialTimeoutMs,
         serverHost: msg.serverHost,
-        serverIp: msg.serverIp,
         serverPort: msg.serverPort,
         alpn: msg.alpn,
         password: msg.password,

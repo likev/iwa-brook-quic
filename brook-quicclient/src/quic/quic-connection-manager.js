@@ -516,16 +516,6 @@ export class QuicConnectionManager {
           return Math.round(serverSec - localSec);
         }
         return null;
-      }),
-      // 2. HTTP Date header fallback
-      fetchWithTimeout('https://httpbin.org/ip', async (resp, rtt, start) => {
-        const dateHeader = resp.headers.get('date');
-        if (dateHeader) {
-          const serverTime = new Date(dateHeader).getTime();
-          const localTime = start + Math.round(rtt / 2);
-          return Math.round((serverTime - localTime) / 1000);
-        }
-        return null;
       })
     ];
 
