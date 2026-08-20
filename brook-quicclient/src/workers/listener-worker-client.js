@@ -4,8 +4,8 @@
  */
 
 export class ListenerWorkerClient {
-  constructor({ quicWorkerPool, onLog, onBoundPorts }) {
-    this.quicWorkerPool = quicWorkerPool;
+  constructor({ quicWorkerManager, onLog, onBoundPorts }) {
+    this.quicWorkerManager = quicWorkerManager;
     this.onLog = onLog;
     this.onBoundPorts = onBoundPorts;
 
@@ -60,8 +60,8 @@ export class ListenerWorkerClient {
             break;
           case 'REQUEST_TUNNEL': {
             const port = event.ports[0];
-            if (this.quicWorkerPool) {
-              this.quicWorkerPool.allocateTunnel({
+            if (this.quicWorkerManager) {
+              this.quicWorkerManager.spawnTunnelWorker({
                 sessionId: msg.sessionId,
                 dstBytes: msg.dstBytes,
                 targetStr: msg.targetStr,

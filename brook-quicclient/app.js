@@ -8,7 +8,7 @@ import { SessionTracker } from './src/server/session-tracker.js';
 import { QuicConnectionManager } from './src/quic/quic-connection-manager.js';
 import { ProxyDispatcher } from './src/server/proxy-dispatcher.js';
 import { UiController } from './src/ui/ui-controller.js';
-import { QuicWorkerPool } from './src/workers/quic-worker-pool.js';
+import { QuicWorkerManager } from './src/workers/quic-worker-manager.js';
 import { ListenerWorkerClient } from './src/workers/listener-worker-client.js';
 
 // 1. Initialize Trusted Types Policy for Strict IWA CSP
@@ -17,7 +17,7 @@ initTrustedTypesPolicy();
 // 2. State & Components
 let logStream = null;
 let sessionTracker = null;
-let quicWorkerPool = null;
+let quicWorkerManager = null;
 let listenerClient = null;
 let fallbackQuicManager = null;
 let fallbackDispatcher = null;
@@ -35,7 +35,7 @@ async function bootstrap() {
     modalContainer
   });
 
-  logStream.add('info', `🚀 Brook QUIC Client IWA v1.32.0 initialized (Multi-Worker Engine: ${HAS_WORKER_SUPPORT ? 'Enabled' : 'Single-Thread Fallback'})`);
+  logStream.add('info', `🚀 Brook QUIC Client IWA v1.32.0 initialized (Multi-Worker Engine: ${HAS_WORKER_SUPPORT ? 'Enabled (Per-Connection Workers)' : 'Single-Thread Fallback'})`);
 
   // Initialize Session Tracker & Telemetry
   sessionTracker = new SessionTracker({
@@ -65,17 +65,14 @@ async function bootstrap() {
         }
 
         if (HAS_WORKER_SUPPORT) {
-          // 2. Setup QUIC Worker Pool (Up to 10 QUIC connection workers)
-          quicWorkerPool = new QuicWorkerPool({
+          // 2. Setup Per-Connection QUIC Worker Manager (1 dedicated Worker per QUIC Connection per UDPSocket)
+          quicWorkerManager = new QuicWorkerManager({
             serverHost: config.serverHost,
             serverPort: config.serverPort,
             alpn: ['h3'],
             password: config.password,
             withoutBrook: config.withoutBrook,
             clockOffsetSec: clockDriftSec,
-            maxWorkers: 10,
-            minWorkers: 1,
-            maxStreamsPerWorker: 8,
             onStateChange: (state, details) => {
               if (uiController) {
                 uiController.updateConnectionState(state, details);
@@ -86,11 +83,9 @@ async function bootstrap() {
             }
           });
 
-          await quicWorkerPool.start();
-
           // 3. Setup Listener Worker (Worker #1)
           listenerClient = new ListenerWorkerClient({
-            quicWorkerPool,
+            quicWorkerManager,
             onLog: (lvl, msg, meta) => {
               logStream.add(lvl, msg, meta);
             },
@@ -110,7 +105,7 @@ async function bootstrap() {
           });
 
           sessionTracker.setSnapshotProvider(() => {
-            return quicWorkerPool ? quicWorkerPool.getSnapshot(listenerClient.getStats()) : {};
+            return quicWorkerManager ? quicWorkerManager.getSnapshot(listenerClient.getStats()) : {};
           });
 
           if (boundPorts && uiController) {
@@ -160,9 +155,9 @@ async function bootstrap() {
           try { await listenerClient.stop(); } catch (e) {}
           listenerClient = null;
         }
-        if (quicWorkerPool) {
-          try { await quicWorkerPool.close(); } catch (e) {}
-          quicWorkerPool = null;
+        if (quicWorkerManager) {
+          try { await quicWorkerManager.close(); } catch (e) {}
+          quicWorkerManager = null;
         }
         if (fallbackDispatcher) {
           try { await fallbackDispatcher.stop(); } catch (e) {}
@@ -183,9 +178,9 @@ async function bootstrap() {
         listenerClient = null;
       }
 
-      if (quicWorkerPool) {
-        try { await quicWorkerPool.close(); } catch (e) {}
-        quicWorkerPool = null;
+      if (quicWorkerManager) {
+        try { await quicWorkerManager.close(); } catch (e) {}
+        quicWorkerManager = null;
       }
 
       if (fallbackDispatcher) {
