@@ -1,2 +1,6 @@
 node_modules/
 .DS_Store
+*.exe
+brook-quicserver
+wt-bridge
+test-scratch/

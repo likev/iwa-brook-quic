@@ -4,7 +4,7 @@
 
 import { DomBuilder } from './dom-builder.js';
 import { formatBytes, formatSpeed, parseHostPort } from '../core/byte-utils.js';
-import { ConnectionState } from '../quic/quic-connection-manager.js';
+import { ConnectionState } from '../webtransport/wt-connection-manager.js';
 import { CHROME_RESTRICTED_PORTS } from '../server/tcp-listener.js';
 
 export class UiController {
@@ -228,9 +228,16 @@ export class UiController {
   }
 
   getConfig() {
-    const rawServer = (this.inputServer?.value || 'quic://brook-quic.pplx.io:4433').trim();
-    const cleaned = rawServer.replace(/^quic:\/\//i, '');
-    const { host: serverHost, port: serverPort } = parseHostPort(cleaned, 4433);
+    let rawServer = (this.inputServer?.value || 'https://brook-quic.pplx.io:4433/brook').trim();
+    rawServer = rawServer.replace(/^quic:\/\//i, '').replace(/^https:\/\//i, '').replace(/^http:\/\//i, '');
+
+    let path = '/brook';
+    if (rawServer.includes('/')) {
+      const idx = rawServer.indexOf('/');
+      path = rawServer.slice(idx);
+      rawServer = rawServer.slice(0, idx);
+    }
+    const { host: serverHost, port: serverPort } = parseHostPort(rawServer, 4433);
 
     const socks5Port = parseInt(this.inputSocks5Port?.value || '10808', 10);
     const httpPort = parseInt(this.inputHttpPort?.value || '8080', 10);
@@ -238,6 +245,7 @@ export class UiController {
     return {
       serverHost,
       serverPort,
+      serverPath: path,
       password: this.inputPassword?.value || '271828brook',
       socks5Port,
       httpPort,

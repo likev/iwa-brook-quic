@@ -1,14 +1,15 @@
 /**
- * Brook QUIC Client IWA — Main Application Bootstrap & Orchestrator.
+ * Brook WebTransport Client IWA — Main Application Bootstrap & Orchestrator.
+ * Uses native WebTransport (HTTP/3 QUIC) transport for high-performance proxying.
  */
 
 import { initTrustedTypesPolicy } from './src/ui/trusted-types-policy.js';
 import { LogStream } from './src/ui/log-stream.js';
 import { SessionTracker } from './src/server/session-tracker.js';
-import { QuicConnectionManager } from './src/quic/quic-connection-manager.js';
+import { WebTransportConnectionManager } from './src/webtransport/wt-connection-manager.js';
 import { ProxyDispatcher } from './src/server/proxy-dispatcher.js';
 import { UiController } from './src/ui/ui-controller.js';
-import { QuicWorkerManager } from './src/workers/quic-worker-manager.js';
+import { WtWorkerManager } from './src/workers/wt-worker-manager.js';
 import { ListenerWorkerClient } from './src/workers/listener-worker-client.js';
 
 // 1. Initialize Trusted Types Policy for Strict IWA CSP
@@ -17,9 +18,9 @@ initTrustedTypesPolicy();
 // 2. State & Components
 let logStream = null;
 let sessionTracker = null;
-let quicWorkerManager = null;
+let wtWorkerManager = null;
 let listenerClient = null;
-let fallbackQuicManager = null;
+let fallbackWtManager = null;
 let fallbackDispatcher = null;
 let uiController = null;
 
@@ -35,7 +36,7 @@ async function bootstrap() {
     modalContainer
   });
 
-  logStream.add('info', `🚀 Brook QUIC Client IWA v1.32.0 initialized (Multi-Worker Engine: ${HAS_WORKER_SUPPORT ? 'Enabled (Per-Connection Workers)' : 'Single-Thread Fallback'})`);
+  logStream.add('info', `🚀 Brook WebTransport Client IWA v2.0.0 initialized (Engine: Native WebTransport / HTTP/3 QUIC)`);
 
   // Initialize Session Tracker & Telemetry
   sessionTracker = new SessionTracker({
@@ -50,26 +51,22 @@ async function bootstrap() {
   uiController = new UiController({
     logStream,
     onStart: async (config) => {
-      logStream.add('info', `Starting multi-threaded proxy with server ${config.serverHost}:${config.serverPort}...`);
-
-      // 0. Preflight check for Direct Sockets / IWA isolation
-      if (typeof window !== 'undefined' && (!window.crossOriginIsolated || typeof window.UDPSocket === 'undefined')) {
-        logStream.add('warning', '⚠️ Direct Sockets requires an Isolated Web App context (isolated-app://) or Chrome IWA flags.');
-      }
+      const serverPath = config.serverPath || '/brook';
+      logStream.add('info', `Starting WebTransport proxy connected to https://${config.serverHost}:${config.serverPort}${serverPath}...`);
 
       try {
         // 1. Auto-synchronize network clock drift
-        const clockDriftSec = await QuicConnectionManager.measureClockDrift();
+        const clockDriftSec = await WebTransportConnectionManager.measureClockDrift();
         if (Math.abs(clockDriftSec) > 1) {
           logStream.add('info', `⏱️ Network time sync: local clock drift is ${clockDriftSec > 0 ? '+' : ''}${clockDriftSec}s (auto-compensated)`);
         }
 
         if (HAS_WORKER_SUPPORT) {
-          // 2. Setup Per-Connection QUIC Worker Manager (1 dedicated Worker per QUIC Connection per UDPSocket)
-          quicWorkerManager = new QuicWorkerManager({
+          // 2. Setup WebTransport Worker Manager
+          wtWorkerManager = new WtWorkerManager({
             serverHost: config.serverHost,
             serverPort: config.serverPort,
-            alpn: ['h3'],
+            path: serverPath,
             password: config.password,
             withoutBrook: config.withoutBrook,
             clockOffsetSec: clockDriftSec,
@@ -83,9 +80,9 @@ async function bootstrap() {
             }
           });
 
-          // 3. Setup Listener Worker (Worker #1)
+          // 3. Setup Listener Worker
           listenerClient = new ListenerWorkerClient({
-            quicWorkerManager,
+            quicWorkerManager: wtWorkerManager,
             onLog: (lvl, msg, meta) => {
               logStream.add(lvl, msg, meta);
             },
@@ -105,27 +102,27 @@ async function bootstrap() {
           });
 
           sessionTracker.setSnapshotProvider(() => {
-            return quicWorkerManager ? quicWorkerManager.getSnapshot(listenerClient.getStats()) : {};
+            return wtWorkerManager ? wtWorkerManager.getSnapshot(listenerClient.getStats()) : {};
           });
 
           if (boundPorts && uiController) {
             uiController.updateBoundPorts(boundPorts);
           }
         } else {
-          // Fallback single-thread mode for non-worker environments
-          fallbackQuicManager = new QuicConnectionManager({
+          // Direct main-thread WebTransport mode
+          fallbackWtManager = new WebTransportConnectionManager({
             serverHost: config.serverHost,
             serverPort: config.serverPort,
-            alpn: ['h3'],
+            path: serverPath,
             onStateChange: (state, details) => {
               if (uiController) uiController.updateConnectionState(state, details);
             },
             onLog: (lvl, msg, meta) => logStream.add(lvl, msg, meta)
           });
-          await fallbackQuicManager.connect();
+          await fallbackWtManager.connect();
 
           fallbackDispatcher = new ProxyDispatcher({
-            quicManager: fallbackQuicManager,
+            quicManager: fallbackWtManager,
             sessionTracker,
             password: config.password,
             withoutBrook: config.withoutBrook,
@@ -134,7 +131,7 @@ async function bootstrap() {
           });
 
           sessionTracker.setSnapshotProvider(() => {
-            return fallbackQuicManager ? fallbackQuicManager.getSnapshot(fallbackDispatcher) : {};
+            return fallbackWtManager ? fallbackWtManager.getSnapshot(fallbackDispatcher) : {};
           });
 
           const boundPorts = await fallbackDispatcher.start({
@@ -155,17 +152,17 @@ async function bootstrap() {
           try { await listenerClient.stop(); } catch (e) {}
           listenerClient = null;
         }
-        if (quicWorkerManager) {
-          try { await quicWorkerManager.close(); } catch (e) {}
-          quicWorkerManager = null;
+        if (wtWorkerManager) {
+          try { await wtWorkerManager.close(); } catch (e) {}
+          wtWorkerManager = null;
         }
         if (fallbackDispatcher) {
           try { await fallbackDispatcher.stop(); } catch (e) {}
           fallbackDispatcher = null;
         }
-        if (fallbackQuicManager) {
-          try { await fallbackQuicManager.close(); } catch (e) {}
-          fallbackQuicManager = null;
+        if (fallbackWtManager) {
+          try { await fallbackWtManager.close(); } catch (e) {}
+          fallbackWtManager = null;
         }
         throw err;
       }
@@ -178,9 +175,9 @@ async function bootstrap() {
         listenerClient = null;
       }
 
-      if (quicWorkerManager) {
-        try { await quicWorkerManager.close(); } catch (e) {}
-        quicWorkerManager = null;
+      if (wtWorkerManager) {
+        try { await wtWorkerManager.close(); } catch (e) {}
+        wtWorkerManager = null;
       }
 
       if (fallbackDispatcher) {
@@ -188,9 +185,9 @@ async function bootstrap() {
         fallbackDispatcher = null;
       }
 
-      if (fallbackQuicManager) {
-        try { await fallbackQuicManager.close(); } catch (e) {}
-        fallbackQuicManager = null;
+      if (fallbackWtManager) {
+        try { await fallbackWtManager.close(); } catch (e) {}
+        fallbackWtManager = null;
       }
 
       sessionTracker.setSnapshotProvider(null);

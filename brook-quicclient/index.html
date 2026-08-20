@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Brook QUIC Client — Isolated Web App</title>
+  <title>Brook WebTransport Client — Isolated Web App</title>
   <meta http-equiv="Cross-Origin-Opener-Policy" content="same-origin">
   <meta http-equiv="Cross-Origin-Embedder-Policy" content="require-corp">
   <meta http-equiv="Cross-Origin-Resource-Policy" content="same-origin">
@@ -18,8 +18,8 @@
       <div class="brand-section">
         <div class="logo-icon">⚡</div>
         <div>
-          <h1 class="app-title">Brook QUIC Client</h1>
-          <p class="app-subtitle">Direct Sockets SOCKS5 & HTTP In-Browser Proxy Tunnel</p>
+          <h1 class="app-title">Brook WebTransport Client</h1>
+          <p class="app-subtitle">Direct Sockets SOCKS5 & HTTP In-Browser Proxy Tunnel over WebTransport (HTTP/3)</p>
         </div>
       </div>
       <div class="header-status-section">
@@ -38,8 +38,8 @@
         <div class="card-body">
           <form id="proxy-config-form" onsubmit="return false;">
             <div class="form-group">
-              <label for="input-server">Brook QUIC Server</label>
-              <input type="text" id="input-server" value="quic://brook-quic.pplx.io:4433" placeholder="quic://host:port" required>
+              <label for="input-server">Brook WebTransport Server</label>
+              <input type="text" id="input-server" value="https://brook-quic.pplx.io:4433/brook" placeholder="https://host:port/brook" required>
             </div>
 
             <div class="form-group">
