@@ -166,7 +166,7 @@ async function runQuicTunnel({
         if (handler && handler.onError) handler.onError(err);
       });
 
-      quic.on('connected', () => {
+      quic.on('connect', () => {
         if (resolved) return;
         resolved = true;
         clearTimeout(timeout);
@@ -187,10 +187,13 @@ async function runQuicTunnel({
       });
 
       quic.on('close', () => {
+        if (!resolved) {
+          resolved = true;
+          clearTimeout(timeout);
+          reject(new Error('QUIC connection closed unexpectedly'));
+        }
         cleanup('QUIC closed');
       });
-
-      quic.init();
     });
 
     // 3. Build virtual stream manager interface for BrookTunnel
