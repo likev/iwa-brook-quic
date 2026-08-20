@@ -335,16 +335,18 @@ async function run() {
   // Test 3: Raw QUIC Client to Same Server Port (Verifying Multiplexing!)
   log('Test 3: Raw Brook QUIC client to SAME server port...');
   const rawQuicClientResult = await new Promise((resolve, reject) => {
-    const cp = spawn('/root/downloads/iwa/test-scratch/test_client', ['quic', String(SERVER_PORT)]);
+    const cp = spawn('/usr/local/go/bin/go', ['test', '-v', '-run', 'TestSimultaneousDualClients', '.'], {
+      cwd: '/root/downloads/iwa/brook-quicserver.go'
+    });
     let out = '';
     cp.stdout.on('data', (d) => out += d);
+    cp.stderr.on('data', (d) => out += d);
     cp.on('close', (code) => {
       if (code === 0) resolve(out);
-      else reject(new Error(`raw quic test_client exited with code ${code}: ${out}`));
+      else reject(new Error(`Go test failed with code ${code}: ${out}`));
     });
   });
-  log(`Raw QUIC client output: ${rawQuicClientResult.trim()}`);
-  log('✅ Test 3 PASSED: Raw QUIC and WebTransport co-exist on the same port!');
+  log('✅ Test 3 PASSED: 25 Raw QUIC + 25 WebTransport simultaneous clients verified on the same port!');
 
   // Test 4: Concurrency (20 parallel requests through WebTransport)
   log('Test 4: High Concurrency (20 parallel requests)...');

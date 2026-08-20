@@ -64,9 +64,9 @@ async function testConcurrentQuicSessions(concurrency = 8) {
           // Now test Brook handshake on stream 0
           const cn = generateNonce();
           const cnCopy = new Uint8Array(cn);
-          const ck = deriveKey(PASSWORD, cnCopy, 'brook', false);
+          const ck = await deriveKey(PASSWORD, cnCopy, 'brook', false);
           const dstBytes = new Uint8Array([0x03, 0x0e, ...Buffer.from('www.google.com'), 0x01, 0xbb]);
-          const header = sealFrame(ck, cnCopy, buildBrookHeader(dstBytes, true, 0));
+          const header = await sealFrame(ck, cnCopy, buildBrookHeader(dstBytes, true, 0));
 
           let brookResolved = false;
           const brookTimer = setTimeout(() => {

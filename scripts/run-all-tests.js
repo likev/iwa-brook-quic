@@ -9,12 +9,12 @@ import dns from 'node:dns/promises';
 import { exec } from 'node:child_process';
 import { promisify } from 'node:util';
 
-import { deriveKey, generateNonce, nextNonce } from '../brook-quicclient/src/core/brook-crypto.js';
+import { deriveKey, generateNonce, nextNonce, sha256 } from '../brook-quicclient/src/core/brook-crypto.js';
 import { sealFrame, openLength, openPayload, buildBrookHeader, BrookCipher } from '../brook-quicclient/src/core/brook-framing.js';
 import { Socks5Parser } from '../brook-quicclient/src/protocols/socks5-parser.js';
 import { HttpProxyParser } from '../brook-quicclient/src/protocols/http-proxy-parser.js';
 import { ProtocolDetector, ProtocolType } from '../brook-quicclient/src/protocols/protocol-detector.js';
-import { QUICConnection, sha256 } from '../brook-quicclient/vendor/quic-engine.bundle.js';
+import { QUICConnection } from '../brook-quicclient/vendor/quic-engine.bundle.js';
 import { BrookTunnel } from '../brook-quicclient/src/core/brook-tunnel.js';
 import { DnsResolver } from '../brook-quicclient/src/core/dns-resolver.js';
 import { encodeAddress, parseIpv6, parseHostPort, formatIpv6 } from '../brook-quicclient/src/core/byte-utils.js';
@@ -54,11 +54,11 @@ async function runUnitTests() {
   // Test Crypto Key Derivation
   const password = '271828brook';
   const nonce = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
-  const key = deriveKey(password, nonce, 'brook', false);
-  assert(key instanceof Uint8Array && key.length === 32, 'deriveKey returns 32-byte AES-256 key');
+  const key = await deriveKey(password, nonce, 'brook', false);
+  assert(key instanceof CryptoKey, 'deriveKey returns native Web Crypto CryptoKey');
 
   // Test SHA256
-  const hash = sha256(new TextEncoder().encode('hello'));
+  const hash = await sha256(new TextEncoder().encode('hello'));
   assert(hash instanceof Uint8Array && hash.length === 32, 'sha256 returns 32-byte digest');
 
   // Test Nonce Increment
@@ -69,27 +69,26 @@ async function runUnitTests() {
   // Test Frame Sealing & Opening
   const payload = new TextEncoder().encode('Hello Brook QUIC');
   const cn = new Uint8Array(nonce);
-  const sealed = sealFrame(key, cn, payload);
+  const sealed = await sealFrame(key, cn, payload);
   assert(sealed.length === 18 + payload.length + 16, `Sealed frame length is correct (${sealed.length}B)`);
 
   const sn = new Uint8Array(nonce);
-  const openLen = openLength(key, sn, sealed.slice(0, 18));
+  const openLen = await openLength(key, sn, sealed.slice(0, 18));
   assert(openLen === payload.length, `Decrypted frame length matches original (${openLen} == ${payload.length})`);
 
-  const openedPayload = openPayload(key, sn, sealed.slice(18));
+  const openedPayload = await openPayload(key, sn, sealed.slice(18));
   assert(new TextDecoder().decode(openedPayload) === 'Hello Brook QUIC', 'Decrypted payload matches original string');
 
-  // Test Fast BrookCipher Precomputed AES Schedule & GHASH Table
+  // Test BrookCipher with Web Crypto API
   const fastCipher = new BrookCipher(key);
-  assert(fastCipher.useFast === true, 'BrookCipher initializes fast precomputed AES key schedule and H-table');
   const cn2 = new Uint8Array(nonce);
-  const sealedFast = sealFrame(fastCipher, cn2, payload);
+  const sealedFast = await sealFrame(fastCipher, cn2, payload);
   assert(sealedFast.length === sealed.length, 'BrookCipher sealed frame length matches standard format');
 
   const sn2 = new Uint8Array(nonce);
-  const openLenFast = openLength(fastCipher, sn2, sealedFast.subarray(0, 18));
+  const openLenFast = await openLength(fastCipher, sn2, sealedFast.subarray(0, 18));
   assert(openLenFast === payload.length, 'BrookCipher openLength correctly recovers payload length');
-  const openedFast = openPayload(fastCipher, sn2, sealedFast.subarray(18));
+  const openedFast = await openPayload(fastCipher, sn2, sealedFast.subarray(18));
   assert(new TextDecoder().decode(openedFast) === 'Hello Brook QUIC', 'BrookCipher openPayload matches original plaintext');
 
   // Test BrookCipher unaligned memory slice resilience (byteOffset % 4 != 0)
@@ -97,14 +96,14 @@ async function runUnitTests() {
   const unalignedSlice = unalignedBuf.subarray(3, 3 + payload.length);
   unalignedSlice.set(payload);
   const cnUnaligned = new Uint8Array(nonce);
-  const sealedUnaligned = fastCipher.encrypt(cnUnaligned, unalignedSlice);
+  const sealedUnaligned = await fastCipher.encrypt(cnUnaligned, unalignedSlice);
   assert(sealedUnaligned.length === payload.length + 16, 'BrookCipher encrypts unaligned memory view without error');
 
   const unalignedCtBuf = new Uint8Array(200);
   const unalignedCtSlice = unalignedCtBuf.subarray(1, 1 + sealedUnaligned.length);
   unalignedCtSlice.set(sealedUnaligned);
   const snUnaligned = new Uint8Array(nonce);
-  const openedUnaligned = fastCipher.decrypt(snUnaligned, unalignedCtSlice);
+  const openedUnaligned = await fastCipher.decrypt(snUnaligned, unalignedCtSlice);
   assert(new TextDecoder().decode(openedUnaligned) === 'Hello Brook QUIC', 'BrookCipher decrypts unaligned ciphertext view accurately');
 
   // Test Protocol Detector
@@ -532,9 +531,9 @@ async function runUnitTests() {
   transportCb.onData(snSample, false);
   await new Promise(r => setTimeout(r, 10));
   // Send 1 frame of data then trigger onClose (transport_closed)
-  const sampleKey = deriveKey('271828brook', snSample, 'brook', false);
+  const sampleKey = await deriveKey('271828brook', snSample, 'brook', false);
   const samplePayload = new TextEncoder().encode('HTTP/1.1 200 OK\r\n\r\nHello');
-  const sealedData = sealFrame(sampleKey, snSample, samplePayload);
+  const sealedData = await sealFrame(sampleKey, snSample, samplePayload);
   transportCb.onData(sealedData, false);
   await new Promise(r => setTimeout(r, 20));
   transportCb.onClose(); // Transport closes after data

@@ -126,11 +126,11 @@ export class DnsResolver {
       const dstBytes = new Uint8Array([0x01, 8, 8, 8, 8, 0x00, 53]);
       const cn = generateNonce();
       const cnCopy = new Uint8Array(cn);
-      const ck = deriveKey(password, cnCopy, 'brook', withoutBrook);
-      const header = sealFrame(ck, cnCopy, buildBrookHeader(dstBytes, true, clockOffsetSec));
+      const ck = await deriveKey(password, cnCopy, 'brook', withoutBrook);
+      const header = await sealFrame(ck, cnCopy, buildBrookHeader(dstBytes, true, clockOffsetSec));
 
       const dnsPayload = this._buildDnsQuery(host);
-      const sealedDns = sealFrame(ck, cnCopy, dnsPayload);
+      const sealedDns = await sealFrame(ck, cnCopy, dnsPayload);
 
       await session.ensureConnected();
 
@@ -142,7 +142,7 @@ export class DnsResolver {
         const timer = setTimeout(() => reject(new Error('DNS resolution timed out')), timeoutMs);
 
         session.registerStream(streamId, {
-          onData: (data) => {
+          onData: async (data) => {
             if (!data || data.length === 0) return;
             const merged = new Uint8Array(rxBuf.length + data.length);
             merged.set(rxBuf, 0);
@@ -152,16 +152,21 @@ export class DnsResolver {
             if (!sn && rxBuf.length >= 12) {
               sn = rxBuf.slice(0, 12);
               rxBuf = rxBuf.slice(12);
-              sk = deriveKey(password, sn, 'brook', withoutBrook);
+              sk = await deriveKey(password, sn, 'brook', withoutBrook);
             }
 
             if (sk && rxBuf.length >= 18) {
-              const payloadLen = openLength(sk, sn, rxBuf.slice(0, 18));
-              if (rxBuf.length >= 18 + payloadLen + 16) {
-                const plain = openPayload(sk, sn, rxBuf.slice(18, 18 + payloadLen + 16));
+              try {
+                const payloadLen = await openLength(sk, sn, rxBuf.slice(0, 18));
+                if (rxBuf.length >= 18 + payloadLen + 16) {
+                  const plain = await openPayload(sk, sn, rxBuf.slice(18, 18 + payloadLen + 16));
+                  clearTimeout(timer);
+                  const parsed = this._parseDnsResponse(plain);
+                  resolve(parsed);
+                }
+              } catch (e) {
                 clearTimeout(timer);
-                const parsed = this._parseDnsResponse(plain);
-                resolve(parsed);
+                reject(e);
               }
             }
           },

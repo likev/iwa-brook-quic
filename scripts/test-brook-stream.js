@@ -1,59 +1,7 @@
 import { createQuicClientSocket } from '../node_modules/quico/src/quic_socket.js';
-import { gcm } from '@noble/ciphers/aes.js';
-import { hkdf } from '@noble/hashes/hkdf.js';
-import { sha256 } from '@noble/hashes/sha2.js';
+import { deriveKey, nextNonce } from '../brook-quicclient/src/core/brook-crypto.js';
+import { sealFrame, openLength, openPayload, BrookCipher } from '../brook-quicclient/src/core/brook-framing.js';
 import dns from 'node:dns/promises';
-
-function nextNonce(nonce12) {
-  let v = (BigInt(nonce12[0])) |
-          (BigInt(nonce12[1]) << 8n) |
-          (BigInt(nonce12[2]) << 16n) |
-          (BigInt(nonce12[3]) << 24n) |
-          (BigInt(nonce12[4]) << 32n) |
-          (BigInt(nonce12[5]) << 40n) |
-          (BigInt(nonce12[6]) << 48n) |
-          (BigInt(nonce12[7]) << 56n);
-  v = (v + 1n) & 0xFFFFFFFFFFFFFFFFn;
-  for (let i = 0; i < 8; i++) {
-    nonce12[i] = Number((v >> BigInt(i * 8)) & 0xFFn);
-  }
-}
-
-function deriveKey(password, nonce12, info = 'brook') {
-  const pwdBytes = typeof password === 'string' ? new TextEncoder().encode(password) : password;
-  const infoBytes = typeof info === 'string' ? new TextEncoder().encode(info) : info;
-  return hkdf(sha256, pwdBytes, nonce12, infoBytes, 32);
-}
-
-function sealFrame(keyBytes, nonce12, payload) {
-  const lenBuf = new Uint8Array([ (payload.length >> 8) & 0xFF, payload.length & 0xFF ]);
-  const lenCipher = gcm(keyBytes, nonce12);
-  const sealedLen = lenCipher.encrypt(lenBuf); // 2 + 16 = 18B
-  nextNonce(nonce12);
-
-  const payloadCipher = gcm(keyBytes, nonce12);
-  const sealedPayload = payloadCipher.encrypt(payload); // L + 16B
-  nextNonce(nonce12);
-
-  const out = new Uint8Array(18 + sealedPayload.length);
-  out.set(sealedLen, 0);
-  out.set(sealedPayload, 18);
-  return out;
-}
-
-function openLength(keyBytes, nonce12, chunk18) {
-  const lenCipher = gcm(keyBytes, nonce12);
-  const lenBuf = lenCipher.decrypt(chunk18);
-  nextNonce(nonce12);
-  return (lenBuf[0] << 8) | lenBuf[1];
-}
-
-function openPayload(keyBytes, nonce12, chunkPayloadAndTag) {
-  const payloadCipher = gcm(keyBytes, nonce12);
-  const payload = payloadCipher.decrypt(chunkPayloadAndTag);
-  nextNonce(nonce12);
-  return payload;
-}
 
 async function runBrookTest() {
   const password = '271828brook';

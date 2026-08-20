@@ -2113,24 +2113,6 @@ var ghash = /* @__PURE__ */ wrapMacConstructor(16, (key, expectedLength) => new 
 var BLOCK_SIZE2 = 16;
 var BLOCK_SIZE32 = 4;
 var EMPTY_BLOCK = /* @__PURE__ */ new Uint8Array(BLOCK_SIZE2);
-var ONE_BLOCK = /* @__PURE__ */ Uint8Array.from([
-  0,
-  0,
-  0,
-  0,
-  0,
-  0,
-  0,
-  0,
-  0,
-  0,
-  0,
-  0,
-  0,
-  0,
-  0,
-  1
-]);
 var POLY2 = 283;
 function validateKeyLength(key) {
   if (![16, 24, 32].includes(key.length))
@@ -2275,40 +2257,6 @@ function decrypt(xk, s0, s1, s2, s3) {
   const t2 = xk[k++] ^ applySbox(sbox2, s2, s1, s0, s3);
   const t3 = xk[k++] ^ applySbox(sbox2, s3, s2, s1, s0);
   return { s0: t0, s1: t1, s2: t2, s3: t3 };
-}
-function ctrCounter(xk, nonce, src, dst) {
-  abytes2(nonce, BLOCK_SIZE2, "nonce");
-  abytes2(src);
-  const srcLen = src.length;
-  dst = getOutput(srcLen, dst);
-  complexOverlapBytes(src, dst);
-  const ctr = nonce;
-  const c32 = u32(ctr);
-  const src32 = u32(src);
-  const dst32 = u32(dst);
-  for (let i = 0; i + 4 <= src32.length; i += 4) {
-    const { s0, s1, s2, s3 } = encrypt(xk, swap8IfBE(c32[0]), swap8IfBE(c32[1]), swap8IfBE(c32[2]), swap8IfBE(c32[3]));
-    dst32[i + 0] = src32[i + 0] ^ swap8IfBE(s0);
-    dst32[i + 1] = src32[i + 1] ^ swap8IfBE(s1);
-    dst32[i + 2] = src32[i + 2] ^ swap8IfBE(s2);
-    dst32[i + 3] = src32[i + 3] ^ swap8IfBE(s3);
-    for (let j = BLOCK_SIZE2 - 1, carry = 1; j >= 0; j--) {
-      carry = carry + ctr[j] | 0;
-      ctr[j] = carry & 255;
-      carry >>>= 8;
-    }
-  }
-  const start = BLOCK_SIZE2 * Math.floor(src32.length / BLOCK_SIZE32);
-  if (start < srcLen) {
-    const { s0, s1, s2, s3 } = encrypt(xk, swap8IfBE(c32[0]), swap8IfBE(c32[1]), swap8IfBE(c32[2]), swap8IfBE(c32[3]));
-    const b32 = new Uint32Array([s0, s1, s2, s3]);
-    swap32IfBE(b32);
-    const buf = u8(b32);
-    for (let i = start, pos = 0; i < srcLen; i++, pos++)
-      dst[i] = src[i] ^ buf[pos];
-    clean2(b32);
-  }
-  return dst;
 }
 function ctr32(xk, isLE2, nonce, src, dst) {
   abytes2(nonce, BLOCK_SIZE2, "nonce");
@@ -2527,204 +2475,6 @@ var gcm = /* @__PURE__ */ wrapCipher({ blockSize: 16, nonceLength: 12, tagLength
       return out;
     }
   };
-});
-function isBytes32(a) {
-  return a instanceof Uint32Array || ArrayBuffer.isView(a) && a.constructor.name === "Uint32Array";
-}
-function encryptBlock(xk, block) {
-  abytes2(block, 16, "block");
-  if (!isBytes32(xk))
-    throw new Error("_encryptBlock accepts result of expandKeyLE");
-  const b32 = u32(block);
-  swap32IfBE(b32);
-  let { s0, s1, s2, s3 } = encrypt(xk, b32[0], b32[1], b32[2], b32[3]);
-  b32[0] = s0, b32[1] = s1, b32[2] = s2, b32[3] = s3;
-  swap32IfBE(b32);
-  return block;
-}
-function decryptBlock(xk, block) {
-  abytes2(block, 16, "block");
-  if (!isBytes32(xk))
-    throw new Error("_decryptBlock accepts result of expandKeyLE");
-  const b32 = u32(block);
-  swap32IfBE(b32);
-  let { s0, s1, s2, s3 } = decrypt(xk, b32[0], b32[1], b32[2], b32[3]);
-  b32[0] = s0, b32[1] = s1, b32[2] = s2, b32[3] = s3;
-  swap32IfBE(b32);
-  return block;
-}
-function dbl(block) {
-  let carry = 0;
-  for (let i = BLOCK_SIZE2 - 1; i >= 0; i--) {
-    const newCarry = (block[i] & 128) >>> 7;
-    block[i] = block[i] << 1 | carry;
-    carry = newCarry;
-  }
-  block[BLOCK_SIZE2 - 1] ^= 135 & -carry;
-  return block;
-}
-function xorBlock(a, b) {
-  if (a.length !== b.length)
-    throw new Error("xorBlock: blocks must have same length");
-  for (let i = 0; i < a.length; i++) {
-    a[i] = a[i] ^ b[i];
-  }
-  return a;
-}
-function xorend(a, b) {
-  if (b.length > a.length) {
-    throw new Error("xorend: expected len(B) <= len(A)");
-  }
-  const offset = a.length - b.length;
-  for (let i = 0; i < b.length; i++) {
-    a[offset + i] = a[offset + i] ^ b[i];
-  }
-  return a;
-}
-var _CMAC = class {
-  blockLen = BLOCK_SIZE2;
-  outputLen = BLOCK_SIZE2;
-  // CMAC can only decide between `K1` and `K2` once the true final block is known,
-  // so updates process older blocks eagerly but keep one pending block buffered.
-  buffer;
-  pos;
-  finished;
-  destroyed;
-  k1;
-  k2;
-  x;
-  x32;
-  xk;
-  constructor(key) {
-    abytes2(key);
-    validateKeyLength(key);
-    this.xk = expandKeyLE(key);
-    this.buffer = new Uint8Array(BLOCK_SIZE2);
-    this.pos = 0;
-    this.finished = false;
-    this.destroyed = false;
-    this.x = new Uint8Array(BLOCK_SIZE2);
-    this.x32 = u32(this.x);
-    const L = new Uint8Array(BLOCK_SIZE2);
-    encryptBlock(this.xk, L);
-    this.k1 = dbl(L);
-    this.k2 = dbl(new Uint8Array(this.k1));
-  }
-  // Consumes 16 bytes of `data` starting at `pos`; `pos` avoids a per-block
-  // subarray view allocation in update().
-  process(data, pos) {
-    const { x, x32, xk } = this;
-    for (let i = 0; i < BLOCK_SIZE2; i++)
-      x[i] ^= data[pos + i];
-    swap32IfBE(x32);
-    const { s0, s1, s2, s3 } = encrypt(xk, x32[0], x32[1], x32[2], x32[3]);
-    x32[0] = s0, x32[1] = s1, x32[2] = s2, x32[3] = s3;
-    swap32IfBE(x32);
-  }
-  update(data) {
-    aexists2(this);
-    abytes2(data);
-    let pos = 0;
-    if (this.pos) {
-      const take = Math.min(BLOCK_SIZE2 - this.pos, data.length);
-      this.buffer.set(data.subarray(0, take), this.pos);
-      this.pos += take;
-      pos = take;
-      if (this.pos === BLOCK_SIZE2 && pos < data.length) {
-        this.process(this.buffer, 0);
-        this.pos = 0;
-      }
-    }
-    while (pos + BLOCK_SIZE2 < data.length) {
-      this.process(data, pos);
-      pos += BLOCK_SIZE2;
-    }
-    if (pos < data.length) {
-      this.buffer.set(data.subarray(pos), 0);
-      this.pos = data.length - pos;
-    }
-    return this;
-  }
-  // See {@link https://www.rfc-editor.org/rfc/rfc4493.html#section-2.4 | RFC 4493 Section 2.4}.
-  digestInto(out) {
-    aexists2(this);
-    aoutput32(out, this);
-    this.finished = true;
-    const view = out.subarray(0, this.outputLen);
-    let last = new Uint8Array(BLOCK_SIZE2);
-    if (this.pos === BLOCK_SIZE2) {
-      last.set(this.buffer);
-      xorBlock(last, this.k1);
-    } else {
-      last.set(this.buffer.subarray(0, this.pos));
-      last[this.pos] = 128;
-      xorBlock(last, this.k2);
-    }
-    view.set(this.x);
-    xorBlock(view, last);
-    encryptBlock(this.xk, view);
-    clean2(last);
-  }
-  digest() {
-    const { buffer, outputLen } = this;
-    this.digestInto(buffer);
-    const res = buffer.slice(0, outputLen);
-    this.destroy();
-    return res;
-  }
-  destroy() {
-    const { buffer, destroyed, x, xk, k1, k2 } = this;
-    if (destroyed)
-      return;
-    this.destroyed = true;
-    clean2(buffer, x, xk, k1, k2);
-  }
-};
-var cmac = /* @__PURE__ */ wrapMacConstructor(16, (key) => new _CMAC(key));
-function s2v(key, strings) {
-  validateKeyLength(key);
-  const len = strings.length;
-  if (len > 127) {
-    throw new Error("s2v: expected <= 127 inputs");
-  }
-  if (len === 0)
-    return cmac(ONE_BLOCK, key);
-  let d = cmac(EMPTY_BLOCK, key);
-  for (let i = 0; i < len - 1; i++) {
-    dbl(d);
-    const cmacResult = cmac(strings[i], key);
-    xorBlock(d, cmacResult);
-    clean2(cmacResult);
-  }
-  const s_n = strings[len - 1];
-  abytes2(s_n);
-  let t;
-  if (s_n.byteLength >= BLOCK_SIZE2) {
-    t = xorend(Uint8Array.from(s_n), d);
-  } else {
-    const paddedSn = new Uint8Array(BLOCK_SIZE2);
-    paddedSn.set(s_n);
-    paddedSn[s_n.length] = 128;
-    t = xorBlock(dbl(d), paddedSn);
-    clean2(paddedSn);
-  }
-  const result = cmac(t, key);
-  clean2(d, t);
-  return result;
-}
-var unsafe = /* @__PURE__ */ Object.freeze({
-  expandKeyLE,
-  expandKeyDecLE,
-  encrypt,
-  decrypt,
-  encryptBlock,
-  decryptBlock,
-  ctrCounter,
-  ctr32,
-  dbl,
-  xorBlock,
-  xorend,
-  s2v
 });
 
 // node_modules/@noble/ciphers/chacha.js
@@ -3982,10 +3732,10 @@ function getWindowSize(P) {
   return pointWindowSizes.get(P) || 1;
 }
 function oddMultiples(p, size) {
-  const dbl2 = p.double();
+  const dbl = p.double();
   const t = [p];
   for (let j = 1; j < size; j++)
-    t.push(t[j - 1].add(dbl2));
+    t.push(t[j - 1].add(dbl));
   return t;
 }
 function wnafDigits(n, W) {
@@ -16791,77 +16541,10 @@ function createQuicClientSocket(opts) {
   });
   return udpSocket;
 }
-
-// node_modules/@noble/hashes/hkdf.js
-init_buffer();
-var HKDF_COUNTER = /* @__PURE__ */ Uint8Array.of(0);
-var EMPTY_BUFFER = /* @__PURE__ */ Uint8Array.of();
-function expand(hash, prk, info, length2 = 32, _recycled) {
-  ahash(hash);
-  anumber(length2, "length");
-  abytes(prk, void 0, "prk");
-  const olen = hash.outputLen;
-  if (prk.length < olen)
-    throw new Error('"prk" must be at least HashLen octets');
-  if (length2 > 255 * olen)
-    throw new Error("Length must be <= 255*HashLen");
-  const blocks = Math.ceil(length2 / olen);
-  if (info === void 0)
-    info = EMPTY_BUFFER;
-  else
-    abytes(info, void 0, "info");
-  if (!blocks) {
-    if (_recycled)
-      clean(prk);
-    return new Uint8Array();
-  }
-  const okm = _recycled && blocks === 1 ? prk : new Uint8Array(blocks * olen);
-  const { iHash, oHash } = hmac.create(hash, prk);
-  const T = _recycled ? prk : new Uint8Array(olen);
-  const worker = blocks > 1 ? _recycled?.iHash || hash.create() : void 0;
-  for (let counter = 0; counter < blocks - 1; counter++) {
-    HKDF_COUNTER[0] = counter + 1;
-    const iWork = iHash._cloneInto(worker);
-    if (counter)
-      iWork.update(T);
-    iWork.update(info).update(HKDF_COUNTER).digestInto(T);
-    oHash._cloneInto(worker).update(T).digestInto(T);
-    okm.set(T, olen * counter);
-  }
-  HKDF_COUNTER[0] = blocks;
-  if (blocks > 1)
-    iHash.update(T);
-  iHash.update(info).update(HKDF_COUNTER).digestInto(T);
-  oHash.update(T).digestInto(T);
-  okm.set(T, olen * (blocks - 1));
-  iHash.destroy();
-  oHash.destroy();
-  worker?.destroy();
-  if (T !== okm)
-    clean(T);
-  clean(HKDF_COUNTER);
-  if (length2 === okm.length)
-    return okm;
-  const res = okm.slice(0, length2);
-  clean(okm);
-  return res;
-}
-var hkdf = (hash, ikm, salt, info, length2) => {
-  ahash(hash);
-  if (salt === void 0)
-    salt = new Uint8Array(hash.outputLen);
-  const HMAC = hmac.create(hash, salt).update(ikm);
-  return expand(hash, HMAC.digest(), info, length2, HMAC);
-};
 export {
   Emitter,
   QUICConnection,
-  unsafe as aesUnsafe,
-  createQuicClientSocket,
-  gcm,
-  ghash,
-  hkdf,
-  sha256
+  createQuicClientSocket
 };
 /*! Bundled license information:
 

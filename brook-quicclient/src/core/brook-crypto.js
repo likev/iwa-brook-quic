@@ -1,8 +1,7 @@
 /**
- * Brook cryptographic key derivation and nonce progression.
+ * Brook cryptographic key derivation, SHA-256 hashing, and nonce progression.
+ * Implemented using the standard W3C Web Crypto API (globalThis.crypto.subtle).
  */
-
-import { hkdf, sha256 } from '../../vendor/quic-engine.bundle.js';
 
 /**
  * Increment the 12-byte nonce according to Brook's specification:
@@ -37,19 +36,83 @@ export function generateNonce() {
 }
 
 /**
- * Derive 32-byte AES key using HKDF-SHA256.
+ * Compute SHA-256 hash using Web Crypto API.
+ * @param {string|Uint8Array} data
+ * @returns {Promise<Uint8Array>} 32-byte digest
+ */
+export async function sha256(data) {
+  const u8 = typeof data === 'string' ? new TextEncoder().encode(data) : data;
+  const digest = await globalThis.crypto.subtle.digest('SHA-256', u8);
+  return new Uint8Array(digest);
+}
+
+/**
+ * Derive an AES-GCM CryptoKey using HKDF-SHA256 via Web Crypto API.
  *
  * @param {string|Uint8Array} password - Server password
  * @param {Uint8Array} nonce12 - 12-byte nonce (salt)
  * @param {string|Uint8Array} info - HKDF info string (default: "brook")
  * @param {boolean} withoutBrook - Whether to pre-hash password with SHA-256
- * @returns {Uint8Array} 32-byte derived key
+ * @returns {Promise<CryptoKey>} Derived AES-GCM CryptoKey
  */
-export function deriveKey(password, nonce12, info = 'brook', withoutBrook = false) {
+export async function deriveKey(password, nonce12, info = 'brook', withoutBrook = false) {
   let pwdBytes = typeof password === 'string' ? new TextEncoder().encode(password) : password;
   if (withoutBrook) {
-    pwdBytes = sha256(pwdBytes);
+    pwdBytes = await sha256(pwdBytes);
   }
   const infoBytes = typeof info === 'string' ? new TextEncoder().encode(info) : info;
-  return hkdf(sha256, pwdBytes, nonce12, infoBytes, 32);
+  const baseKey = await globalThis.crypto.subtle.importKey(
+    'raw',
+    pwdBytes,
+    'HKDF',
+    false,
+    ['deriveKey', 'deriveBits']
+  );
+  return await globalThis.crypto.subtle.deriveKey(
+    {
+      name: 'HKDF',
+      hash: 'SHA-256',
+      salt: nonce12,
+      info: infoBytes
+    },
+    baseKey,
+    { name: 'AES-GCM', length: 256 },
+    true,
+    ['encrypt', 'decrypt']
+  );
+}
+
+/**
+ * Derive raw 32-byte key bits using HKDF-SHA256 via Web Crypto API.
+ *
+ * @param {string|Uint8Array} password - Server password
+ * @param {Uint8Array} nonce12 - 12-byte nonce (salt)
+ * @param {string|Uint8Array} info - HKDF info string (default: "brook")
+ * @param {boolean} withoutBrook - Whether to pre-hash password with SHA-256
+ * @returns {Promise<Uint8Array>} 32-byte raw key buffer
+ */
+export async function deriveKeyBytes(password, nonce12, info = 'brook', withoutBrook = false) {
+  let pwdBytes = typeof password === 'string' ? new TextEncoder().encode(password) : password;
+  if (withoutBrook) {
+    pwdBytes = await sha256(pwdBytes);
+  }
+  const infoBytes = typeof info === 'string' ? new TextEncoder().encode(info) : info;
+  const baseKey = await globalThis.crypto.subtle.importKey(
+    'raw',
+    pwdBytes,
+    'HKDF',
+    false,
+    ['deriveBits']
+  );
+  const bits = await globalThis.crypto.subtle.deriveBits(
+    {
+      name: 'HKDF',
+      hash: 'SHA-256',
+      salt: nonce12,
+      info: infoBytes
+    },
+    baseKey,
+    256
+  );
+  return new Uint8Array(bits);
 }

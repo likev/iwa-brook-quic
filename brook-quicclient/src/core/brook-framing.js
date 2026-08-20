@@ -1,84 +1,87 @@
 /**
- * Synchronous AES-256-GCM frame sealing and opening for Brook stream chunks.
+ * Hardware-Accelerated AES-256-GCM frame sealing and opening for Brook stream chunks.
+ * Implemented using the standard W3C Web Crypto API (globalThis.crypto.subtle).
  */
 
-import { gcm, aesUnsafe, ghash } from '../../vendor/quic-engine.bundle.js';
 import { nextNonce } from './brook-crypto.js';
 
 /**
- * Pre-expanded AES-256-GCM cipher instance.
- * Avoids recomputing 14-round AES key schedule and H-table on every frame.
+ * High-performance AES-256-GCM cipher instance wrapping a native CryptoKey.
  */
 export class BrookCipher {
-  constructor(keyBytes) {
-    this.keyBytes = keyBytes;
-    if (aesUnsafe && ghash && typeof aesUnsafe.expandKeyLE === 'function') {
-      this.xk = aesUnsafe.expandKeyLE(keyBytes);
-      this.authKey = new Uint8Array(16);
-      const c0 = new Uint8Array(16);
-      aesUnsafe.ctr32(this.xk, false, c0, c0, this.authKey);
-      this.useFast = true;
-    } else {
-      this.useFast = false;
+  constructor(key) {
+    this._cryptoKeyPromise = null;
+    this.cryptoKey = null;
+
+    if (key instanceof CryptoKey) {
+      this.cryptoKey = key;
+    } else if (key instanceof Uint8Array || key instanceof ArrayBuffer) {
+      const raw = key instanceof Uint8Array ? key : new Uint8Array(key);
+      this._cryptoKeyPromise = globalThis.crypto.subtle.importKey(
+        'raw',
+        raw,
+        'AES-GCM',
+        false,
+        ['encrypt', 'decrypt']
+      ).then((k) => {
+        this.cryptoKey = k;
+        return k;
+      });
+    } else if (key && typeof key.then === 'function') {
+      this._cryptoKeyPromise = key.then((k) => {
+        if (k instanceof CryptoKey) {
+          this.cryptoKey = k;
+          return k;
+        }
+        const raw = k instanceof Uint8Array ? k : new Uint8Array(k);
+        return globalThis.crypto.subtle.importKey(
+          'raw',
+          raw,
+          'AES-GCM',
+          false,
+          ['encrypt', 'decrypt']
+        ).then((ck) => {
+          this.cryptoKey = ck;
+          return ck;
+        });
+      });
     }
   }
 
-  encrypt(nonce12, plaintext) {
-    if (!this.useFast) {
-      return gcm(this.keyBytes, nonce12).encrypt(plaintext);
-    }
-    let pt = plaintext;
-    if (pt.byteOffset % 4 !== 0) pt = new Uint8Array(pt);
-
-    const counter = new Uint8Array(16);
-    counter.set(nonce12, 0);
-    counter[15] = 1;
-    const tagMask = aesUnsafe.ctr32(this.xk, false, counter, new Uint8Array(16));
-
-    const out = new Uint8Array(pt.length + 16);
-    aesUnsafe.ctr32(this.xk, false, counter, pt, out.subarray(0, pt.length));
-
-    const gh = ghash.create(this.authKey);
-    gh.update(out.subarray(0, pt.length));
-    const lenBlock = new Uint8Array(16);
-    const view = new DataView(lenBlock.buffer, lenBlock.byteOffset, 16);
-    view.setBigUint64(8, BigInt(pt.length * 8), false);
-    gh.update(lenBlock);
-    const tag = gh.digest();
-    for (let i = 0; i < 16; i++) tag[i] ^= tagMask[i];
-    out.set(tag, pt.length);
-    return out;
+  async getCryptoKey() {
+    if (this.cryptoKey) return this.cryptoKey;
+    if (this._cryptoKeyPromise) return await this._cryptoKeyPromise;
+    throw new Error('BrookCipher: No valid key provided');
   }
 
-  decrypt(nonce12, ciphertextAndTag) {
-    if (!this.useFast) {
-      return gcm(this.keyBytes, nonce12).decrypt(ciphertextAndTag);
-    }
-    const ptLen = ciphertextAndTag.length - 16;
-    let data = ciphertextAndTag.subarray(0, ptLen);
-    const passedTag = ciphertextAndTag.subarray(ptLen);
+  async encrypt(nonce12, plaintext) {
+    const key = await this.getCryptoKey();
+    const u8Plain = plaintext instanceof Uint8Array ? plaintext : new Uint8Array(plaintext);
+    const ct = await globalThis.crypto.subtle.encrypt(
+      {
+        name: 'AES-GCM',
+        iv: nonce12,
+        tagLength: 128
+      },
+      key,
+      u8Plain
+    );
+    return new Uint8Array(ct);
+  }
 
-    if (data.byteOffset % 4 !== 0) data = new Uint8Array(data);
-
-    const counter = new Uint8Array(16);
-    counter.set(nonce12, 0);
-    counter[15] = 1;
-    const tagMask = aesUnsafe.ctr32(this.xk, false, counter, new Uint8Array(16));
-
-    const gh = ghash.create(this.authKey);
-    gh.update(data);
-    const lenBlock = new Uint8Array(16);
-    const view = new DataView(lenBlock.buffer, lenBlock.byteOffset, 16);
-    view.setBigUint64(8, BigInt(data.length * 8), false);
-    gh.update(lenBlock);
-    const tag = gh.digest();
-    for (let i = 0; i < 16; i++) tag[i] ^= tagMask[i];
-
-    for (let i = 0; i < 16; i++) {
-      if (tag[i] !== passedTag[i]) throw new Error('aes-gcm: invalid tag');
-    }
-
-    return aesUnsafe.ctr32(this.xk, false, counter, data);
+  async decrypt(nonce12, ciphertextAndTag) {
+    const key = await this.getCryptoKey();
+    const u8Cipher = ciphertextAndTag instanceof Uint8Array ? ciphertextAndTag : new Uint8Array(ciphertextAndTag);
+    const pt = await globalThis.crypto.subtle.decrypt(
+      {
+        name: 'AES-GCM',
+        iv: nonce12,
+        tagLength: 128
+      },
+      key,
+      u8Cipher
+    );
+    return new Uint8Array(pt);
   }
 }
 
@@ -88,17 +91,17 @@ function resolveCipher(cipherOrKey) {
 }
 
 /**
- * Encrypt and frame a payload chunk for transmission over Brook QUIC stream.
+ * Encrypt and frame a payload chunk for transmission over Brook stream.
  *
  * Wire format:
  * [Encrypted Length (2B)] + [Tag (16B)] + [Encrypted Data (L B)] + [Tag (16B)]
  *
- * @param {Uint8Array|BrookCipher} cipherOrKey - 32-byte AES key or BrookCipher
+ * @param {Uint8Array|CryptoKey|BrookCipher} cipherOrKey - AES key or BrookCipher
  * @param {Uint8Array} nonce12 - 12-byte nonce (advanced in place twice)
  * @param {Uint8Array} payload - Plaintext payload to seal
- * @returns {Uint8Array} Sealed frame buffer
+ * @returns {Promise<Uint8Array>} Sealed frame buffer
  */
-export function sealFrame(cipherOrKey, nonce12, payload) {
+export async function sealFrame(cipherOrKey, nonce12, payload) {
   const cipher = resolveCipher(cipherOrKey);
   const lenBuf = new Uint8Array([
     (payload.length >> 8) & 0xFF,
@@ -106,12 +109,14 @@ export function sealFrame(cipherOrKey, nonce12, payload) {
   ]);
 
   // 1. Encrypt Length (2 bytes) with current nonce
-  const sealedLen = cipher.encrypt(nonce12, lenBuf); // 2 + 16 = 18 bytes
+  const iv1 = new Uint8Array(nonce12);
   nextNonce(nonce12);
+  const sealedLen = await cipher.encrypt(iv1, lenBuf); // 2 + 16 = 18 bytes
 
   // 2. Encrypt Payload (L bytes) with incremented nonce
-  const sealedPayload = cipher.encrypt(nonce12, payload); // L + 16 bytes
+  const iv2 = new Uint8Array(nonce12);
   nextNonce(nonce12);
+  const sealedPayload = await cipher.encrypt(iv2, payload); // L + 16 bytes
 
   // 3. Assemble full frame
   const out = new Uint8Array(18 + sealedPayload.length);
@@ -123,31 +128,32 @@ export function sealFrame(cipherOrKey, nonce12, payload) {
 /**
  * Decrypt the 18-byte length prefix frame.
  *
- * @param {Uint8Array|BrookCipher} cipherOrKey - 32-byte AES key or BrookCipher
+ * @param {Uint8Array|CryptoKey|BrookCipher} cipherOrKey - AES key or BrookCipher
  * @param {Uint8Array} nonce12 - 12-byte nonce (advanced in place once)
  * @param {Uint8Array} chunk18 - 18-byte buffer (2B ciphertext + 16B tag)
- * @returns {number} Decrypted payload length
+ * @returns {Promise<number>} Decrypted payload length
  */
-export function openLength(cipherOrKey, nonce12, chunk18) {
+export async function openLength(cipherOrKey, nonce12, chunk18) {
   const cipher = resolveCipher(cipherOrKey);
-  const lenBuf = cipher.decrypt(nonce12, chunk18);
+  const iv = new Uint8Array(nonce12);
   nextNonce(nonce12);
+  const lenBuf = await cipher.decrypt(iv, chunk18);
   return (lenBuf[0] << 8) | lenBuf[1];
 }
 
 /**
  * Decrypt the payload chunk.
  *
- * @param {Uint8Array|BrookCipher} cipherOrKey - 32-byte AES key or BrookCipher
+ * @param {Uint8Array|CryptoKey|BrookCipher} cipherOrKey - AES key or BrookCipher
  * @param {Uint8Array} nonce12 - 12-byte nonce (advanced in place once)
  * @param {Uint8Array} payloadAndTag - (L + 16) byte buffer
- * @returns {Uint8Array} Plaintext decrypted payload
+ * @returns {Promise<Uint8Array>} Plaintext decrypted payload
  */
-export function openPayload(cipherOrKey, nonce12, payloadAndTag) {
+export async function openPayload(cipherOrKey, nonce12, payloadAndTag) {
   const cipher = resolveCipher(cipherOrKey);
-  const plain = cipher.decrypt(nonce12, payloadAndTag);
+  const iv = new Uint8Array(nonce12);
   nextNonce(nonce12);
-  return plain;
+  return await cipher.decrypt(iv, payloadAndTag);
 }
 
 /**
