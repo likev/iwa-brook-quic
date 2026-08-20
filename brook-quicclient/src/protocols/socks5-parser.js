@@ -6,6 +6,10 @@
 import { readUInt16BE, formatIpv6 } from '../core/byte-utils.js';
 
 export class Socks5Parser {
+  static async handshake(initialChunk, reader, writer, timeoutMs = 8000) {
+    return this.handleHandshake(initialChunk, reader, writer, timeoutMs);
+  }
+
   /**
    * Parse SOCKS5 initial method negotiation and CONNECT request.
    *

@@ -163,13 +163,13 @@ async function handleClientConnection(socket, listenerType, onDone) {
     let sendFailure = null;
 
     if (detectedProto === 'socks5' || detectedProto === ProtocolType.SOCKS5) {
-      const s5Result = await Socks5Parser.handshake(reader, writer, initialChunk);
+      const s5Result = await Socks5Parser.handleHandshake(initialChunk, reader, writer, 8000);
       targetStr = s5Result.targetStr;
       dstBytes = s5Result.dstBytes;
       sendSuccess = s5Result.sendSuccess;
       sendFailure = s5Result.sendFailure;
     } else {
-      const httpResult = await HttpProxyParser.handshake(reader, writer, initialChunk);
+      const httpResult = await HttpProxyParser.handleHandshake(initialChunk, reader, writer, 8000);
       targetStr = httpResult.targetStr;
       dstBytes = httpResult.dstBytes;
       leftover = httpResult.leftover || new Uint8Array(0);

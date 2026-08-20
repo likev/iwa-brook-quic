@@ -19,6 +19,10 @@ function findHeaderEnd(buf) {
 }
 
 export class HttpProxyParser {
+  static async handshake(initialChunk, reader, writer, timeoutMs = 8000) {
+    return this.handleHandshake(initialChunk, reader, writer, timeoutMs);
+  }
+
   /**
    * Parse HTTP Proxy request (CONNECT or plain HTTP).
    *
