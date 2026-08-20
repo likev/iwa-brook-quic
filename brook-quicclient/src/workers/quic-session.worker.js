@@ -194,6 +194,9 @@ async function runQuicTunnel({
         }
         cleanup('QUIC closed');
       });
+
+      // Initiate client QUIC handshake & initial packets
+      quic.connect();
     });
 
     // 3. Build virtual stream manager interface for BrookTunnel
