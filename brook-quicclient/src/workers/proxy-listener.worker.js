@@ -197,6 +197,9 @@ async function handleClientConnection(socket, listenerType, onDone) {
     postStats();
 
     // Setup port message handler (QUIC Worker -> Client TCP Writer)
+    if (port1 && port1.start) {
+      try { port1.start(); } catch (e) {}
+    }
     let hasSentSuccess = false;
     port1.onmessage = async (e) => {
       const msg = e.data;
@@ -208,6 +211,7 @@ async function handleClientConnection(socket, listenerType, onDone) {
           try { await sendSuccess(); } catch (err) {}
         }
       } else if (msg.type === 'STREAM_FAILED') {
+        log('warning', `${logTag} Upstream QUIC dial failed for ${targetStr} (code: ${msg.errorCode || 0x05})`);
         if (!hasSentSuccess && sendFailure) {
           hasSentSuccess = true;
           try { await sendFailure(msg.errorCode || 0x05); } catch (err) {}

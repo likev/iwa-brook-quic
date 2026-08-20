@@ -8,6 +8,10 @@ export function createPortStreamBridge(port) {
   let pendingReadResolve = null;
   let isClosed = false;
 
+  if (port && port.start) {
+    try { port.start(); } catch (e) {}
+  }
+
   port.onmessage = (event) => {
     const msg = event.data;
     if (!msg) return;

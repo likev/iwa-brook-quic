@@ -80,6 +80,7 @@ async function runQuicTunnel({
   leftover,
   dialTimeoutMs = 8000,
   serverHost,
+  serverIp,
   serverPort,
   alpn = ['h3'],
   password,
@@ -93,12 +94,19 @@ async function runQuicTunnel({
   isConnected = false;
   nextStreamId = 0;
 
+  if (port && port.start) {
+    try { port.start(); } catch (e) {}
+  }
+
   const bridge = createPortStreamBridge(port);
+  const targetUdpIp = serverIp || serverHost;
 
   try {
+    log('info', `Initializing dedicated QUIC session to ${targetUdpIp}:${serverPort} for ${targetStr}`);
+
     // 1. Open dedicated Direct Sockets UDPSocket for this connection
     udpAdapter = new UdpSocketAdapter({
-      remoteAddress: serverHost,
+      remoteAddress: targetUdpIp,
       remotePort: serverPort,
       onDatagram: (data, fromAddr, fromPort) => {
         if (quic && !isClosed) {
@@ -235,6 +243,7 @@ async function runQuicTunnel({
       outcome
     });
   } catch (err) {
+    log('error', `❌ Tunnel failed for ${targetStr}: ${err.message}`);
     try { bridge.sendFailure(0x05); } catch (e) {}
     self.postMessage({
       type: 'DONE',
@@ -263,6 +272,7 @@ self.onmessage = async (event) => {
         leftover: msg.leftover,
         dialTimeoutMs: msg.dialTimeoutMs,
         serverHost: msg.serverHost,
+        serverIp: msg.serverIp,
         serverPort: msg.serverPort,
         alpn: msg.alpn,
         password: msg.password,

@@ -17,6 +17,7 @@ export class QuicWorkerManager {
   }) {
     this.serverHost = serverHost;
     this.serverPort = serverPort;
+    this.serverIp = serverHost;
     this.alpn = alpn;
     this.password = password;
     this.withoutBrook = withoutBrook;
@@ -27,6 +28,48 @@ export class QuicWorkerManager {
     this.activeWorkers = new Map(); // sessionId -> { worker, createdAt, targetStr, stats }
     this.totalConnectionsServed = 0;
     this.isClosed = false;
+
+    // Resolve server IP in background if serverHost is a hostname
+    this._initServerIp();
+  }
+
+  async _initServerIp() {
+    try {
+      this.serverIp = await QuicWorkerManager.resolveServerIp(this.serverHost);
+    } catch (e) {
+      this.serverIp = this.serverHost;
+    }
+  }
+
+  static async resolveServerIp(host) {
+    if (!host) return '127.0.0.1';
+    const clean = host.trim().toLowerCase();
+    if (/^(\d{1,3}\.){3}\d{1,3}$/.test(clean) || clean.includes(':')) {
+      return clean;
+    }
+    if (clean === 'localhost') return '127.0.0.1';
+
+    try {
+      const res = await fetch(`https://1.1.1.1/dns-query?name=${encodeURIComponent(clean)}&type=A`, {
+        headers: { accept: 'application/dns-json' }
+      });
+      const json = await res.json();
+      if (json && json.Answer && json.Answer.length > 0) {
+        const a = json.Answer.find(ans => ans.type === 1);
+        if (a && a.data) return a.data;
+      }
+    } catch (e) {}
+
+    try {
+      const res = await fetch(`https://dns.google/resolve?name=${encodeURIComponent(clean)}&type=A`);
+      const json = await res.json();
+      if (json && json.Answer && json.Answer.length > 0) {
+        const a = json.Answer.find(ans => ans.type === 1);
+        if (a && a.data) return a.data;
+      }
+    } catch (e) {}
+
+    return clean;
   }
 
   _log(level, message, meta = null) {
@@ -84,15 +127,21 @@ export class QuicWorkerManager {
           entry.stats = msg.stats;
           break;
         case 'DONE':
+          if (msg.outcome && !msg.outcome.success && msg.outcome.error) {
+            this._log('error', `[QUIC Worker #${sessionId}] Tunnel ended: ${msg.outcome.error}`);
+          }
           this._terminateWorker(sessionId);
           break;
       }
     };
 
     worker.onerror = (err) => {
-      this._log('error', `[QUIC Worker #${sessionId}] Worker error: ${err.message}`);
+      this._log('error', `[QUIC Worker #${sessionId}] Worker exception: ${err.message || err}`);
       this._terminateWorker(sessionId);
     };
+
+    // Ensure server IP is resolved
+    const serverIp = this.serverIp || (await QuicWorkerManager.resolveServerIp(this.serverHost));
 
     // Launch the per-connection QUIC session in the new Web Worker
     worker.postMessage({
@@ -103,6 +152,7 @@ export class QuicWorkerManager {
       leftover,
       dialTimeoutMs: dialTimeoutMs || 8000,
       serverHost: this.serverHost,
+      serverIp,
       serverPort: this.serverPort,
       alpn: this.alpn,
       password: this.password,
