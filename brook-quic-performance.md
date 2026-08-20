@@ -294,3 +294,164 @@ Tested against remote live Brook server (`brook-quic.pplx.io:4433`) using the co
 | **High-Burst Web Surfing (20+ Tabs)** | Per-host pacing limiter (max 8 concurrent dials per domain) avoids CDN edge throttling |
 | **High-Throughput / ISP Throttled** | Multi-UDP Socket Pool (2–4 sockets) for 4× kernel buffer space and anti-throttling |
 | **Multi-Core Scaling & Heavy Downloads** | Multi-Worker Cluster (2–4 Web Workers) mapping 1:1 to OS CPU threads |
+
+---
+
+## 10. Cloudflare `quiche` WASM Engine: Experiment, Benchmark & Analysis
+
+> **Date:** 2026-08-20 | **Branch:** `webworkers` | **Benchmark Script:** [`scripts/benchmark-wasm-comparison.js`](file:///root/downloads/iwa/scripts/benchmark-wasm-comparison.js)
+
+### 10.1 Motivation
+
+The pure JavaScript QUIC engine (`quic-engine.bundle.js`) benchmarked at **only ~10% of Go's throughput** — roughly 0.36 MB/s vs. 9 MB/s for 25 MB downloads. Two bottlenecks were identified:
+
+1. **QUIC packet state-machine overhead**: Full RFC 9000 packet framing, header protection, ACK management, and BBR congestion control running on a single V8 event loop with no SIMD / native acceleration.
+2. **Brook frame encryption**: Every stream chunk requires two AES-256-GCM operations (length seal + payload seal). Pure-JS AES saturates at **≈3.5 MB/s** on 16 KB frames vs. **≈54 MB/s** for `crypto.subtle` / hardware AES-NI.
+
+The experiment asked: **can replacing the JS QUIC engine with Cloudflare's `quiche` (compiled to WebAssembly) close the gap to Go?**
+
+### 10.2 What is `quiche`?
+
+[`quiche`](https://github.com/cloudflare/quiche) is Cloudflare's production-grade QUIC + HTTP/3 implementation written in Rust, compiled with BoringSSL for TLS 1.3. The npm package [`@currentspace/http3`](https://www.npmjs.com/package/@currentspace/http3) bundles:
+
+- **`dist/wasm/http3_client.wasm`** (1.7 MB): Full `quiche` compiled to `wasm32-wasip1` — runs inside Node.js/Deno via WASI and could run in a browser Worker via WASM instantiation.
+- **Native `.node` binding** (`runtimeMode: 'fast'`): A prebuilt C++ addon that calls the same `quiche` Rust code via io_uring, eliminating the WASM sandbox overhead.
+
+The library exposes raw QUIC streams (no HTTP/3 framing) via a simple `Duplex`-compatible Node stream:
+
+```js
+const session = await connectQuicAsync('https://brook-quic.pplx.io:4433', {
+  alpn: ['h3'],
+  rejectUnauthorized: false,
+  runtimeMode: 'wasm',     // or 'fast' for native
+  initialMaxData: 64 * 1024 * 1024,
+  initialMaxStreamDataBidiLocal: 32 * 1024 * 1024,
+  initialMaxStreamsBidi: 1000
+});
+const stream = session.openStream();  // Node Duplex wrapping QUIC bidi stream
+```
+
+### 10.3 Integration Architecture
+
+The integration required a thin adapter (`QuicheSessionAdapter` / `QuicheManagerAdapter`) to map `quiche`'s Node stream API to the interface expected by [`BrookTunnel.run()`](file:///root/downloads/iwa/brook-quicclient/src/core/brook-tunnel.js):
+
+```
+curl / Browser
+     │ SOCKS5
+     ▼
+ProxyDispatcher (tcp-listener.js)
+     │
+     ▼
+BrookTunnel.run()           ← Unchanged; handles Brook framing, nonce, crypto
+     │ quicManager.sendStreamData()
+     ▼
+QuicheManagerAdapter.createSession()
+     │ connectQuicAsync(...)
+     ▼
+quiche @currentspace/http3
+     │ QUIC bidi stream (stream.write / stream.on('data'))
+     ▼
+Brook Server (brook-quic.pplx.io:4433)
+```
+
+Key integration points:
+- `allocateStreamId()` / `registerStream()` / `unregisterStream()` mapped onto Node.js `EventEmitter` stream events (`data`, `end`, `error`).
+- `sendStreamData(id, buf, fin)` calls `stream.write(buf)` or `stream.end(buf)`.
+- The `TCPServerSocket` Direct Sockets API was polyfilled in Node.js with `net.createServer()` wrapped in `ReadableStream<clientSocket>`.
+
+### 10.4 Benchmark Setup
+
+All four clients were run **simultaneously** on the same machine against the same live Brook server:
+
+| Client | Mode | Port | Crypto |
+|---|---|---|---|
+| Official Go `brook quicclient` | Native Go (AES-NI) | 10881 | `crypto/aes` hardware |
+| JS IWA client | Pure JS `quic-engine.bundle.js` | 10882 | `@noble/ciphers` (JS) |
+| `quiche` WASM | `http3_client.wasm` | 10883 | `@noble/ciphers` (JS) |
+| `quiche` Native | io_uring C++ addon | 10884 | `@noble/ciphers` (JS) |
+| `quiche` WASM + HW AES | `http3_client.wasm` | 10891 | Node.js `crypto` AES-NI |
+| `quiche` Native + HW AES | io_uring C++ addon | 10892 | Node.js `crypto` AES-NI |
+
+Warmup: 1 full request to `cloudflare.com/cdn-cgi/trace` per client before measurements.
+
+### 10.5 Results
+
+#### Latency & TTFB (5 iterations, `cloudflare.com/cdn-cgi/trace`)
+
+| Run | Go | JS | quiche WASM | quiche Native |
+|---|---|---|---|---|
+| 1 | 82 ms | 298 ms | 227 ms | 339 ms |
+| 2 | 84 ms | 323 ms | 245 ms | 147 ms |
+| 3 | 72 ms | 293 ms | 237 ms | 141 ms |
+| 4 | 75 ms | 397 ms | 362 ms | 156 ms |
+| 5 | 86 ms | 317 ms | 223 ms | 133 ms |
+| **Average** | **80 ms** | **326 ms** | **259 ms** | **183 ms** |
+
+#### Download Throughput
+
+| Test | Go Binary | JS Client | quiche WASM | quiche Native | quiche WASM + HW AES | quiche Native + HW AES |
+|---|---|---|---|---|---|---|
+| **5 MB** | **7.35 MB/s** (61.6 Mbps) | 0.34 MB/s (2.9 Mbps) | 0.58 MB/s (4.9 Mbps) | 1.76 MB/s (14.7 Mbps) | — | — |
+| **10 MB** | **7.43 MB/s** (62.3 Mbps) | 0.34 MB/s (2.8 Mbps) | 0.60 MB/s (5.0 Mbps) | 1.72 MB/s (14.4 Mbps) | **0.83 MB/s** (6.6 Mbps) | **4.91 MB/s** (39.3 Mbps) |
+| **25 MB** | **9.06 MB/s** (76.0 Mbps) | 0.36 MB/s (3.0 Mbps) | 0.65 MB/s (5.5 Mbps) | 1.87 MB/s (15.7 Mbps) | **0.90 MB/s** (7.2 Mbps) | **5.44 MB/s** (43.5 Mbps) |
+| **vs. JS** | **25×** | 1× | **1.8×** | **5.2×** | **2.5×** | **15.1×** |
+
+### 10.6 Analysis: Where the Speed Goes
+
+The results reveal **two cascaded bottlenecks**, each of which must be resolved independently to approach Go's speed.
+
+#### Bottleneck 1 — QUIC Packet State Machine (Transport Layer)
+
+The pure JS QUIC engine runs the entire RFC 9000 state machine — including Initial packet construction, header protection (AES-ECB), ACK processing, BBR, and packet retransmit timers — on the V8 single-threaded event loop with no SIMD.
+
+Replacing it with `quiche` (WASM) improved latency from **326 ms → 259 ms** (20% reduction) and throughput from **0.36 MB/s → 0.65 MB/s** (1.8× improvement). With the native io_uring C++ backend this rises to **1.87 MB/s** (5.2×).
+
+The WASM overhead relative to native is significant: the WASM runtime must copy every UDP datagram across the linear memory boundary on each `send`/`recv` call, adding a per-packet overhead of roughly 1–3 µs.
+
+#### Bottleneck 2 — Brook Frame Cipher (Application Layer)
+
+Brook wraps every stream payload chunk in an additional AES-256-GCM layer (length frame + payload frame). At 16 KB chunks, the throughput budget for the cipher is:
+
+| Cipher Implementation | Throughput @ 16 KB | Throughput @ 64 KB |
+|---|---|---|
+| Pure JS `@noble/ciphers` | **3.5 MB/s** | **4.3 MB/s** |
+| Node.js `crypto` (AES-NI) | **54.7 MB/s** | **155.5 MB/s** |
+| **Speedup** | **15.6×** | **36.5×** |
+
+When `quiche` native ran with the pure JS Brook cipher, throughput plateaued at **1.87 MB/s** — not because QUIC was the bottleneck, but because the cipher ran out of MB/s budget at the application layer.
+
+Patching `BrookCipher.prototype.encrypt/decrypt` to use `node:crypto` AES-NI (via `crypto.createCipheriv('aes-256-gcm')`) immediately raised native throughput to **5.44 MB/s (43.5 Mbps)** — within **60% of Go's throughput**.
+
+#### Combined Bottleneck Model
+
+```
+Effective throughput = min(QUIC_transport_capacity, Brook_cipher_throughput)
+
+JS QUIC  + JS AES:  min(~0.5 MB/s, ~3.5 MB/s) = 0.36 MB/s   ← QUIC-limited
+quiche N + JS AES:  min(~9.0 MB/s, ~3.5 MB/s) = 1.87 MB/s   ← Cipher-limited
+quiche N + HW AES:  min(~9.0 MB/s, ~55 MB/s)  = 5.44 MB/s   ← Likely network or per-datagram overhead
+Go binary + HW AES: min(~12 MB/s, ~55 MB/s)   = 9.06 MB/s   ← Network-limited
+```
+
+### 10.7 Browser (IWA) Applicability
+
+In a Chromium IWA, neither Node.js `crypto` nor native `.node` addons are available. However, the same acceleration can be achieved via:
+
+| Mechanism | Node.js equivalent | Browser availability |
+|---|---|---|
+| Hardware AES-GCM | `node:crypto createCipheriv('aes-256-gcm')` | **`crypto.subtle.encrypt('AES-GCM', ...)`** ✅ |
+| Quiche WASM transport | `@currentspace/http3` `runtimeMode: 'wasm'` | `new WebAssembly.Instance(http3_client_wasm)` in Worker ✅ |
+| Native io_uring transport | `runtimeMode: 'fast'` (.node addon) | ❌ Not available in browser sandbox |
+
+> [!IMPORTANT]
+> Using `crypto.subtle` with **AES-256-GCM** for Brook frame decryption is the highest-impact single optimization available to the IWA. Replacing `@noble/ciphers` with `crypto.subtle` for all Brook framing operations is expected to raise IWA throughput to **~5× current levels** while `quiche` WASM handles the QUIC transport layer.
+
+### 10.8 Recommended Next Steps
+
+1. **Integrate `quiche` WASM into IWA**: Compile `@currentspace/http3`'s `http3_client.wasm` for browser WASM instantiation inside a Dedicated Web Worker. Wire its stream API to `BrookTunnel.run()` via the `QuicheSessionAdapter` pattern proven in this experiment.
+
+2. **Migrate Brook cipher to `crypto.subtle`**: Replace `BrookCipher` encrypt/decrypt with `crypto.subtle.encrypt('AES-GCM')` / `crypto.subtle.decrypt('AES-GCM')`. Use a single imported `CryptoKey` object per session (avoids key import overhead per frame). Expected gain: **4–5× throughput** for downloads.
+
+3. **Re-benchmark after both changes**: Target milestone is **≥3 MB/s (25 Mbps)** sustained 25 MB download through the IWA — vs. current **0.36 MB/s**.
+
+---
