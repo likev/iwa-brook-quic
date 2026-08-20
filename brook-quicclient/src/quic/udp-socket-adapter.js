@@ -5,12 +5,13 @@
  */
 
 export class UdpSocketAdapter {
-  constructor({ remoteAddress, remotePort, onDatagram, onError, onClose }) {
+  constructor({ remoteAddress, remotePort, onDatagram, onError, onClose, onLog }) {
     this.remoteAddress = remoteAddress;
     this.remotePort = remotePort;
     this.onDatagram = onDatagram;
     this.onError = onError;
     this.onClose = onClose;
+    this.onLog = onLog;
 
     this.socket = null;
     this.writer = null;
@@ -105,7 +106,7 @@ export class UdpSocketAdapter {
     }
   }
 
-  _waitForDrain(targetWatermark = 512, timeoutMs = 5000) {
+  _waitForDrain(targetWatermark = 1024, timeoutMs = 5000) {
     if (this.isClosed || this.sendQueue.length <= targetWatermark) {
       return Promise.resolve();
     }
@@ -134,8 +135,9 @@ export class UdpSocketAdapter {
   }
 
   _notifyDrain() {
+    const qLen = this.sendQueue.length;
     for (const [watermark, list] of this.drainWaiters.entries()) {
-      if (this.isClosed || this.sendQueue.length <= watermark) {
+      if (this.isClosed || qLen <= watermark) {
         this.drainWaiters.delete(watermark);
         for (const resolve of list) {
           resolve();
@@ -144,52 +146,58 @@ export class UdpSocketAdapter {
     }
   }
 
-  async send(packetData) {
+  async send(packetData, meta = {}) {
     if (this.isClosed || !this.writer) {
       throw new Error('UDPSocket is not open');
     }
     const u8 = packetData instanceof Uint8Array ? packetData : new Uint8Array(packetData);
-    const isControlPacket = u8.length > 0 && (u8[0] & 0x80) !== 0; // Long header: Initial / Handshake / Retry
+    const isLongHeader = u8.length > 0 && (u8[0] & 0x80) !== 0; // Long header: Initial / Handshake / Retry
+    const isControl = Boolean(meta.isControl || isLongHeader);
 
-    const MAX_QUEUE_SIZE = 1024;
-    const HIGH_WATERMARK = 512;
+    const MAX_QUEUE_SIZE = 2048;
+    const HIGH_WATERMARK = 1024;
 
     if (this.sendQueue.length >= MAX_QUEUE_SIZE) {
-      this.packetEvictions++;
-      if (isControlPacket) {
-        // Evict oldest short-header non-control packet (1-RTT data) to prioritize handshake/control
-        const nonControlIndex = this.sendQueue.findIndex(pkt => {
-          const raw = pkt.data || pkt;
-          return raw.length > 0 && (raw[0] & 0x80) === 0;
-        });
-        if (nonControlIndex >= 0) {
-          this.sendQueue.splice(nonControlIndex, 1);
-        } else {
-          // If queue is 100% control packets, drop oldest control packet to strictly enforce hard cap
-          this.sendQueue.shift();
+      let nonControlIndex = -1;
+      for (let i = 0; i < this.sendQueue.length; i++) {
+        if (!this.sendQueue[i].isControl) {
+          nonControlIndex = i;
+          break;
+        }
+      }
+
+      if (nonControlIndex >= 0) {
+        // Evict oldest non-control 1-RTT data packet; NEVER evict control frames
+        this.packetEvictions++;
+        const dropped = this.sendQueue.splice(nonControlIndex, 1)[0];
+        const droppedLen = dropped?.data?.length || 0;
+        if (this.onLog) {
+          this.onLog('warning', `⚠️ [UDP Transport] Local packet drop: send queue saturated (${MAX_QUEUE_SIZE} pkts). Evicted 1-RTT data packet (${droppedLen}B)${isControl ? ' to prioritize control frame' : ''}. Total drops: ${this.packetEvictions}`);
         }
       } else {
-        // For non-control data packets, evict oldest short-header packet; never evict long-header control packets
-        const nonControlIndex = this.sendQueue.findIndex(pkt => {
-          const raw = pkt.data || pkt;
-          return raw.length > 0 && (raw[0] & 0x80) === 0;
-        });
-        if (nonControlIndex >= 0) {
-          this.sendQueue.splice(nonControlIndex, 1);
-        } else {
-          throw new Error('UDP socket send queue saturated with control frames');
+        // If queue is 100% control packets, apply backpressure rather than dropping control
+        if (this.onLog) {
+          this.onLog('warning', `⚠️ [UDP Transport] High queue pressure: queue has ${this.sendQueue.length} control frames.`);
         }
+        await this._waitForDrain(HIGH_WATERMARK);
       }
     }
 
-    this.sendQueue.push({ data: u8, enqueuedAt: Date.now() });
-    if (this.sendQueue.length > this.maxQueueLength) {
-      this.maxQueueLength = this.sendQueue.length;
+    this.sendQueue.push({
+      data: u8,
+      isControl,
+      space: meta.space || (isLongHeader ? 'long_header' : '1rtt'),
+      enqueuedAt: Date.now()
+    });
+
+    const currentLen = this.sendQueue.length;
+    if (currentLen > this.maxQueueLength) {
+      this.maxQueueLength = currentLen;
     }
     this._drainSendQueue();
 
     // Apply asynchronous backpressure when queue exceeds high watermark
-    if (this.sendQueue.length > HIGH_WATERMARK) {
+    if (currentLen > HIGH_WATERMARK) {
       await this._waitForDrain(HIGH_WATERMARK);
     }
   }
@@ -197,18 +205,49 @@ export class UdpSocketAdapter {
   async _drainSendQueue() {
     if (this.isDraining || this.isClosed || !this.writer) return;
     this.isDraining = true;
+    const inFlight = new Set();
+    const MAX_IN_FLIGHT = 4;
+
     try {
       while (this.sendQueue.length > 0 && !this.isClosed && this.writer) {
-        const item = this.sendQueue.shift();
-        const chunk = item.data || item;
-        this.bytesSent += chunk.length;
-        this.packetsSent++;
-        const t0 = (typeof performance !== 'undefined') ? performance.now() : Date.now();
-        await this.writer.write({ data: chunk });
-        const dur = ((typeof performance !== 'undefined') ? performance.now() : Date.now()) - t0;
-        this.writeDurations.push(dur);
-        if (this.writeDurations.length > 100) this.writeDurations.shift();
-        this._notifyDrain();
+        while (inFlight.size < MAX_IN_FLIGHT && this.sendQueue.length > 0 && !this.isClosed && this.writer) {
+          // Prioritize control packets: if any control frame is in queue, take the first one
+          let itemIndex = 0;
+          if (!this.sendQueue[0].isControl) {
+            for (let i = 1; i < this.sendQueue.length; i++) {
+              if (this.sendQueue[i].isControl) {
+                itemIndex = i;
+                break;
+              }
+            }
+          }
+          const item = (itemIndex === 0) ? this.sendQueue.shift() : this.sendQueue.splice(itemIndex, 1)[0];
+          const chunk = item.data || item;
+          this.bytesSent += chunk.length;
+          this.packetsSent++;
+          const t0 = (typeof performance !== 'undefined') ? performance.now() : Date.now();
+
+          const writePromise = this.writer.write({ data: chunk }).then(() => {
+            const dur = ((typeof performance !== 'undefined') ? performance.now() : Date.now()) - t0;
+            this.writeDurations.push(dur);
+            if (this.writeDurations.length > 100) this.writeDurations.shift();
+          }).catch((err) => {
+            if (!this.isClosed && this.onError) this.onError(err);
+          }).finally(() => {
+            inFlight.delete(writePromise);
+            this._notifyDrain();
+          });
+
+          inFlight.add(writePromise);
+        }
+
+        if (inFlight.size >= MAX_IN_FLIGHT) {
+          await Promise.race(inFlight);
+        }
+      }
+
+      if (inFlight.size > 0) {
+        await Promise.allSettled(Array.from(inFlight));
       }
     } catch (e) {
       if (!this.isClosed && this.onError) {

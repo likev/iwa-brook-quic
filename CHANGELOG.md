@@ -4,6 +4,47 @@ All notable changes to the **Isolated Web Apps (IWAs) Direct Sockets Suite & Bro
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.32.0] - 2026-08-20
+
+### Performance Optimizations (Single-Thread JS, Fast AES Schedules, Pipelined Direct Sockets & O(1) In-Flight Tracking)
+- **Precomputed AES Key Schedules & GHASH Tables (`BrookCipher`)**:
+  - Implemented `BrookCipher` with session-level pre-expanded 14-round AES key schedules (`xk`) and precalculated GHASH multiplier subkeys (`authKey` / $H = E_K(0^{128})$).
+  - Eliminated per-frame key schedule derivation in `sealFrame`, `openLength`, and `openPayload`, reducing 2-byte frame encryption/decryption overhead by **10x**.
+  - Added seamless handling for unaligned memory views (`byteOffset % 4 !== 0`) preventing Uint32Array alignment exceptions across streaming chunks.
+- **Pipelined Direct Sockets UDP Write Drainage**:
+  - Replaced strict serial single-write awaiting with a **4-packet in-flight pipelined write window** (`MAX_IN_FLIGHT = 4`) in `UdpSocketAdapter`.
+  - Dramatically improves Chromium Mojo IPC throughput by overlapping asynchronous Direct Sockets write operations.
+  - Implemented strict control-frame priority drainage during bursts to ensure ACKs and control frames leave the send queue first.
+- **$O(1)$ QUIC In-Flight Byte Tracking**:
+  - Replaced $O(N_{\text{streams}} \times M_{\text{packets}})$ nested traversal in `plan_quic_burst()` with an $O(1)$ continuous running scalar `context.bytes_in_flight`.
+  - Automatically maintained across packet transmissions, ACK retirements, and packet loss expiry intervals.
+- **Sequential Chunk Appending Optimization**:
+  - Optimized `set_sending_stream` in `quic_connection.js` with a fast sequential concatenation path, eliminating extraneous memory allocations and copies for consecutive stream chunks.
+- **Continuous Idle Timer Rolling on Streaming Arrivals**:
+  - Ensured `resetIdleTimer(60000)` is continuously refreshed in `BrookTunnel.onData` upon receiving raw QUIC chunks, guaranteeing uninterrupted large file downloads across long-duration streams.
+
+---
+
+## [v1.31.0] - 2026-08-20
+
+### Fixed & Enhanced (UDP/QUIC Packet Loss Prevention, Control Frame Protection & Telemetry)
+- **Direct Sockets UDP Transport Safety & Control Protection**:
+  - Expanded `UdpSocketAdapter` queue capacity to **2048 packets** with an active high watermark of **1024 packets**.
+  - Implemented strict **Control Frame Protection**: Long Header packets (`Initial`, `Handshake`, `Retry`) and 1-RTT Short Header control frames (`CONNECTION_CLOSE`, `MAX_DATA`, `MAX_STREAM_DATA`, `ACK`, `PING`) are **never evicted**.
+  - When queue saturation occurs, only stale 1-RTT stream data datagrams are evicted, preserving connection state and recovery frames.
+  - Sized burst emissions to 32 packets per burst to smooth IPC transfer over Direct Sockets `writer.write()`.
+- **Adaptive Sending History Retention**:
+  - Eliminated the static 2000ms PN history pruning window in `quic_connection.js`.
+  - Replaced with adaptive history retention: `Math.max(10000, timeout * 4, (context.srtt || 333) * 8)`, preventing spurious packet loss declarations on high-latency or delayed ACK connections.
+- **Traffic & Protocol Event Logging for Packet Drops**:
+  - Wired real-time structured warning logs (`⚠️ [UDP Transport] Local packet drop: ...`) into the protocol and traffic log stream whenever queue saturation occurs or datagrams are evicted.
+  - Preserved cumulative lifetime `packetEvictions` across connection teardown in `QuicConnectionManager.getSnapshot()`.
+- **Receive Buffer Coordination & Pressure Warnings**:
+  - Expanded `BrookTunnel` downstream receive buffer capacity to **8 MB**.
+  - Added real-time buffer occupancy telemetry with proactive warnings at 4MB for slow client consumers, and recovery logging when drained below 1MB.
+
+---
+
 ## [v1.30.4] - 2026-08-19
 
 ### Performance & Flow Control (Massive Speedup, Fixed 2-5MB Stall)

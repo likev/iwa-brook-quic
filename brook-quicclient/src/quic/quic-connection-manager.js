@@ -121,7 +121,8 @@ export class QuicSession {
         if (!this.isClosed) {
           this.close();
         }
-      }
+      },
+      onLog: this.onLog
     });
 
     await this.udpAdapter.open();
@@ -146,10 +147,10 @@ export class QuicSession {
         rejectUnauthorized: false
       });
 
-      this.quic.on('packet', (data) => {
+      this.quic.on('packet', (data, meta) => {
         this.lastActivity = Date.now();
         if (!this.isClosed && this.udpAdapter) {
-          this.udpAdapter.send(data).catch(() => {});
+          this.udpAdapter.send(data, meta).catch(() => {});
         }
       });
 
@@ -271,6 +272,7 @@ export class QuicConnectionManager {
     this.activeHandshakes = 0;
     this.maxConcurrentHandshakes = 256;
     this.handshakeQueue = [];
+    this.cumulativePacketEvictions = 0;
     this.isClosed = false;
   }
 
@@ -279,7 +281,7 @@ export class QuicConnectionManager {
     let maxUdpQueue = 0;
     let maxUdpOldestMs = 0;
     let writeDurations = [];
-    let totalPacketEvictions = 0;
+    let totalPacketEvictions = this.cumulativePacketEvictions;
 
     // Aggregate stats across all live active sessions
     for (const session of this.activeSessions) {
@@ -340,6 +342,9 @@ export class QuicConnectionManager {
   }
 
   unregisterSession(session) {
+    if (session && session.udpAdapter) {
+      this.cumulativePacketEvictions += session.udpAdapter.packetEvictions || 0;
+    }
     this.activeSessions.delete(session);
   }
 

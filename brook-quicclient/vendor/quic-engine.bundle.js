@@ -2113,6 +2113,24 @@ var ghash = /* @__PURE__ */ wrapMacConstructor(16, (key, expectedLength) => new 
 var BLOCK_SIZE2 = 16;
 var BLOCK_SIZE32 = 4;
 var EMPTY_BLOCK = /* @__PURE__ */ new Uint8Array(BLOCK_SIZE2);
+var ONE_BLOCK = /* @__PURE__ */ Uint8Array.from([
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  1
+]);
 var POLY2 = 283;
 function validateKeyLength(key) {
   if (![16, 24, 32].includes(key.length))
@@ -2257,6 +2275,40 @@ function decrypt(xk, s0, s1, s2, s3) {
   const t2 = xk[k++] ^ applySbox(sbox2, s2, s1, s0, s3);
   const t3 = xk[k++] ^ applySbox(sbox2, s3, s2, s1, s0);
   return { s0: t0, s1: t1, s2: t2, s3: t3 };
+}
+function ctrCounter(xk, nonce, src, dst) {
+  abytes2(nonce, BLOCK_SIZE2, "nonce");
+  abytes2(src);
+  const srcLen = src.length;
+  dst = getOutput(srcLen, dst);
+  complexOverlapBytes(src, dst);
+  const ctr = nonce;
+  const c32 = u32(ctr);
+  const src32 = u32(src);
+  const dst32 = u32(dst);
+  for (let i = 0; i + 4 <= src32.length; i += 4) {
+    const { s0, s1, s2, s3 } = encrypt(xk, swap8IfBE(c32[0]), swap8IfBE(c32[1]), swap8IfBE(c32[2]), swap8IfBE(c32[3]));
+    dst32[i + 0] = src32[i + 0] ^ swap8IfBE(s0);
+    dst32[i + 1] = src32[i + 1] ^ swap8IfBE(s1);
+    dst32[i + 2] = src32[i + 2] ^ swap8IfBE(s2);
+    dst32[i + 3] = src32[i + 3] ^ swap8IfBE(s3);
+    for (let j = BLOCK_SIZE2 - 1, carry = 1; j >= 0; j--) {
+      carry = carry + ctr[j] | 0;
+      ctr[j] = carry & 255;
+      carry >>>= 8;
+    }
+  }
+  const start = BLOCK_SIZE2 * Math.floor(src32.length / BLOCK_SIZE32);
+  if (start < srcLen) {
+    const { s0, s1, s2, s3 } = encrypt(xk, swap8IfBE(c32[0]), swap8IfBE(c32[1]), swap8IfBE(c32[2]), swap8IfBE(c32[3]));
+    const b32 = new Uint32Array([s0, s1, s2, s3]);
+    swap32IfBE(b32);
+    const buf = u8(b32);
+    for (let i = start, pos = 0; i < srcLen; i++, pos++)
+      dst[i] = src[i] ^ buf[pos];
+    clean2(b32);
+  }
+  return dst;
 }
 function ctr32(xk, isLE2, nonce, src, dst) {
   abytes2(nonce, BLOCK_SIZE2, "nonce");
@@ -2475,6 +2527,204 @@ var gcm = /* @__PURE__ */ wrapCipher({ blockSize: 16, nonceLength: 12, tagLength
       return out;
     }
   };
+});
+function isBytes32(a) {
+  return a instanceof Uint32Array || ArrayBuffer.isView(a) && a.constructor.name === "Uint32Array";
+}
+function encryptBlock(xk, block) {
+  abytes2(block, 16, "block");
+  if (!isBytes32(xk))
+    throw new Error("_encryptBlock accepts result of expandKeyLE");
+  const b32 = u32(block);
+  swap32IfBE(b32);
+  let { s0, s1, s2, s3 } = encrypt(xk, b32[0], b32[1], b32[2], b32[3]);
+  b32[0] = s0, b32[1] = s1, b32[2] = s2, b32[3] = s3;
+  swap32IfBE(b32);
+  return block;
+}
+function decryptBlock(xk, block) {
+  abytes2(block, 16, "block");
+  if (!isBytes32(xk))
+    throw new Error("_decryptBlock accepts result of expandKeyLE");
+  const b32 = u32(block);
+  swap32IfBE(b32);
+  let { s0, s1, s2, s3 } = decrypt(xk, b32[0], b32[1], b32[2], b32[3]);
+  b32[0] = s0, b32[1] = s1, b32[2] = s2, b32[3] = s3;
+  swap32IfBE(b32);
+  return block;
+}
+function dbl(block) {
+  let carry = 0;
+  for (let i = BLOCK_SIZE2 - 1; i >= 0; i--) {
+    const newCarry = (block[i] & 128) >>> 7;
+    block[i] = block[i] << 1 | carry;
+    carry = newCarry;
+  }
+  block[BLOCK_SIZE2 - 1] ^= 135 & -carry;
+  return block;
+}
+function xorBlock(a, b) {
+  if (a.length !== b.length)
+    throw new Error("xorBlock: blocks must have same length");
+  for (let i = 0; i < a.length; i++) {
+    a[i] = a[i] ^ b[i];
+  }
+  return a;
+}
+function xorend(a, b) {
+  if (b.length > a.length) {
+    throw new Error("xorend: expected len(B) <= len(A)");
+  }
+  const offset = a.length - b.length;
+  for (let i = 0; i < b.length; i++) {
+    a[offset + i] = a[offset + i] ^ b[i];
+  }
+  return a;
+}
+var _CMAC = class {
+  blockLen = BLOCK_SIZE2;
+  outputLen = BLOCK_SIZE2;
+  // CMAC can only decide between `K1` and `K2` once the true final block is known,
+  // so updates process older blocks eagerly but keep one pending block buffered.
+  buffer;
+  pos;
+  finished;
+  destroyed;
+  k1;
+  k2;
+  x;
+  x32;
+  xk;
+  constructor(key) {
+    abytes2(key);
+    validateKeyLength(key);
+    this.xk = expandKeyLE(key);
+    this.buffer = new Uint8Array(BLOCK_SIZE2);
+    this.pos = 0;
+    this.finished = false;
+    this.destroyed = false;
+    this.x = new Uint8Array(BLOCK_SIZE2);
+    this.x32 = u32(this.x);
+    const L = new Uint8Array(BLOCK_SIZE2);
+    encryptBlock(this.xk, L);
+    this.k1 = dbl(L);
+    this.k2 = dbl(new Uint8Array(this.k1));
+  }
+  // Consumes 16 bytes of `data` starting at `pos`; `pos` avoids a per-block
+  // subarray view allocation in update().
+  process(data, pos) {
+    const { x, x32, xk } = this;
+    for (let i = 0; i < BLOCK_SIZE2; i++)
+      x[i] ^= data[pos + i];
+    swap32IfBE(x32);
+    const { s0, s1, s2, s3 } = encrypt(xk, x32[0], x32[1], x32[2], x32[3]);
+    x32[0] = s0, x32[1] = s1, x32[2] = s2, x32[3] = s3;
+    swap32IfBE(x32);
+  }
+  update(data) {
+    aexists2(this);
+    abytes2(data);
+    let pos = 0;
+    if (this.pos) {
+      const take = Math.min(BLOCK_SIZE2 - this.pos, data.length);
+      this.buffer.set(data.subarray(0, take), this.pos);
+      this.pos += take;
+      pos = take;
+      if (this.pos === BLOCK_SIZE2 && pos < data.length) {
+        this.process(this.buffer, 0);
+        this.pos = 0;
+      }
+    }
+    while (pos + BLOCK_SIZE2 < data.length) {
+      this.process(data, pos);
+      pos += BLOCK_SIZE2;
+    }
+    if (pos < data.length) {
+      this.buffer.set(data.subarray(pos), 0);
+      this.pos = data.length - pos;
+    }
+    return this;
+  }
+  // See {@link https://www.rfc-editor.org/rfc/rfc4493.html#section-2.4 | RFC 4493 Section 2.4}.
+  digestInto(out) {
+    aexists2(this);
+    aoutput32(out, this);
+    this.finished = true;
+    const view = out.subarray(0, this.outputLen);
+    let last = new Uint8Array(BLOCK_SIZE2);
+    if (this.pos === BLOCK_SIZE2) {
+      last.set(this.buffer);
+      xorBlock(last, this.k1);
+    } else {
+      last.set(this.buffer.subarray(0, this.pos));
+      last[this.pos] = 128;
+      xorBlock(last, this.k2);
+    }
+    view.set(this.x);
+    xorBlock(view, last);
+    encryptBlock(this.xk, view);
+    clean2(last);
+  }
+  digest() {
+    const { buffer, outputLen } = this;
+    this.digestInto(buffer);
+    const res = buffer.slice(0, outputLen);
+    this.destroy();
+    return res;
+  }
+  destroy() {
+    const { buffer, destroyed, x, xk, k1, k2 } = this;
+    if (destroyed)
+      return;
+    this.destroyed = true;
+    clean2(buffer, x, xk, k1, k2);
+  }
+};
+var cmac = /* @__PURE__ */ wrapMacConstructor(16, (key) => new _CMAC(key));
+function s2v(key, strings) {
+  validateKeyLength(key);
+  const len = strings.length;
+  if (len > 127) {
+    throw new Error("s2v: expected <= 127 inputs");
+  }
+  if (len === 0)
+    return cmac(ONE_BLOCK, key);
+  let d = cmac(EMPTY_BLOCK, key);
+  for (let i = 0; i < len - 1; i++) {
+    dbl(d);
+    const cmacResult = cmac(strings[i], key);
+    xorBlock(d, cmacResult);
+    clean2(cmacResult);
+  }
+  const s_n = strings[len - 1];
+  abytes2(s_n);
+  let t;
+  if (s_n.byteLength >= BLOCK_SIZE2) {
+    t = xorend(Uint8Array.from(s_n), d);
+  } else {
+    const paddedSn = new Uint8Array(BLOCK_SIZE2);
+    paddedSn.set(s_n);
+    paddedSn[s_n.length] = 128;
+    t = xorBlock(dbl(d), paddedSn);
+    clean2(paddedSn);
+  }
+  const result = cmac(t, key);
+  clean2(d, t);
+  return result;
+}
+var unsafe = /* @__PURE__ */ Object.freeze({
+  expandKeyLE,
+  expandKeyDecLE,
+  encrypt,
+  decrypt,
+  encryptBlock,
+  decryptBlock,
+  ctrCounter,
+  ctr32,
+  dbl,
+  xorBlock,
+  xorend,
+  s2v
 });
 
 // node_modules/@noble/ciphers/chacha.js
@@ -3732,10 +3982,10 @@ function getWindowSize(P) {
   return pointWindowSizes.get(P) || 1;
 }
 function oddMultiples(p, size) {
-  const dbl = p.double();
+  const dbl2 = p.double();
   const t = [p];
   for (let j = 1; j < size; j++)
-    t.push(t[j - 1].add(dbl));
+    t.push(t[j - 1].add(dbl2));
   return t;
 }
 function wnafDigits(n, W) {
@@ -14304,9 +14554,9 @@ function defaultTransportParams() {
   return {
     max_udp_payload_size: 65527,
     max_idle_timeout: 6e4,
-    initial_max_data: 67108864,
-    initial_max_stream_data_bidi_local: 33554432,
-    initial_max_stream_data_bidi_remote: 33554432,
+    initial_max_data: 33554432,
+    initial_max_stream_data_bidi_local: 16777216,
+    initial_max_stream_data_bidi_remote: 16777216,
     initial_max_stream_data_uni: 16777216,
     initial_max_streams_bidi: 100,
     initial_max_streams_uni: 10,
@@ -14611,6 +14861,8 @@ function QUICConnection(options) {
     sending_app_pn_in_flight: /* @__PURE__ */ new Set(),
     sending_app_pn_history: [],
     // [time_sent, encoded_len, delivered_at_send, delivered_time_at_send]
+    bytes_in_flight: 0,
+    // O(1) running scalar tracking total in-flight bytes
     delivered: 0,
     // cumulative app bytes acked — for BBR rate samples
     delivered_time: Date.now(),
@@ -14640,8 +14892,8 @@ function QUICConnection(options) {
     // Until those algorithms run, init_* = max_* so behavior is the static default.
     // When 4b lands, lower the in-flight init_* toward IW10 (~10 pkts / ~14 KB)
     // and let the algorithm climb from there.
-    max_packets_per_burst: 64,
-    // increased from 20 for high-throughput bursts
+    max_packets_per_burst: 32,
+    // smooth Direct Sockets burst sizing to prevent queue pressure
     // packet payload (MTU). current_ is the size actually used; max_ is the ceiling
     // DPLPMTUD must not probe past; init_/floor is QUIC's guaranteed 1200-byte minimum.
     max_limit_packet_payload: 1452,
@@ -14724,18 +14976,18 @@ function QUICConnection(options) {
     // STREAM_DATA_BLOCKED, answered by re-sending the current advertised —
     // that pairing (see the frame handlers) is what makes a lost window
     // update recoverable.
-    local_max_data: 67108864,
-    // ADVERTISED conn limit (64MB)
-    local_max_data_window: 67108864,
-    // W — fixed; matches initial_max_data we advertise (64MB)
+    local_max_data: 33554432,
+    // ADVERTISED conn limit (32MB)
+    local_max_data_window: 33554432,
+    // W — fixed; matches initial_max_data we advertise (32MB)
     local_max_data_consumed: 0,
     // in-order bytes delivered to the app (all streams)
     fc_recv_usage: 0,
     // Σ per-stream max_recv_offset — the peer's usage
     //
     // Flow control — stream level (RFC 9000 §4.1)
-    local_initial_max_stream_data: 33554432,
-    // matches transport params (32MB)
+    local_initial_max_stream_data: 16777216,
+    // matches transport params (16MB)
     remote_max_streams_bidi: 100,
     remote_max_streams_uni: 10,
     // ── Per-stream send-side flow control (RFC 9000 §4.1) — the peer's limits
@@ -15598,6 +15850,8 @@ function QUICConnection(options) {
         for (var sid in context.send_streams) {
           var st = context.send_streams[sid];
           if (st.in_flight_ranges && apn in st.in_flight_ranges) {
+            var rangeLen = st.in_flight_ranges[apn][1] - st.in_flight_ranges[apn][0];
+            context.bytes_in_flight = Math.max(0, context.bytes_in_flight - rangeLen);
             newlyAckedBytes += creditSpan(st, st.in_flight_ranges[apn][0], st.in_flight_ranges[apn][1]);
             delete st.in_flight_ranges[apn];
             retireStreamIfComplete(sid, st);
@@ -15880,6 +16134,9 @@ function QUICConnection(options) {
               if (!context.send_streams[sid].in_flight_ranges) context.send_streams[sid].in_flight_ranges = {};
               var from = frameList[i].offset;
               var to = from + (frameList[i].data ? frameList[i].data.byteLength : 0);
+              if (to > from) {
+                context.bytes_in_flight += to - from;
+              }
               if (!context.send_streams[sid].in_flight_ranges[pn]) {
                 context.send_streams[sid].in_flight_ranges[pn] = [from, to];
               } else {
@@ -15898,7 +16155,14 @@ function QUICConnection(options) {
           }
         }
       }
-      ev.emit("packet", encrypted);
+      var isControlOnly = true;
+      for (var fi = 0; fi < frameList.length; fi++) {
+        if (frameList[fi].type === "stream" && frameList[fi].data && frameList[fi].data.byteLength > 0) {
+          isControlOnly = false;
+          break;
+        }
+      }
+      ev.emit("packet", encrypted, { space, isControl: isControlOnly || space !== "app" });
     }
   }
   function initialStreamSendLimit(sid) {
@@ -15945,9 +16209,15 @@ function QUICConnection(options) {
         var start = stream.write_offset;
         stream.write_offset += chunk.byteLength;
         if (DEBUG) console.log("[quic] stream " + streamId + " add_chunk len=" + chunk.byteLength + " write_offset=" + stream.write_offset + " fin=" + !!options2.add_chunk.fin);
-        if (stream.pending_data === null) {
+        if (stream.pending_data === null || stream.pending_data.byteLength === 0) {
           stream.pending_data = chunk;
           stream.pending_offset_start = start;
+        } else if (start === stream.pending_offset_start + stream.pending_data.byteLength) {
+          var old = stream.pending_data;
+          var merged = new Uint8Array(old.byteLength + chunk.byteLength);
+          merged.set(old, 0);
+          merged.set(chunk, old.byteLength);
+          stream.pending_data = merged;
         } else {
           var old = stream.pending_data, old_off = stream.pending_offset_start;
           var ns = Math.min(old_off, start);
@@ -16008,6 +16278,8 @@ function QUICConnection(options) {
           var limbo = context.expired_unacked[pnum];
           if (!limbo) limbo = context.expired_unacked[pnum] = { t: now, spans: [] };
           limbo.spans.push([sid, st.in_flight_ranges[pn][0], st.in_flight_ranges[pn][1]]);
+          var rangeLen = st.in_flight_ranges[pn][1] - st.in_flight_ranges[pn][0];
+          context.bytes_in_flight = Math.max(0, context.bytes_in_flight - rangeLen);
           delete st.in_flight_ranges[pn];
           if (context.sending_app_pn_in_flight.delete(pnum)) context.lost_count++;
         }
@@ -16061,8 +16333,9 @@ function QUICConnection(options) {
         packetsSentLastSec++;
       }
     }
-    var twoSecAgo = now - 2e3;
-    while (context.sending_app_pn_history.length > 0 && context.sending_app_pn_history[0][0] < twoSecAgo) {
+    var historyTimeout = Math.max(1e4, context.srtt ? context.srtt * 10 : 5e3);
+    var historyCutoff = now - historyTimeout;
+    while (context.sending_app_pn_history.length > 0 && context.sending_app_pn_history[0][0] < historyCutoff) {
       context.sending_app_pn_history.shift();
     }
     var effBytesPerSec = Math.min(context.current_limit_bytes_per_sec, context.max_limit_bytes_per_sec);
@@ -16076,15 +16349,7 @@ function QUICConnection(options) {
     var inflightCount = context.sending_app_pn_in_flight.size;
     var inflightRoom = effPktsInFlight - inflightCount;
     if (inflightRoom < 0) inflightRoom = 0;
-    var bytesInFlight = 0;
-    for (var sidB in context.send_streams) {
-      var stB = context.send_streams[sidB];
-      if (!stB.in_flight_ranges) continue;
-      for (var pnB in stB.in_flight_ranges) {
-        if (pnB === "_burst") continue;
-        bytesInFlight += stB.in_flight_ranges[pnB][1] - stB.in_flight_ranges[pnB][0];
-      }
-    }
+    var bytesInFlight = context.bytes_in_flight;
     var bytesInFlightRoom = effBytesInFlight - bytesInFlight;
     if (bytesInFlightRoom < 0) bytesInFlightRoom = 0;
     var inflightBytesPackets = Math.floor(bytesInFlightRoom / context.current_limit_packet_payload);
@@ -16591,8 +16856,10 @@ var hkdf = (hash, ikm, salt, info, length2) => {
 export {
   Emitter,
   QUICConnection,
+  unsafe as aesUnsafe,
   createQuicClientSocket,
   gcm,
+  ghash,
   hkdf,
   sha256
 };

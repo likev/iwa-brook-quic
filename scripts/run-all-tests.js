@@ -10,7 +10,7 @@ import { exec } from 'node:child_process';
 import { promisify } from 'node:util';
 
 import { deriveKey, generateNonce, nextNonce } from '../brook-quicclient/src/core/brook-crypto.js';
-import { sealFrame, openLength, openPayload, buildBrookHeader } from '../brook-quicclient/src/core/brook-framing.js';
+import { sealFrame, openLength, openPayload, buildBrookHeader, BrookCipher } from '../brook-quicclient/src/core/brook-framing.js';
 import { Socks5Parser } from '../brook-quicclient/src/protocols/socks5-parser.js';
 import { HttpProxyParser } from '../brook-quicclient/src/protocols/http-proxy-parser.js';
 import { ProtocolDetector, ProtocolType } from '../brook-quicclient/src/protocols/protocol-detector.js';
@@ -24,6 +24,7 @@ import { ProxyDispatcher } from '../brook-quicclient/src/server/proxy-dispatcher
 import { TcpListener } from '../brook-quicclient/src/server/tcp-listener.js';
 import { LogStream } from '../brook-quicclient/src/ui/log-stream.js';
 import { SessionTracker } from '../brook-quicclient/src/server/session-tracker.js';
+import { runLossRecoveryTests } from './test-loss-recovery.js';
 
 const execAsync = promisify(exec);
 
@@ -77,6 +78,34 @@ async function runUnitTests() {
   const openedPayload = openPayload(key, sn, sealed.slice(18));
   assert(new TextDecoder().decode(openedPayload) === 'Hello Brook QUIC', 'Decrypted payload matches original string');
 
+  // Test Fast BrookCipher Precomputed AES Schedule & GHASH Table
+  const fastCipher = new BrookCipher(key);
+  assert(fastCipher.useFast === true, 'BrookCipher initializes fast precomputed AES key schedule and H-table');
+  const cn2 = new Uint8Array(nonce);
+  const sealedFast = sealFrame(fastCipher, cn2, payload);
+  assert(sealedFast.length === sealed.length, 'BrookCipher sealed frame length matches standard format');
+
+  const sn2 = new Uint8Array(nonce);
+  const openLenFast = openLength(fastCipher, sn2, sealedFast.subarray(0, 18));
+  assert(openLenFast === payload.length, 'BrookCipher openLength correctly recovers payload length');
+  const openedFast = openPayload(fastCipher, sn2, sealedFast.subarray(18));
+  assert(new TextDecoder().decode(openedFast) === 'Hello Brook QUIC', 'BrookCipher openPayload matches original plaintext');
+
+  // Test BrookCipher unaligned memory slice resilience (byteOffset % 4 != 0)
+  const unalignedBuf = new Uint8Array(200);
+  const unalignedSlice = unalignedBuf.subarray(3, 3 + payload.length);
+  unalignedSlice.set(payload);
+  const cnUnaligned = new Uint8Array(nonce);
+  const sealedUnaligned = fastCipher.encrypt(cnUnaligned, unalignedSlice);
+  assert(sealedUnaligned.length === payload.length + 16, 'BrookCipher encrypts unaligned memory view without error');
+
+  const unalignedCtBuf = new Uint8Array(200);
+  const unalignedCtSlice = unalignedCtBuf.subarray(1, 1 + sealedUnaligned.length);
+  unalignedCtSlice.set(sealedUnaligned);
+  const snUnaligned = new Uint8Array(nonce);
+  const openedUnaligned = fastCipher.decrypt(snUnaligned, unalignedCtSlice);
+  assert(new TextDecoder().decode(openedUnaligned) === 'Hello Brook QUIC', 'BrookCipher decrypts unaligned ciphertext view accurately');
+
   // Test Protocol Detector
   assert(ProtocolDetector.detect(new Uint8Array([0x05, 0x01, 0x00])) === ProtocolType.SOCKS5, 'Detects SOCKS5 correctly');
   assert(ProtocolDetector.detect(new TextEncoder().encode('CONNECT google.com:443 HTTP/1.1\r\n')) === ProtocolType.HTTP, 'Detects HTTP CONNECT correctly');
@@ -126,25 +155,63 @@ async function runUnitTests() {
   assert(testConn.context.min_limit_bytes_per_sec >= 2000000, `BBR pacing floor prevents crawl (${testConn.context.min_limit_bytes_per_sec} >= 2MB/s)`);
   assert(testConn.context.init_limit_packets_in_flight >= 24, `Initial cwnd is high-performance (${testConn.context.init_limit_packets_in_flight} >= 24 pkts)`);
   assert(testConn.context.min_limit_bytes_in_flight >= 16000, `BBR min bytes in flight is >= 16000B (${testConn.context.min_limit_bytes_in_flight}B)`);
+  assert(typeof testConn.context.bytes_in_flight === 'number' && testConn.context.bytes_in_flight === 0, 'QUIC connection maintains O(1) bytes_in_flight tracking initialized to 0');
 
   // Test UDP Socket Adapter Priority-Aware Queue & Backpressure
+  let logDroppedMsg = null;
   const mockAdapter = new UdpSocketAdapter({
     remoteAddress: '127.0.0.1',
-    remotePort: 4433
+    remotePort: 4433,
+    onLog: (lvl, msg) => {
+      if (msg.includes('Local packet drop')) logDroppedMsg = msg;
+    }
   });
   const writtenChunks = [];
   mockAdapter.writer = { write: async (obj) => { writtenChunks.push(obj.data); } };
-  // Fill send queue with 1024 short-header 1-RTT data packets
-  for (let i = 0; i < 1024; i++) {
-    mockAdapter.sendQueue.push(new Uint8Array([0x40, i & 0xff])); // Short header (MSB=0)
+  // Fill send queue with 2048 short-header 1-RTT data packets
+  for (let i = 0; i < 2048; i++) {
+    mockAdapter.sendQueue.push({ data: new Uint8Array([0x40, i & 0xff]), isControl: false, space: 'app' });
   }
   // Enqueue Long Header control packet (Initial: MSB=1)
   const initialPkt = new Uint8Array([0xC0, 0x00, 0x00, 0x01]);
-  mockAdapter.send(initialPkt);
-  const foundControl = mockAdapter.sendQueue.some(pkt => (((pkt.data || pkt)[0]) & 0x80) !== 0) || writtenChunks.some(pkt => (pkt[0] & 0x80) !== 0);
+  await mockAdapter.send(initialPkt, { isControl: true, space: 'initial' });
+  const foundControl = mockAdapter.sendQueue.some(pkt => (((pkt.data || pkt)[0]) & 0x80) !== 0 || pkt.isControl) || writtenChunks.some(pkt => (pkt[0] & 0x80) !== 0);
   assert(foundControl, 'UDP send queue prioritizes and retains Long-Header control/handshake packets');
+  assert(mockAdapter.packetEvictions === 1, 'UDP adapter tracks packetEvictions count accurately');
+  assert(logDroppedMsg !== null && logDroppedMsg.includes('Local packet drop'), 'UDP packet drop is logged to event stream with warning');
+
+  // Enqueue 1-RTT Short-Header Control Frame (e.g. ACK-only or CONNECTION_CLOSE)
+  const shortControlPkt = new Uint8Array([0x40, 0xAA, 0xBB]);
+  await mockAdapter.send(shortControlPkt, { isControl: true, space: 'app' });
+  const foundShortControl = mockAdapter.sendQueue.some(pkt => pkt.isControl && pkt.space === 'app') || writtenChunks.some(pkt => pkt.length === 3 && pkt[1] === 0xAA && pkt[2] === 0xBB);
+  assert(foundShortControl, 'UDP adapter protects 1-RTT short-header control frames from eviction');
   await mockAdapter._waitForDrain(0);
   assert(mockAdapter.sendQueue.length === 0, 'All queued packets drained to UDP writer');
+
+  // Test UDP Socket Adapter Pipelined Multi-Write Concurrency (MAX=4)
+  let maxConcurrentWrites = 0;
+  let activeWrites = 0;
+  const pipelineAdapter = new UdpSocketAdapter({
+    remoteAddress: '127.0.0.1',
+    remotePort: 4433
+  });
+  pipelineAdapter.writer = {
+    write: async () => {
+      activeWrites++;
+      if (activeWrites > maxConcurrentWrites) maxConcurrentWrites = activeWrites;
+      await new Promise(r => setTimeout(r, 10));
+      activeWrites--;
+    }
+  };
+  // Enqueue burst of 12 packets and drain
+  for (let i = 0; i < 12; i++) {
+    pipelineAdapter.sendQueue.push({ data: new Uint8Array([0x40, i]), isControl: false });
+  }
+  pipelineAdapter._drainSendQueue();
+  await new Promise(r => setTimeout(r, 50));
+  assert(maxConcurrentWrites >= 2 && maxConcurrentWrites <= 4, `UDP adapter pipelines concurrent writes (${maxConcurrentWrites} concurrent in flight)`);
+  await pipelineAdapter._waitForDrain(0);
+  assert(pipelineAdapter.sendQueue.length === 0, 'Pipelined writes drained completely');
 
   // Test QuicConnectionManager Handshake Concurrency Limiter
   const mockMgr = new QuicConnectionManager({
@@ -620,6 +687,7 @@ async function runUnitTests() {
   assert(refusalOutcome.success === false, 'BrookTunnel reports success: false on 0-byte target refusal');
   assert(refusalOutcome.kind === 'target_dial_refused', `BrookTunnel identifies refusal kind correctly (${refusalOutcome.kind})`);
 
+
   // Test Review 7: BrookTunnel Bounded Receive Buffer Overflow Protection
   let overflowCb = null;
   const mockOverflowSession = {
@@ -646,8 +714,8 @@ async function runUnitTests() {
     sessionId: 'test-rx-overflow'
   });
   await new Promise(r => setTimeout(r, 10));
-  // Send a chunk larger than 2MB
-  const largeChunk = new Uint8Array(2.5 * 1024 * 1024);
+  // Send a chunk larger than 8MB
+  const largeChunk = new Uint8Array(8.5 * 1024 * 1024);
   overflowCb.onData(largeChunk, false);
   const overflowOutcome = await overflowPromise;
   assert(overflowOutcome.success === false, 'BrookTunnel fails on rx buffer overflow');
@@ -665,17 +733,14 @@ async function runUnitTests() {
   // Test Review 7: UdpSocketAdapter Strict Queue Bound
   const boundedUdp = new UdpSocketAdapter({ remoteAddress: '127.0.0.1', remotePort: 4433 });
   boundedUdp.writer = { write: async () => new Promise(() => {}) }; // Stalled writer
-  // Fill with 1024 control packets
-  for (let i = 0; i < 1024; i++) {
-    boundedUdp.sendQueue.push(new Uint8Array([0xC0, 1])); // Control packet
+  // Fill with 2048 control packets
+  for (let i = 0; i < 2048; i++) {
+    boundedUdp.sendQueue.push({ data: new Uint8Array([0xC0, 1]), isControl: true }); // Control packet
   }
-  let queueSaturatedError = false;
-  try {
-    await boundedUdp.send(new Uint8Array([0x40, 1])); // Non-control packet when full of control
-  } catch (err) {
-    if (err.message.includes('saturated')) queueSaturatedError = true;
-  }
-  assert(queueSaturatedError, 'UdpSocketAdapter throws when send queue is saturated with control frames');
+  let queueDrainAttempted = false;
+  boundedUdp._waitForDrain = () => { queueDrainAttempted = true; return Promise.resolve(); };
+  await boundedUdp.send(new Uint8Array([0x40, 1]), { isControl: false });
+  assert(queueDrainAttempted, 'UdpSocketAdapter applies backpressure when send queue is saturated with control frames');
   await boundedUdp.close();
 
   // Test Review 7: DnsResolver clear()
@@ -982,6 +1047,7 @@ async function main() {
   const startTime = Date.now();
   try {
     await runUnitTests();
+    await runLossRecoveryTests();
     await runE2ETests();
   } catch (err) {
     console.error('\nSuite encountered an error:', err);

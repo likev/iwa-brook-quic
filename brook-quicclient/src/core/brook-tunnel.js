@@ -6,7 +6,7 @@
  */
 
 import { generateNonce, deriveKey } from './brook-crypto.js';
-import { sealFrame, openLength, openPayload, buildBrookHeader } from './brook-framing.js';
+import { sealFrame, openLength, openPayload, buildBrookHeader, BrookCipher } from './brook-framing.js';
 
 export class BrookTunnel {
   static globalMetrics = {
@@ -110,20 +110,23 @@ export class BrookTunnel {
     const cn = generateNonce();
     const cnCopy = new Uint8Array(cn);
     const ck = deriveKey(password, cnCopy, 'brook', withoutBrook);
+    const clientCipher = new BrookCipher(ck);
 
     let sn = null;
     let sk = null;
+    let serverCipher = null;
     let rxBuffer = new Uint8Array(0);
     let rxOffset = 0;
     let serverHandshakeDone = false;
     let dialDurationMs = 0;
     let expectedPayloadLen = -1;
 
-    // Bounded Serialized FIFO queue for downstream processing (2MB hard buffer cap)
-    const MAX_RX_BUFFER_BYTES = 2 * 1024 * 1024;
+    // Bounded Serialized FIFO queue for downstream processing (8MB hard buffer cap)
+    const MAX_RX_BUFFER_BYTES = 8 * 1024 * 1024;
     let rxQueuedBytes = 0;
     const rxQueue = [];
     let isProcessingRx = false;
+    let rxHighWaterLogged = false;
 
     // 2. Timers:
     let handshakeTimer = null;
@@ -266,6 +269,7 @@ export class BrookTunnel {
               sn = rxBuffer.slice(rxOffset, rxOffset + 12);
               rxOffset += 12;
               sk = deriveKey(password, sn, 'brook', withoutBrook);
+              serverCipher = new BrookCipher(sk);
               serverHandshakeDone = true;
               dialDurationMs = Date.now() - tunnelStartTime;
 
@@ -309,7 +313,7 @@ export class BrookTunnel {
                 const chunk18 = rxBuffer.subarray(rxOffset, rxOffset + 18);
                 rxOffset += 18;
                 try {
-                  expectedPayloadLen = openLength(sk, sn, chunk18);
+                  expectedPayloadLen = openLength(serverCipher, sn, chunk18);
                 } catch (err) {
                   if (onLog) onLog('error', `${logTag} Frame length decrypt failed on stream ${streamId}: ${err.message}`);
                   cleanup('decrypt_error', err);
@@ -327,7 +331,7 @@ export class BrookTunnel {
 
                 let plainPayload;
                 try {
-                  plainPayload = openPayload(sk, sn, payloadAndTag);
+                  plainPayload = openPayload(serverCipher, sn, payloadAndTag);
                 } catch (err) {
                   if (onLog) onLog('error', `${logTag} Payload decrypt failed on stream ${streamId}: ${err.message}`);
                   cleanup('decrypt_error', err);
@@ -402,6 +406,12 @@ export class BrookTunnel {
         cleanup('rx_error', err);
       } finally {
         isProcessingRx = false;
+        if (rxQueuedBytes < 1024 * 1024 && rxHighWaterLogged) {
+          rxHighWaterLogged = false;
+          if (onLog) {
+            onLog('info', `${logTag} ℹ️ [Brook Buffer] Downstream rx buffer recovered to ${Math.round(rxQueuedBytes / 1024)}KB.`);
+          }
+        }
       }
     };
 
@@ -410,11 +420,18 @@ export class BrookTunnel {
       quicManager.registerStream(streamId, {
         onData: (data, fin) => {
           if (isTerminated) return;
+          resetIdleTimer(60000);
           const dataLen = data ? data.length : 0;
           if (rxQueuedBytes + dataLen > MAX_RX_BUFFER_BYTES) {
             if (onLog) onLog('error', `${logTag} Downstream receive buffer overflow (${rxQueuedBytes + dataLen} > ${MAX_RX_BUFFER_BYTES}). Terminating tunnel.`);
             cleanup('rx_overflow', new Error('Downstream receive buffer overflow'));
             return;
+          }
+          if (rxQueuedBytes + dataLen > 4 * 1024 * 1024 && !rxHighWaterLogged) {
+            rxHighWaterLogged = true;
+            if (onLog) {
+              onLog('warning', `${logTag} ⚠️ [Brook Buffer] High downstream buffer pressure (${Math.round((rxQueuedBytes + dataLen) / 1024)}KB). Slow client TCP consumer detected.`);
+            }
           }
           rxQueuedBytes += dataLen;
           BrookTunnel.globalMetrics.rxQueuedBytes += dataLen;
@@ -447,7 +464,7 @@ export class BrookTunnel {
 
       // Step B: Send sealed header: [uint32 timestamp (even)] + dstBytes
       const headerBody = buildBrookHeader(dstBytes, true, clockOffsetSec);
-      const sealedHeader = sealFrame(ck, cnCopy, headerBody);
+      const sealedHeader = sealFrame(clientCipher, cnCopy, headerBody);
       await quicManager.sendStreamData(streamId, sealedHeader, false);
       totalBytesSent += sealedHeader.length;
       if (onBytes) onBytes(sealedHeader.length, 0);
@@ -458,7 +475,7 @@ export class BrookTunnel {
         const CHUNK_SIZE = 16384;
         for (let offset = 0; offset < leftover.length; offset += CHUNK_SIZE) {
           const slice = leftover.subarray(offset, Math.min(offset + CHUNK_SIZE, leftover.length));
-          const sealedLeftover = sealFrame(ck, cnCopy, slice);
+          const sealedLeftover = sealFrame(clientCipher, cnCopy, slice);
           await quicManager.sendStreamData(streamId, sealedLeftover, false);
           totalBytesSent += sealedLeftover.length;
           if (onBytes) onBytes(sealedLeftover.length, 0);
@@ -523,7 +540,7 @@ export class BrookTunnel {
             let writeFailed = false;
             for (let offset = 0; offset < value.length; offset += CHUNK_SIZE) {
               const slice = value.subarray(offset, Math.min(offset + CHUNK_SIZE, value.length));
-              const sealedChunk = sealFrame(ck, cnCopy, slice);
+              const sealedChunk = sealFrame(clientCipher, cnCopy, slice);
               try {
                 await quicManager.sendStreamData(streamId, sealedChunk, false);
                 BrookTunnel.globalMetrics.uploadPendingBytes = Math.max(0, BrookTunnel.globalMetrics.uploadPendingBytes - slice.length);
