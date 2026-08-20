@@ -13,6 +13,7 @@ export class WtStreamSession {
     this.reader = bidiStream.readable.getReader();
     this.writer = bidiStream.writable.getWriter();
     this.streamHandlers = new Map();
+    this._pendingChunks = [];
     this.isClosed = false;
     this.isConnected = true;
 
@@ -25,6 +26,14 @@ export class WtStreamSession {
 
   registerStream(streamId, handlers) {
     this.streamHandlers.set(streamId, handlers);
+    if (this._pendingChunks.length > 0) {
+      const pending = this._pendingChunks;
+      this._pendingChunks = [];
+      for (const item of pending) {
+        if (handlers.onData) handlers.onData(item.data, item.fin);
+        if (item.fin && handlers.onClose) handlers.onClose();
+      }
+    }
   }
 
   unregisterStream(streamId) {
@@ -62,11 +71,15 @@ export class WtStreamSession {
         const { value, done } = await this.reader.read();
         if (done) {
           const handler = this.streamHandlers.get(this.streamId);
-          if (handler && handler.onData) {
-            handler.onData(new Uint8Array(0), true);
-          }
-          if (handler && handler.onClose) {
-            handler.onClose();
+          if (handler) {
+            if (handler.onData) {
+              handler.onData(new Uint8Array(0), true);
+            }
+            if (handler.onClose) {
+              handler.onClose();
+            }
+          } else {
+            this._pendingChunks.push({ data: new Uint8Array(0), fin: true });
           }
           break;
         }
@@ -75,6 +88,8 @@ export class WtStreamSession {
           const handler = this.streamHandlers.get(this.streamId);
           if (handler && handler.onData) {
             handler.onData(value, false);
+          } else {
+            this._pendingChunks.push({ data: value, fin: false });
           }
         }
       }

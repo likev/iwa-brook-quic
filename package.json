@@ -27,16 +27,9 @@
   "author": "Google DeepMind Antigravity",
   "license": "MIT",
   "dependencies": {
-    "@currentspace/http3": "^0.9.0",
     "@fails-components/webtransport": "^1.6.7",
     "@fails-components/webtransport-transport-http3-quiche": "^1.6.7",
-    "@noble/ciphers": "^2.3.0",
-    "@noble/curves": "^2.3.0",
-    "@noble/hashes": "^2.3.0",
     "esbuild": "^0.28.2",
-    "flat-ranges": "^2.1.0",
-    "lemon-tls": "^0.7.0",
-    "quico": "^0.4.0",
     "wbn": "^0.0.9",
     "wbn-sign": "^0.3.1"
   }

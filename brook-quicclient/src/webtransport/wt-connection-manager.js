@@ -39,6 +39,10 @@ export class WebTransportConnectionManager {
     this.lastActivity = Date.now();
   }
 
+  get serverUrl() {
+    return `https://${this.serverHost}:${this.serverPort}${this.path}`;
+  }
+
   static async getWebTransportClass() {
     if (typeof window !== 'undefined' && typeof window.WebTransport !== 'undefined') {
       return window.WebTransport;

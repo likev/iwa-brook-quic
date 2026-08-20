@@ -82,7 +82,7 @@ async function bootstrap() {
 
           // 3. Setup Listener Worker
           listenerClient = new ListenerWorkerClient({
-            quicWorkerManager: wtWorkerManager,
+            wtWorkerManager,
             onLog: (lvl, msg, meta) => {
               logStream.add(lvl, msg, meta);
             },
