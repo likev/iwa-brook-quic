@@ -195,6 +195,21 @@ async function bootstrap() {
       logStream.add('info', 'All proxy services stopped.');
     }
   });
+
+  // Fast Wi-Fi & Network Recovery Listeners
+  if (typeof window !== 'undefined') {
+    window.addEventListener('offline', () => {
+      if (logStream) logStream.add('warning', '⚠️ Network/Wi-Fi connection lost (offline). Instantly flushing stalled proxy sessions...');
+      if (wtWorkerManager) wtWorkerManager.flushStalledSessions('network_offline');
+      if (listenerClient) listenerClient.flushPending();
+      if (uiController) uiController.updateConnectionState('reconnecting', 'Wi-Fi Offline');
+    });
+
+    window.addEventListener('online', () => {
+      if (logStream) logStream.add('success', '🌐 Network/Wi-Fi connection restored (online). Ready for immediate proxy requests.');
+      if (uiController) uiController.updateConnectionState('connected', 'Online');
+    });
+  }
 }
 
 // Start application when DOM is ready

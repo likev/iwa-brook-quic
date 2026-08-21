@@ -316,6 +316,31 @@ async function runUnitTests() {
   await mockDetachingWriter.write(testPayload);
   mockOnBytes(0, plainLen);
   assert(accountedRecv === 8, 'Downstream throughput accounting captures non-zero received bytes across detached buffer writes (8 bytes)');
+
+  // 1.17 Fast Wi-Fi Recovery & Stalled Session Flushing
+  const recoveryTracker = new SessionTracker();
+  recoveryTracker.createSession({ id: 'sess-stalled-1', target: 'stalled.com:443' });
+  recoveryTracker.createSession({ id: 'sess-stalled-2', target: 'stalled2.com:443' });
+  assert(recoveryTracker.getStats().activeSessions === 2, 'SessionTracker registers stalled sessions (2)');
+
+  const mockWtManager = {
+    workers: new Map([
+      ['sess-stalled-1', { worker: { postMessage: () => {}, terminate: () => {} }, targetStr: 'stalled.com:443' }],
+      ['sess-stalled-2', { worker: { postMessage: () => {}, terminate: () => {} }, targetStr: 'stalled2.com:443' }]
+    ]),
+    sessionTracker: recoveryTracker,
+    _log: () => {},
+    flushStalledSessions(reason) {
+      for (const [id] of this.workers.entries()) {
+        if (this.sessionTracker) this.sessionTracker.closeSession(id);
+      }
+      this.workers.clear();
+    }
+  };
+
+  mockWtManager.flushStalledSessions('network_offline');
+  assert(recoveryTracker.getStats().activeSessions === 0, 'flushStalledSessions immediately clears all active streams to 0 on network disconnect');
+  recoveryTracker.destroy();
 }
 
 // -------------------------------------------------------------

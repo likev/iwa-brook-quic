@@ -299,6 +299,16 @@ self.onmessage = async (event) => {
       }
       break;
     }
+    case 'FLUSH_SESSIONS': {
+      for (const [id, session] of activeSessions.entries()) {
+        try {
+          session.close();
+        } catch (e) {}
+      }
+      activeSessions.clear();
+      postStats();
+      break;
+    }
     case 'STOP_LISTENERS': {
       await stopListeners();
       self.postMessage({ type: 'LISTENERS_STOPPED' });

@@ -135,8 +135,8 @@ export class BrookTunnel {
     const resetIdleTimer = (durationMs = null) => {
       if (idleTimer) clearTimeout(idleTimer);
       if (!isTerminated) {
-        // Standard keep-alive idle timeout (60s)
-        const timeout = durationMs !== null ? durationMs : 60000;
+        // Fast-recovery keep-alive timeout: 30s active, 15s speculative
+        const timeout = durationMs !== null ? durationMs : (hasExchangedData ? 30000 : 15000);
         idleTimer = setTimeout(() => {
           if (!isTerminated) {
             if (totalBytesRecv === 0 && onLog) {
@@ -355,7 +355,7 @@ export class BrookTunnel {
                     activeWritePromise = null;
                     const waitMs = ((typeof performance !== 'undefined') ? performance.now() : Date.now()) - t0;
                     BrookTunnel.globalMetrics.recordWriterWait(waitMs);
-                    resetIdleTimer(60000);
+                    resetIdleTimer();
                     if (onBytes) onBytes(0, plainLen);
                   } catch (err) {
                     activeWritePromise = null;
@@ -397,8 +397,8 @@ export class BrookTunnel {
 
             checkFullClose();
             if (serverRxClosed && !clientReadClosed && !isTerminated) {
-              // Standard bounded half-close: allow client ample time (30s) to read remaining response
-              resetIdleTimer(30000);
+              // Bounded half-close: allow client 10s to complete reading
+              resetIdleTimer(10000);
             }
             return;
           }
@@ -421,7 +421,7 @@ export class BrookTunnel {
       quicManager.registerStream(streamId, {
         onData: (data, fin) => {
           if (isTerminated) return;
-          resetIdleTimer(60000);
+          resetIdleTimer();
           const dataLen = data ? data.length : 0;
           if (rxQueuedBytes + dataLen > MAX_RX_BUFFER_BYTES) {
             if (onLog) onLog('error', `${logTag} Downstream receive buffer overflow (${rxQueuedBytes + dataLen} > ${MAX_RX_BUFFER_BYTES}). Terminating tunnel.`);
@@ -444,7 +444,7 @@ export class BrookTunnel {
           if (rxQueue.length === 0 && !isProcessingRx) {
             checkFullClose();
             if (!isTerminated && !clientReadClosed) {
-              resetIdleTimer(30000);
+              resetIdleTimer(10000);
             }
           }
         },
@@ -455,7 +455,7 @@ export class BrookTunnel {
       });
 
       // 4. Initiate Brook Client Handshake
-      resetIdleTimer(60000);
+      resetIdleTimer();
       await quicManager.ensureConnected();
 
       // Step A: Send client nonce (12B)
@@ -524,8 +524,8 @@ export class BrookTunnel {
             } catch (e) {}
             checkFullClose();
             if (!isTerminated && !serverRxClosed) {
-              // Client closed its write side; allow server normal keep-alive time to complete response
-              resetIdleTimer(60000);
+              // Client closed its write side; allow server bounded time to complete response
+              resetIdleTimer(15000);
             }
             break;
           }
@@ -536,7 +536,7 @@ export class BrookTunnel {
               onClientDataRead();
             }
             hasExchangedData = true;
-            resetIdleTimer(60000);
+            resetIdleTimer();
             const CHUNK_SIZE = 16384;
             let writeFailed = false;
             for (let offset = 0; offset < value.length; offset += CHUNK_SIZE) {

@@ -24,8 +24,22 @@ export class WtWorkerManager {
     this.onStateChange = onStateChange;
     this.onLog = onLog;
 
-    this.workers = new Map(); // sessionId -> { worker, resolve, reject }
+    this.workers = new Map(); // sessionId -> { worker, createdAt, lastActivity, targetStr }
     this.isClosed = false;
+
+    // Periodic background reaper for dead / hung workers when network drops silently
+    this.reaperInterval = setInterval(() => {
+      if (this.isClosed) return;
+      const now = Date.now();
+      for (const [id, entry] of this.workers.entries()) {
+        const ageMs = now - (entry.lastActivity || entry.createdAt);
+        // If a worker has been around with zero activity for > 30s, force terminate it
+        if (ageMs > 30000) {
+          this._log('warning', `[WT Worker #${id}] Reaping stalled worker for ${entry.targetStr} (inactive for ${Math.round(ageMs / 1000)}s)`);
+          this._terminateWorker(id);
+        }
+      }
+    }, 5000);
   }
 
   _log(level, message, meta = null) {
@@ -44,6 +58,25 @@ export class WtWorkerManager {
       hostQueueTotal: 0,
       retries: 0
     };
+  }
+
+  /**
+   * Instantly flush all active worker sessions (e.g. on Wi-Fi drop / network offline event).
+   * Resets active session counts and prepares the client for immediate, clean recovery.
+   */
+  flushStalledSessions(reason = 'network_offline') {
+    if (this.workers.size === 0) return;
+    this._log('warning', `⚡ Flushing ${this.workers.size} active worker session(s) due to ${reason}`);
+    for (const [id, entry] of this.workers.entries()) {
+      if (this.sessionTracker) {
+        this.sessionTracker.closeSession(id);
+      }
+      try {
+        entry.worker.postMessage({ type: 'CLOSE' });
+        entry.worker.terminate();
+      } catch (e) {}
+    }
+    this.workers.clear();
   }
 
   /**
@@ -72,6 +105,7 @@ export class WtWorkerManager {
     const entry = {
       worker,
       createdAt: Date.now(),
+      lastActivity: Date.now(),
       targetStr
     };
     this.workers.set(sessionId, entry);
@@ -85,6 +119,7 @@ export class WtWorkerManager {
           this._log(msg.level, msg.message, msg.meta);
           break;
         case 'BYTES':
+          entry.lastActivity = Date.now();
           if (this.sessionTracker) {
             this.sessionTracker.recordBytes(msg.sessionId, msg.sent || 0, msg.recv || 0);
           }
@@ -116,7 +151,7 @@ export class WtWorkerManager {
         targetStr,
         dstBytes,
         leftover,
-        dialTimeoutMs: dialTimeoutMs || 8000,
+        dialTimeoutMs: dialTimeoutMs || 6000,
         serverHost: this.serverHost,
         serverPort: this.serverPort,
         path: this.path,
@@ -144,6 +179,10 @@ export class WtWorkerManager {
 
   async close() {
     this.isClosed = true;
+    if (this.reaperInterval) {
+      clearInterval(this.reaperInterval);
+      this.reaperInterval = null;
+    }
     for (const [id, entry] of this.workers.entries()) {
       if (this.sessionTracker) {
         this.sessionTracker.closeSession(id);

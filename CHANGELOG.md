@@ -4,6 +4,19 @@ All notable changes to the **Isolated Web Apps (IWAs) Direct Sockets Suite & Bro
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.34.1] - 2026-08-21
+
+### Fast Network & Wi-Fi Loss Recovery
+- **Strict Connect & Stream Timeouts (`WebTransportConnectionManager`)**:
+  - Bound WebTransport session connection (`this.transport.ready`) to a strict 6-second timeout and stream allocation (`createBidirectionalStream`) to a 5-second timeout, preventing worker threads from hanging indefinitely in Chromium's internal QUIC state machine during Wi-Fi drops or interface switches.
+- **Fast Idle & Half-Close Timeouts (`BrookTunnel`)**:
+  - Reduced idle connection timeouts to 15 seconds (speculative / pre-data) and 30 seconds (active streams), plus a fast 10-second half-close window, enabling rapid cleanup of dead connections when networks drop silently.
+- **Instant Stalled Session Flushing & Automatic Reaper (`WtWorkerManager`)**:
+  - Added `flushStalledSessions('network_offline')` on browser `window.addEventListener('offline')` events to immediately terminate ghost workers, flush pending connections, and reset `Active Streams` to 0.
+  - Implemented an automatic 5-second background reaper that purges inactive worker threads, guaranteeing zero stuck sessions after Wi-Fi reconnection.
+
+---
+
 ## [v1.34.0] - 2026-08-21
 
 ### Bug Fixes, Live Telemetry & Legacy Protocol Compatibility

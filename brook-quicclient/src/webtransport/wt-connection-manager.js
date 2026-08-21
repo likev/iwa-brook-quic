@@ -111,7 +111,7 @@ export class WebTransportConnectionManager {
   /**
    * Establish initial WebTransport connection to server.
    */
-  async connect() {
+  async connect(options = {}) {
     if (this.isClosed) throw new Error('WebTransportConnectionManager is closed');
     this._setState(ConnectionState.CONNECTING, 'Connecting WebTransport session...');
 
@@ -119,13 +119,13 @@ export class WebTransportConnectionManager {
     const url = `https://${this.serverHost}:${this.serverPort}${this.path}`;
     this._log('info', `Connecting WebTransport to ${url}...`);
 
-    const options = {};
+    const wtOptions = {};
     if (this.serverCertificateHashes && this.serverCertificateHashes.length > 0) {
-      options.serverCertificateHashes = this.serverCertificateHashes;
+      wtOptions.serverCertificateHashes = this.serverCertificateHashes;
     }
 
     try {
-      this.transport = new WTClass(url, options);
+      this.transport = new WTClass(url, wtOptions);
 
       // Handle close event
       this.transport.closed
@@ -142,11 +142,27 @@ export class WebTransportConnectionManager {
           }
         });
 
-      await this.transport.ready;
+      // Strict connect timeout (default 6s) prevents hanging when Wi-Fi drops or network changes
+      const connectTimeoutMs = options.connectTimeoutMs || 6000;
+      let timer = null;
+      const timeoutPromise = new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`WebTransport connection to ${url} timed out after ${connectTimeoutMs}ms`)), connectTimeoutMs);
+      });
+
+      try {
+        await Promise.race([this.transport.ready, timeoutPromise]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+
       this._setState(ConnectionState.CONNECTED);
       this._log('success', `✅ WebTransport session established to ${url}`);
       return this;
     } catch (err) {
+      if (this.transport) {
+        try { this.transport.close(); } catch (e) {}
+        this.transport = null;
+      }
       this._setState(ConnectionState.ERROR, `Failed: ${err.message}`);
       this._log('error', `❌ Failed to connect WebTransport: ${err.message}`);
       throw err;
@@ -166,11 +182,27 @@ export class WebTransportConnectionManager {
         try { this.transport.close(); } catch (e) {}
         this.transport = null;
       }
-      await this.connect();
+      await this.connect(options);
     }
 
     const streamId = (this.nextStreamSeq += 4);
-    const bidiStream = await this.transport.createBidirectionalStream();
+
+    // Strict stream creation timeout (default 5s)
+    const streamTimeoutMs = options.streamTimeoutMs || 5000;
+    let streamTimer = null;
+    const timeoutPromise = new Promise((_, reject) => {
+      streamTimer = setTimeout(() => reject(new Error(`WebTransport stream allocation timed out after ${streamTimeoutMs}ms`)), streamTimeoutMs);
+    });
+
+    let bidiStream;
+    try {
+      bidiStream = await Promise.race([
+        this.transport.createBidirectionalStream(),
+        timeoutPromise
+      ]);
+    } finally {
+      if (streamTimer) clearTimeout(streamTimer);
+    }
 
     const streamSession = new WtStreamSession({
       bidiStream,

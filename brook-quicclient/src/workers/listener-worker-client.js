@@ -91,6 +91,14 @@ export class ListenerWorkerClient {
     });
   }
 
+  flushPending() {
+    if (this.worker) {
+      try {
+        this.worker.postMessage({ type: 'FLUSH_SESSIONS' });
+      } catch (e) {}
+    }
+  }
+
   async stop() {
     if (this.worker) {
       try {

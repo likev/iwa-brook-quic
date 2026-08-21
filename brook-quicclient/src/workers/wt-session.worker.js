@@ -66,7 +66,10 @@ async function runWtTunnel({
       onLog: (lvl, msg, meta) => log(lvl, msg, meta)
     });
 
-    streamSession = await wtManager.createSession();
+    streamSession = await wtManager.createSession({
+      connectTimeoutMs: Math.min(dialTimeoutMs, 6000),
+      streamTimeoutMs: 5000
+    });
 
     const outcome = await BrookTunnel.run({
       clientReader: bridge.clientReader,
