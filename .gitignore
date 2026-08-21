@@ -5,3 +5,7 @@ brook-quicserver
 brook-quic
 wt-bridge
 test-scratch/
+*.swbn
+*.wbn
+**/*.swbn
+**/*.wbn
