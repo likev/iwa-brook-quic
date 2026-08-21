@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/cipher"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -41,12 +42,20 @@ func newBufferedStreamConn(conn StreamConn, initial []byte) *bufferedStreamConn 
 	}
 }
 
-// HandleBrookStream processes an incoming Brook stream from either QUIC or WebTransport.
-func HandleBrookStream(client StreamConn, password []byte, withoutBrook bool, tcpTimeout, udpTimeout int) error {
+// HandleBrookStream processes an incoming Brook stream from either QUIC or WebTransport with auto-detection.
+func HandleBrookStream(client StreamConn, password []byte, defaultWithoutBrook bool, tcpTimeout, udpTimeout int) error {
 	defer client.Close()
 
 	if tcpTimeout != 0 {
 		_ = client.SetDeadline(time.Now().Add(time.Duration(tcpTimeout) * time.Second))
+	}
+
+	var rawPass []byte = password
+	var passHash []byte
+	if len(password) == 32 {
+		passHash = password
+	} else {
+		passHash = SHA256Bytes(password)
 	}
 
 	// 1. Read first 12 bytes (client nonce in Brook framing, or first 12 bytes of SHA256 in simple mode)
@@ -55,14 +64,7 @@ func HandleBrookStream(client StreamConn, password []byte, withoutBrook bool, tc
 		return fmt.Errorf("read client nonce failed: %w", err)
 	}
 
-	var passHash []byte
-	if len(password) == 32 {
-		passHash = password
-	} else {
-		passHash = SHA256Bytes(password)
-	}
-
-	// 2. Check if first 12 bytes match first 12 bytes of passHash
+	// 2. Check if first 12 bytes match first 12 bytes of passHash (simple unencrypted mode)
 	if bytes.Equal(first12, passHash[:12]) {
 		// Read remaining 22 bytes (20B of password hash + 2B payload length)
 		rem22 := make([]byte, 22)
@@ -75,15 +77,15 @@ func HandleBrookStream(client StreamConn, password []byte, withoutBrook bool, tc
 			// If remainder did not match, rewind stream and proceed as encrypted
 			rewind := append(first12, rem22...)
 			bConn := newBufferedStreamConn(client, rewind)
-			return handleEncryptedBrookStream(bConn, nil, password, tcpTimeout, udpTimeout)
+			return handleEncryptedBrookStream(bConn, nil, rawPass, passHash, defaultWithoutBrook, tcpTimeout, udpTimeout)
 		}
 	}
 
-	// 3. Normal Brook framed encrypted stream
-	return handleEncryptedBrookStream(client, first12, password, tcpTimeout, udpTimeout)
+	// 3. Normal Brook framed encrypted stream with auto-detection
+	return handleEncryptedBrookStream(client, first12, rawPass, passHash, defaultWithoutBrook, tcpTimeout, udpTimeout)
 }
 
-func handleEncryptedBrookStream(client StreamConn, cn []byte, password []byte, tcpTimeout, udpTimeout int) error {
+func handleEncryptedBrookStream(client StreamConn, cn []byte, rawPass, passHash []byte, defaultWithoutBrook bool, tcpTimeout, udpTimeout int) error {
 	if tcpTimeout != 0 {
 		_ = client.SetDeadline(time.Now().Add(time.Duration(tcpTimeout) * time.Second))
 	}
@@ -96,25 +98,57 @@ func handleEncryptedBrookStream(client StreamConn, cn []byte, password []byte, t
 		}
 	}
 
-	// 2. Derive Client Key
-	ck, err := DeriveKey(password, cn, brookInfo)
-	if err != nil {
-		return fmt.Errorf("derive client key failed: %w", err)
-	}
-	ca, err := NewGCMCipher(ck)
-	if err != nil {
-		return fmt.Errorf("new client cipher failed: %w", err)
-	}
-
-	// 3. Read Header Length Frame (18 bytes: 2B len ciphertext + 16B tag)
+	// 2. Read Header Length Frame (18 bytes: 2B len ciphertext + 16B tag)
 	lenBuf18 := make([]byte, 18)
 	if _, err := io.ReadFull(client, lenBuf18); err != nil {
 		return fmt.Errorf("read header length frame failed: %w", err)
 	}
-	plainLen, err := ca.Open(nil, cn, lenBuf18, nil)
-	if err != nil {
-		return fmt.Errorf("open header length failed (auth error): %w", err)
+
+	// 3. Auto-Detect withoutBrookProtocol mode:
+	// Try the preferred / default mode first, then fall back to the alternate mode.
+	type keyCandidate struct {
+		pass         []byte
+		withoutBrook bool
 	}
+	var candidates []keyCandidate
+	if defaultWithoutBrook {
+		candidates = []keyCandidate{
+			{pass: passHash, withoutBrook: true},
+			{pass: rawPass, withoutBrook: false},
+		}
+	} else {
+		candidates = []keyCandidate{
+			{pass: rawPass, withoutBrook: false},
+			{pass: passHash, withoutBrook: true},
+		}
+	}
+
+	var ca cipher.AEAD
+	var activePassword []byte
+	var plainLen []byte
+
+	for _, cand := range candidates {
+		ck, err := DeriveKey(cand.pass, cn, brookInfo)
+		if err != nil {
+			continue
+		}
+		cCipher, err := NewGCMCipher(ck)
+		if err != nil {
+			continue
+		}
+		// Attempt to open the 18-byte length frame with AES-GCM tag verification
+		if pLen, err := cCipher.Open(nil, cn, lenBuf18, nil); err == nil {
+			ca = cCipher
+			activePassword = cand.pass
+			plainLen = pLen
+			break
+		}
+	}
+
+	if ca == nil {
+		return fmt.Errorf("open header length failed (auth error): cipher: message authentication failed")
+	}
+
 	NextNonce(cn)
 	headerLen := int(binary.BigEndian.Uint16(plainLen))
 	if headerLen > 2048 {
@@ -163,7 +197,7 @@ func handleEncryptedBrookStream(client StreamConn, cn []byte, password []byte, t
 	if err != nil {
 		return fmt.Errorf("generate server nonce failed: %w", err)
 	}
-	sk, err := DeriveKey(password, sn, brookInfo)
+	sk, err := DeriveKey(activePassword, sn, brookInfo)
 	if err != nil {
 		return fmt.Errorf("derive server key failed: %w", err)
 	}

@@ -724,3 +724,145 @@ func TestSimultaneousDualClients(t *testing.T) {
 	}
 	t.Logf("🎉 %d Raw QUIC + %d WebTransport clients simultaneously verified on SAME port with 0 errors!", totalClients, totalClients)
 }
+
+func TestAutoDetectWithoutBrookProtocol(t *testing.T) {
+	echoAddr, cleanupEcho := startEchoServer(t)
+	defer cleanupEcho()
+
+	password := "autodetect_secret_pass_999"
+	// Server started with withoutBrook=true default
+	server, err := NewServer("127.0.0.1:0", password, "", 10, 10, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	go func() { _ = server.ListenAndServe() }()
+	select {
+	case <-server.Ready():
+	case <-time.After(5 * time.Second):
+		t.Fatal("server failed to start")
+	}
+
+	serverAddr := server.LocalAddr().String()
+	t.Logf("Auto-Detect Test Server running on %s", serverAddr)
+
+	tlsConf := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"brook-quic", "h3"}}
+
+	// Helper to run client stream with specified key
+	runClient := func(keyMaterial []byte, testMsg string) error {
+		conn, err := quic.DialAddr(context.Background(), serverAddr, tlsConf, &quic.Config{EnableDatagrams: true})
+		if err != nil {
+			return fmt.Errorf("dial: %w", err)
+		}
+		defer conn.CloseWithError(0, "")
+
+		stream, err := conn.OpenStreamSync(context.Background())
+		if err != nil {
+			return fmt.Errorf("open stream: %w", err)
+		}
+		defer stream.Close()
+
+		cn, _ := GenerateNonce()
+		ck, _ := DeriveKey(keyMaterial, cn, brookInfo)
+		ca, _ := NewGCMCipher(ck)
+
+		if _, err := stream.Write(cn); err != nil {
+			return err
+		}
+
+		atyp, addrB, portB, _ := ParseAddress(echoAddr)
+		dstSlice := append([]byte{atyp}, addrB...)
+		dstSlice = append(dstSlice, portB...)
+		now := time.Now().Unix()
+		if now%2 != 0 {
+			now += 1
+		}
+		headerBody := make([]byte, 4+len(dstSlice))
+		binary.BigEndian.PutUint32(headerBody[:4], uint32(now))
+		copy(headerBody[4:], dstSlice)
+
+		hdrLenBuf := make([]byte, 2)
+		binary.BigEndian.PutUint16(hdrLenBuf, uint16(len(headerBody)))
+		sealedLen := ca.Seal(nil, cn, hdrLenBuf, nil)
+		NextNonce(cn)
+		sealedPayload := ca.Seal(nil, cn, headerBody, nil)
+		NextNonce(cn)
+
+		if _, err := stream.Write(append(sealedLen, sealedPayload...)); err != nil {
+			return err
+		}
+
+		sn := make([]byte, 12)
+		if _, err := io.ReadFull(stream, sn); err != nil {
+			return fmt.Errorf("read sn (auth/dial failure): %w", err)
+		}
+		sk, _ := DeriveKey(keyMaterial, sn, brookInfo)
+		sa, _ := NewGCMCipher(sk)
+
+		msg := []byte(testMsg)
+		dataLenBuf := make([]byte, 2)
+		binary.BigEndian.PutUint16(dataLenBuf, uint16(len(msg)))
+		sLen := ca.Seal(nil, cn, dataLenBuf, nil)
+		NextNonce(cn)
+		sPay := ca.Seal(nil, cn, msg, nil)
+		NextNonce(cn)
+		if _, err := stream.Write(append(sLen, sPay...)); err != nil {
+			return err
+		}
+
+		rLen := make([]byte, 18)
+		if _, err := io.ReadFull(stream, rLen); err != nil {
+			return fmt.Errorf("read resp len: %w", err)
+		}
+		pLen, err := sa.Open(nil, sn, rLen, nil)
+		if err != nil {
+			return fmt.Errorf("open resp len: %w", err)
+		}
+		NextNonce(sn)
+		expLen := int(binary.BigEndian.Uint16(pLen))
+
+		rPay := make([]byte, expLen+16)
+		if _, err := io.ReadFull(stream, rPay); err != nil {
+			return fmt.Errorf("read resp pay: %w", err)
+		}
+		plain, err := sa.Open(nil, sn, rPay, nil)
+		if err != nil {
+			return fmt.Errorf("open resp pay: %w", err)
+		}
+		NextNonce(sn)
+
+		if string(plain) != testMsg {
+			return fmt.Errorf("payload mismatch: expected %q, got %q", testMsg, string(plain))
+		}
+		return nil
+	}
+
+	// 1. Test Client with withoutBrook = true (SHA256 of password)
+	t.Run("withoutBrook = true (SHA256 key)", func(t *testing.T) {
+		passHash := SHA256Bytes([]byte(password))
+		if err := runClient(passHash, "Hello from withoutBrook=true client!"); err != nil {
+			t.Fatalf("withoutBrook=true client failed: %v", err)
+		}
+		t.Log("✅ withoutBrook=true client verified successfully")
+	})
+
+	// 2. Test Client with withoutBrook = false (raw password bytes)
+	t.Run("withoutBrook = false (Raw password key)", func(t *testing.T) {
+		rawPass := []byte(password)
+		if err := runClient(rawPass, "Hello from legacy raw withoutBrook=false client!"); err != nil {
+			t.Fatalf("withoutBrook=false client failed: %v", err)
+		}
+		t.Log("✅ withoutBrook=false client verified successfully")
+	})
+
+	// 3. Test Client with wrong password (must be rejected)
+	t.Run("Wrong password rejected", func(t *testing.T) {
+		wrongPass := []byte("incorrect_password")
+		err := runClient(wrongPass, "This should fail")
+		if err == nil {
+			t.Fatal("expected wrong password client to fail, but it succeeded")
+		}
+		t.Logf("✅ Wrong password client rejected as expected: %v", err)
+	})
+}

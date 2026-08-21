@@ -437,14 +437,14 @@ async function runE2ETests() {
 
     const writer = {
       write: async (data) => {
-        return new Promise((resolve, reject) => {
+        if (isDone || socket.destroyed) return;
+        return new Promise((resolve) => {
           socket.write(Buffer.from(data.buffer, data.byteOffset, data.byteLength), (err) => {
-            if (err) reject(err);
-            else resolve();
+            resolve();
           });
         });
       },
-      close: async () => { socket.end(); },
+      close: async () => { try { socket.end(); } catch (e) {} },
       releaseLock: () => {}
     };
 
@@ -569,13 +569,7 @@ async function runE2ETests() {
     const parsedHttp = JSON.parse(httpOut);
     assert(parsedHttp.url === '/echo?client=http', 'HTTP Proxy routed GET request over WebTransport successfully');
 
-    // Test 3: Simultaneous 25 Raw QUIC + 25 WebTransport Clients on the SAME port
-    const { stdout: goTestOut } = await execAsync('/usr/local/go/bin/go test -v -run TestSimultaneousDualClients .', {
-      cwd: '/root/downloads/iwa/brook-quicserver.go'
-    });
-    assert(goTestOut.includes('PASS'), '25 Raw QUIC + 25 WebTransport simultaneous clients verified on same port');
-
-    // Test 4: Concurrency (20 parallel requests through WebTransport)
+    // Test 3: Concurrency (20 parallel requests through WebTransport)
     const reqPromises = [];
     for (let i = 0; i < 20; i++) {
       const idx = i;
@@ -589,12 +583,24 @@ async function runE2ETests() {
     }
     assert(allValid, '20 parallel concurrent proxy requests succeeded with 100% accuracy');
 
-    // Test 5: 2MB Large Payload Streaming
+    // Test 4: 2MB Large Payload Streaming
     const t0 = Date.now();
     const { stdout: streamOut } = await execAsync(`curl -s -x socks5h://127.0.0.1:${SOCKS5_PORT} http://127.0.0.1:${targetPort}/stream | wc -c`);
     const streamBytes = parseInt(streamOut.trim(), 10);
     const duration = (Date.now() - t0) / 1000;
     assert(streamBytes === 2 * 1024 * 1024, `Large payload streaming transferred exactly 2MB without corruption (${(streamBytes / 1024 / 1024 / duration).toFixed(2)} MB/s)`);
+
+    // Test 5: Auto-Detection of withoutBrookProtocol in brook-quicserver.go
+    const { stdout: autoDetectOut } = await execAsync('/usr/local/go/bin/go test -v -run TestAutoDetectWithoutBrookProtocol .', {
+      cwd: '/root/downloads/iwa/brook-quicserver.go'
+    });
+    assert(autoDetectOut.includes('PASS'), 'brook-quicserver.go auto-detects withoutBrookProtocol per stream dynamically');
+
+    // Test 6: Simultaneous 25 Raw QUIC + 25 WebTransport Clients on the SAME port
+    const { stdout: goTestOut } = await execAsync('/usr/local/go/bin/go test -v -run TestSimultaneousDualClients .', {
+      cwd: '/root/downloads/iwa/brook-quicserver.go'
+    });
+    assert(goTestOut.includes('PASS'), '25 Raw QUIC + 25 WebTransport simultaneous clients verified on same port');
 
   } finally {
     socks5Server.close();

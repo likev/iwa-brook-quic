@@ -99,19 +99,12 @@ type Server struct {
 func NewServer(addr, password, domain string, tcpTimeout, udpTimeout int, withoutBrook bool) (*Server, error) {
 	RaiseLimits()
 
-	var p []byte
-	if !withoutBrook {
-		p = []byte(password)
-	} else {
-		p = SHA256Bytes([]byte(password))
-	}
-
 	ctx, cancel := context.WithCancel(context.Background())
 
 	return &Server{
 		Addr:         addr,
 		Domain:       domain,
-		Password:     p,
+		Password:     []byte(password),
 		WithoutBrook: withoutBrook,
 		TCPTimeout:   tcpTimeout,
 		UDPTimeout:   udpTimeout,
