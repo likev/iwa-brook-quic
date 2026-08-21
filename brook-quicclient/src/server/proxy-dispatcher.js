@@ -243,13 +243,14 @@ export class ProxyDispatcher {
         } catch (sessErr) {
           tunnelError = sessErr;
           if (attempt === MAX_ATTEMPTS) {
-            this._log('error', `[#${session.id}] ❌ Failed to acquire QUIC session for ${targetStr}: ${sessErr.message}`);
+            this._log('error', `[#${session.id}] ❌ Failed to acquire WebTransport session for ${targetStr}: ${sessErr.message}`);
             break;
           }
+          await new Promise(r => setTimeout(r, 300));
           continue;
         }
 
-        const dialTimeoutMs = attempt === 1 ? 8000 : (attempt === 2 ? 10000 : 12000);
+        const dialTimeoutMs = attempt === 1 ? 6000 : (attempt === 2 ? 8000 : 10000);
         let outcome = null;
 
         try {
@@ -298,7 +299,8 @@ export class ProxyDispatcher {
 
             if (attempt < MAX_ATTEMPTS) {
               this.totalRetries++;
-              this._log('warning', `[#${session.id}] ⚠️ [Brook] Dial attempt ${attempt} for ${targetStr} failed (${outcome.kind}). Retrying with fresh QUIC session (${attempt + 1}/${MAX_ATTEMPTS})...`);
+              this._log('warning', `[#${session.id}] ⚠️ [Brook] Dial attempt ${attempt} for ${targetStr} failed (${outcome.kind}). Retrying with fresh session (${attempt + 1}/${MAX_ATTEMPTS})...`);
+              await new Promise(r => setTimeout(r, 300));
             }
           }
         } catch (runErr) {

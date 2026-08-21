@@ -61,102 +61,51 @@ async function bootstrap() {
           logStream.add('info', `⏱️ Network time sync: local clock drift is ${clockDriftSec > 0 ? '+' : ''}${clockDriftSec}s (auto-compensated)`);
         }
 
-        if (HAS_WORKER_SUPPORT) {
-          // 2. Setup WebTransport Worker Manager
-          wtWorkerManager = new WtWorkerManager({
-            serverHost: config.serverHost,
-            serverPort: config.serverPort,
-            path: serverPath,
-            password: config.password,
-            withoutBrook: config.withoutBrook !== undefined ? config.withoutBrook : true,
-            clockOffsetSec: clockDriftSec,
-            sessionTracker,
-            onStateChange: (state, details) => {
-              if (uiController) {
-                uiController.updateConnectionState(state, details);
-              }
-            },
-            onLog: (lvl, msg, meta) => {
-              logStream.add(lvl, msg, meta);
-            }
-          });
+        // 2. Setup Unified WebTransport Manager (multiplexed bidi streams over native QUIC session)
+        fallbackWtManager = new WebTransportConnectionManager({
+          serverHost: config.serverHost,
+          serverPort: config.serverPort,
+          path: serverPath,
+          onStateChange: (state, details) => {
+            if (uiController) uiController.updateConnectionState(state, details);
+          },
+          onLog: (lvl, msg, meta) => logStream.add(lvl, msg, meta)
+        });
 
-          // 3. Setup Listener Worker
-          listenerClient = new ListenerWorkerClient({
-            wtWorkerManager,
-            onLog: (lvl, msg, meta) => {
-              logStream.add(lvl, msg, meta);
-            },
-            onBoundPorts: (ports) => {
-              if (uiController) {
-                uiController.updateBoundPorts(ports);
-              }
-            }
-          });
-
-          const boundPorts = await listenerClient.start({
-            socks5Port: config.socks5Port,
-            httpPort: config.httpPort,
-            enableSocks5: true,
-            enableHttp: true,
-            autoDetectMode: config.autoDetectMode
-          });
-
-          sessionTracker.setSnapshotProvider(() => {
-            return wtWorkerManager ? wtWorkerManager.getSnapshot(listenerClient.getStats()) : {};
-          });
-
-          if (boundPorts && uiController) {
-            uiController.updateBoundPorts(boundPorts);
-          }
-        } else {
-          // Direct main-thread WebTransport mode
-          fallbackWtManager = new WebTransportConnectionManager({
-            serverHost: config.serverHost,
-            serverPort: config.serverPort,
-            path: serverPath,
-            onStateChange: (state, details) => {
-              if (uiController) uiController.updateConnectionState(state, details);
-            },
-            onLog: (lvl, msg, meta) => logStream.add(lvl, msg, meta)
-          });
+        // Pre-connect WebTransport session with auto-reconnect capability
+        try {
           await fallbackWtManager.connect();
+        } catch (e) {
+          logStream.add('warning', `Initial WebTransport connection pending: ${e.message} (will connect on first proxy request)`);
+        }
 
-          fallbackDispatcher = new ProxyDispatcher({
-            quicManager: fallbackWtManager,
-            sessionTracker,
-            password: config.password,
-            withoutBrook: config.withoutBrook !== undefined ? config.withoutBrook : true,
-            clockOffsetSec: clockDriftSec,
-            onLog: (lvl, msg, meta) => logStream.add(lvl, msg, meta)
-          });
+        // 3. Setup Proxy Dispatcher
+        fallbackDispatcher = new ProxyDispatcher({
+          quicManager: fallbackWtManager,
+          sessionTracker,
+          password: config.password,
+          withoutBrook: config.withoutBrook !== undefined ? config.withoutBrook : true,
+          clockOffsetSec: clockDriftSec,
+          onLog: (lvl, msg, meta) => logStream.add(lvl, msg, meta)
+        });
 
-          sessionTracker.setSnapshotProvider(() => {
-            return fallbackWtManager ? fallbackWtManager.getSnapshot(fallbackDispatcher) : {};
-          });
+        sessionTracker.setSnapshotProvider(() => {
+          return fallbackWtManager ? fallbackWtManager.getSnapshot(fallbackDispatcher) : {};
+        });
 
-          const boundPorts = await fallbackDispatcher.start({
-            socks5Port: config.socks5Port,
-            httpPort: config.httpPort,
-            enableSocks5: true,
-            enableHttp: true,
-            autoDetectMode: config.autoDetectMode
-          });
+        const boundPorts = await fallbackDispatcher.start({
+          socks5Port: config.socks5Port,
+          httpPort: config.httpPort,
+          enableSocks5: true,
+          enableHttp: true,
+          autoDetectMode: config.autoDetectMode
+        });
 
-          if (boundPorts && uiController) {
-            uiController.updateBoundPorts(boundPorts);
-          }
+        if (boundPorts && uiController) {
+          uiController.updateBoundPorts(boundPorts);
         }
       } catch (err) {
         logStream.add('error', `❌ Failed to start proxy: ${err.message}`);
-        if (listenerClient) {
-          try { await listenerClient.stop(); } catch (e) {}
-          listenerClient = null;
-        }
-        if (wtWorkerManager) {
-          try { await wtWorkerManager.close(); } catch (e) {}
-          wtWorkerManager = null;
-        }
         if (fallbackDispatcher) {
           try { await fallbackDispatcher.stop(); } catch (e) {}
           fallbackDispatcher = null;
@@ -169,17 +118,7 @@ async function bootstrap() {
       }
     },
     onStop: async () => {
-      logStream.add('warning', 'Stopping all proxy workers and listeners...');
-
-      if (listenerClient) {
-        try { await listenerClient.stop(); } catch (e) {}
-        listenerClient = null;
-      }
-
-      if (wtWorkerManager) {
-        try { await wtWorkerManager.close(); } catch (e) {}
-        wtWorkerManager = null;
-      }
+      logStream.add('warning', 'Stopping all proxy services and listeners...');
 
       if (fallbackDispatcher) {
         try { await fallbackDispatcher.stop(); } catch (e) {}
@@ -199,14 +138,14 @@ async function bootstrap() {
   // Fast Wi-Fi & Network Recovery Listeners
   if (typeof window !== 'undefined') {
     window.addEventListener('offline', () => {
-      if (logStream) logStream.add('warning', '⚠️ Network/Wi-Fi connection lost (offline). Instantly flushing stalled proxy sessions...');
-      if (wtWorkerManager) wtWorkerManager.flushStalledSessions('network_offline');
-      if (listenerClient) listenerClient.flushPending();
+      if (logStream) logStream.add('warning', '⚠️ Network/Wi-Fi connection lost (offline). Resetting WebTransport proxy session...');
+      if (fallbackWtManager) fallbackWtManager.resetSession('network_offline');
       if (uiController) uiController.updateConnectionState('reconnecting', 'Wi-Fi Offline');
     });
 
     window.addEventListener('online', () => {
-      if (logStream) logStream.add('success', '🌐 Network/Wi-Fi connection restored (online). Ready for immediate proxy requests.');
+      if (logStream) logStream.add('success', '🌐 Network/Wi-Fi connection restored (online). Reconnecting WebTransport...');
+      if (fallbackWtManager) fallbackWtManager.connect().catch(() => {});
       if (uiController) uiController.updateConnectionState('connected', 'Online');
     });
   }

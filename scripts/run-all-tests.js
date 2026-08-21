@@ -341,6 +341,18 @@ async function runUnitTests() {
   mockWtManager.flushStalledSessions('network_offline');
   assert(recoveryTracker.getStats().activeSessions === 0, 'flushStalledSessions immediately clears all active streams to 0 on network disconnect');
   recoveryTracker.destroy();
+
+  // 1.18 WebTransportConnectionManager Connection Deduplication & resetSession
+  const testWtMgr = new WebTransportConnectionManager({
+    serverHost: '127.0.0.1',
+    serverPort: 4433,
+    path: '/brook'
+  });
+  testWtMgr.activeStreams.add({ close: () => {} });
+  assert(testWtMgr.activeStreams.size === 1, 'WebTransportConnectionManager tracks active stream session (1)');
+  testWtMgr.resetSession('network_offline');
+  assert(testWtMgr.activeStreams.size === 0, 'resetSession clears active streams and marks state disconnected on network drop');
+  assert(testWtMgr.state === 'disconnected', 'WebTransport state is cleanly disconnected after resetSession');
 }
 
 // -------------------------------------------------------------

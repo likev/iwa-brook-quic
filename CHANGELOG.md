@@ -4,6 +4,20 @@ All notable changes to the **Isolated Web Apps (IWAs) Direct Sockets Suite & Bro
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.35.0] - 2026-08-21
+
+### High-Throughput Stream Multiplexing & Resilient Client Auto-Recovery
+- **Unified WebTransport Stream Multiplexing Architecture**:
+  - Replaced per-connection worker spawning with a unified, native WebTransport stream multiplexing architecture (`ProxyDispatcher` + `WebTransportConnectionManager`).
+  - All concurrent TCP sockets from clients (such as Firefox's 20–30 speculative pre-connect connections) are multiplexed over a single, persistent WebTransport session via `transport.createBidirectionalStream()`, completely eliminating thread exhaustion and Chrome socket throttling.
+- **Connection Deduplication & Proactive Reconnect**:
+  - Implemented single-flight connection deduplication (`connectPromise`) in `WebTransportConnectionManager`, ensuring that dozens of parallel client requests await a single shared WebTransport connection handshake.
+  - Proactively triggers `connect()` upon `window.addEventListener('online')` events so that WebTransport is re-established in $<200\text{ms}$ before client traffic arrives.
+- **Seamless 3-Attempt Connection Retry with Backoff**:
+  - Enhanced `ProxyDispatcher` with automatic 3-attempt transparent retries on transient network disconnects ($6\text{s} \rightarrow 8\text{s} \rightarrow 10\text{s}$), allowing Firefox and other external browsers to auto-recover without user-facing connection errors.
+
+---
+
 ## [v1.34.1] - 2026-08-21
 
 ### Fast Network & Wi-Fi Loss Recovery

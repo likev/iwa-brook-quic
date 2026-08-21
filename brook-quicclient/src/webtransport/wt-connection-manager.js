@@ -109,64 +109,92 @@ export class WebTransportConnectionManager {
   }
 
   /**
-   * Establish initial WebTransport connection to server.
+   * Reset active WebTransport session and clear all hanging streams (e.g. on Wi-Fi drop or interface switch).
+   */
+  resetSession(reason = 'network_offline') {
+    if (this.transport) {
+      try { this.transport.close(); } catch (e) {}
+      this.transport = null;
+    }
+    this.connectPromise = null;
+    for (const stream of this.activeStreams) {
+      try { stream.close(); } catch (e) {}
+    }
+    this.activeStreams.clear();
+    this._setState(ConnectionState.DISCONNECTED, reason);
+  }
+
+  /**
+   * Establish WebTransport connection to server.
+   * Deduplicates concurrent connect calls to prevent multiple handshakes.
    */
   async connect(options = {}) {
     if (this.isClosed) throw new Error('WebTransportConnectionManager is closed');
-    this._setState(ConnectionState.CONNECTING, 'Connecting WebTransport session...');
+    if (this.isConnected() && !options.forceFresh) return this;
+    if (this.connectPromise) return this.connectPromise;
 
-    const WTClass = await WebTransportConnectionManager.getWebTransportClass();
-    const url = `https://${this.serverHost}:${this.serverPort}${this.path}`;
-    this._log('info', `Connecting WebTransport to ${url}...`);
+    this.connectPromise = (async () => {
+      this._setState(ConnectionState.CONNECTING, 'Connecting WebTransport session...');
 
-    const wtOptions = {};
-    if (this.serverCertificateHashes && this.serverCertificateHashes.length > 0) {
-      wtOptions.serverCertificateHashes = this.serverCertificateHashes;
-    }
+      const WTClass = await WebTransportConnectionManager.getWebTransportClass();
+      const url = `https://${this.serverHost}:${this.serverPort}${this.path}`;
+      this._log('info', `Connecting WebTransport to ${url}...`);
 
-    try {
-      this.transport = new WTClass(url, wtOptions);
-
-      // Handle close event
-      this.transport.closed
-        .then(() => {
-          if (!this.isClosed) {
-            this._setState(ConnectionState.DISCONNECTED, 'Server closed session');
-            this._log('warning', 'WebTransport session closed by remote server');
-          }
-        })
-        .catch((err) => {
-          if (!this.isClosed) {
-            this._setState(ConnectionState.ERROR, `Session error: ${err.message}`);
-            this._log('error', `WebTransport session error: ${err.message}`);
-          }
-        });
-
-      // Strict connect timeout (default 6s) prevents hanging when Wi-Fi drops or network changes
-      const connectTimeoutMs = options.connectTimeoutMs || 6000;
-      let timer = null;
-      const timeoutPromise = new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error(`WebTransport connection to ${url} timed out after ${connectTimeoutMs}ms`)), connectTimeoutMs);
-      });
+      const wtOptions = {};
+      if (this.serverCertificateHashes && this.serverCertificateHashes.length > 0) {
+        wtOptions.serverCertificateHashes = this.serverCertificateHashes;
+      }
 
       try {
-        await Promise.race([this.transport.ready, timeoutPromise]);
-      } finally {
-        if (timer) clearTimeout(timer);
-      }
+        this.transport = new WTClass(url, wtOptions);
 
-      this._setState(ConnectionState.CONNECTED);
-      this._log('success', `✅ WebTransport session established to ${url}`);
-      return this;
-    } catch (err) {
-      if (this.transport) {
-        try { this.transport.close(); } catch (e) {}
-        this.transport = null;
+        // Handle close event
+        this.transport.closed
+          .then(() => {
+            this.transport = null;
+            if (!this.isClosed) {
+              this._setState(ConnectionState.DISCONNECTED, 'Server closed session');
+              this._log('warning', 'WebTransport session closed');
+            }
+          })
+          .catch((err) => {
+            this.transport = null;
+            if (!this.isClosed) {
+              this._setState(ConnectionState.DISCONNECTED, `Session error: ${err.message}`);
+              this._log('warning', `WebTransport session closed: ${err.message}`);
+            }
+          });
+
+        // Strict connect timeout (default 5s) prevents hanging when Wi-Fi drops or network changes
+        const connectTimeoutMs = options.connectTimeoutMs || 5000;
+        let timer = null;
+        const timeoutPromise = new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error(`WebTransport connection to ${url} timed out after ${connectTimeoutMs}ms`)), connectTimeoutMs);
+        });
+
+        try {
+          await Promise.race([this.transport.ready, timeoutPromise]);
+        } finally {
+          if (timer) clearTimeout(timer);
+        }
+
+        this._setState(ConnectionState.CONNECTED);
+        this._log('success', `✅ WebTransport session established to ${url}`);
+        return this;
+      } catch (err) {
+        if (this.transport) {
+          try { this.transport.close(); } catch (e) {}
+          this.transport = null;
+        }
+        this._setState(ConnectionState.DISCONNECTED, `Failed: ${err.message}`);
+        this._log('error', `❌ Failed to connect WebTransport: ${err.message}`);
+        throw err;
       }
-      this._setState(ConnectionState.ERROR, `Failed: ${err.message}`);
-      this._log('error', `❌ Failed to connect WebTransport: ${err.message}`);
-      throw err;
-    }
+    })().finally(() => {
+      this.connectPromise = null;
+    });
+
+    return this.connectPromise;
   }
 
   /**
@@ -200,6 +228,9 @@ export class WebTransportConnectionManager {
         this.transport.createBidirectionalStream(),
         timeoutPromise
       ]);
+    } catch (err) {
+      this.resetSession('stream_allocation_failed');
+      throw err;
     } finally {
       if (streamTimer) clearTimeout(streamTimer);
     }
