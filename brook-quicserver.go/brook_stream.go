@@ -230,8 +230,15 @@ func handleEncryptedBrookStream(client StreamConn, cn []byte, rawPass, passHash 
 	// Remote -> Client (Encrypt & Send to Client)
 	go func() {
 		defer wg.Done()
-		rawBuf := make([]byte, 16384)
-		frameBuf := make([]byte, 2+16+16384+16)
+		// In official Brook stream protocol (txthinking/brook), client buffers are:
+		// TCP: 2048 bytes total (payload max: 2048 - 2 - 16 - 16 = 2014 bytes)
+		// UDP: 65507 bytes total (payload max: 65507 - 2 - 16 - 16 = 65473 bytes)
+		maxPayload := 2014
+		if !isTCP {
+			maxPayload = 65473
+		}
+		rawBuf := make([]byte, maxPayload)
+		frameBuf := make([]byte, 2+16+maxPayload+16)
 
 		for {
 			if timeout != 0 {
