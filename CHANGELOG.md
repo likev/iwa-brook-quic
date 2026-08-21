@@ -4,6 +4,20 @@ All notable changes to the **Isolated Web Apps (IWAs) Direct Sockets Suite & Bro
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.34.0] - 2026-08-21
+
+### Bug Fixes, Live Telemetry & Legacy Protocol Compatibility
+- **Downstream Throughput & Detached Buffer Telemetry Fix**:
+  - Fixed an issue where `onBytes(0, plainPayload.length)` recorded 0 received bytes because the underlying `ArrayBuffer` was detached during zero-copy `postMessage([u8.buffer])` transfers to the worker port.
+  - Pre-captured `plainLen = plainPayload.length` before transfer, restoring live download speed calculations and cumulative `Total Received` accounting in the telemetry dashboard.
+- **Dynamic Stream-Level `withoutBrookProtocol` Auto-Detection in `brook-quicserver.go`**:
+  - Implemented 100% deterministic, zero-false-positive auto-detection on incoming streams using AES-GCM MAC tag verification over the initial 18-byte header frame.
+  - Dynamically supports modern `withoutBrook=true` (SHA-256 pre-hashed) and legacy `withoutBrook=false` (raw password) clients concurrently on the same port.
+- **Legacy Brook Client Frame Capping**:
+  - Capped downstream TCP payload chunks to **2014 bytes** ($2048 - 34\text{B framing}$), eliminating `panic: runtime error: slice bounds out of range [:2415] with capacity 2048` when official `txthinking/brook` clients connect.
+
+---
+
 ## [v1.33.0] - 2026-08-21
 
 ### Architectural Evolution & High-Throughput Modernization (W3C WebTransport + Web Crypto API)

@@ -1,8 +1,8 @@
 {
   "versions": [
     {
-      "version": "1.33.0",
-      "src": "https://t.iread.fun/downloads/iwa/dist/listener-v1.33.0.swbn",
+      "version": "1.34.0",
+      "src": "https://t.iread.fun/downloads/iwa/dist/listener-v1.34.0.swbn",
       "channels": [
         "default"
       ]

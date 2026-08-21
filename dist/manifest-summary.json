@@ -1,18 +1,18 @@
 [
   {
     "name": "listener",
-    "version": "1.33.0",
+    "version": "1.34.0",
     "bundleId": "u2uwu7f3ihcmiqejcwxfkkgbwj5tjkqaxu6ohud2pbu2fbcoxveaaaic",
     "origin": "isolated-app://u2uwu7f3ihcmiqejcwxfkkgbwj5tjkqaxu6ohud2pbu2fbcoxveaaaic/",
     "bundlePath": "/root/downloads/iwa/dist/listener.swbn",
-    "versionedBundlePath": "/root/downloads/iwa/dist/listener-v1.33.0.swbn",
-    "updateUrl": "https://t.iread.fun/downloads/iwa/dist/listener-v1.33.0.swbn",
+    "versionedBundlePath": "/root/downloads/iwa/dist/listener-v1.34.0.swbn",
+    "updateUrl": "https://t.iread.fun/downloads/iwa/dist/listener-v1.34.0.swbn",
     "updateManifestPath": "/root/downloads/iwa/dist/listener-update-manifest.json",
     "updateManifest": {
       "versions": [
         {
-          "version": "1.33.0",
-          "src": "https://t.iread.fun/downloads/iwa/dist/listener-v1.33.0.swbn",
+          "version": "1.34.0",
+          "src": "https://t.iread.fun/downloads/iwa/dist/listener-v1.34.0.swbn",
           "channels": [
             "default"
           ]
@@ -22,18 +22,18 @@
   },
   {
     "name": "client",
-    "version": "1.33.0",
+    "version": "1.34.0",
     "bundleId": "n3ywd6x7rc7iqzgiwnobvhldakbliigueenvj2gew5u3bfkp6rcaaaic",
     "origin": "isolated-app://n3ywd6x7rc7iqzgiwnobvhldakbliigueenvj2gew5u3bfkp6rcaaaic/",
     "bundlePath": "/root/downloads/iwa/dist/client.swbn",
-    "versionedBundlePath": "/root/downloads/iwa/dist/client-v1.33.0.swbn",
-    "updateUrl": "https://t.iread.fun/downloads/iwa/dist/client-v1.33.0.swbn",
+    "versionedBundlePath": "/root/downloads/iwa/dist/client-v1.34.0.swbn",
+    "updateUrl": "https://t.iread.fun/downloads/iwa/dist/client-v1.34.0.swbn",
     "updateManifestPath": "/root/downloads/iwa/dist/client-update-manifest.json",
     "updateManifest": {
       "versions": [
         {
-          "version": "1.33.0",
-          "src": "https://t.iread.fun/downloads/iwa/dist/client-v1.33.0.swbn",
+          "version": "1.34.0",
+          "src": "https://t.iread.fun/downloads/iwa/dist/client-v1.34.0.swbn",
           "channels": [
             "default"
           ]
@@ -43,18 +43,18 @@
   },
   {
     "name": "brook-quicclient",
-    "version": "1.33.0",
+    "version": "1.34.0",
     "bundleId": "5uad6swnv66tot24df52mjr7nc7pmnmwmmxofkkshietmn3nthqqaaic",
     "origin": "isolated-app://5uad6swnv66tot24df52mjr7nc7pmnmwmmxofkkshietmn3nthqqaaic/",
     "bundlePath": "/root/downloads/iwa/dist/brook-quicclient.swbn",
-    "versionedBundlePath": "/root/downloads/iwa/dist/brook-quicclient-v1.33.0.swbn",
-    "updateUrl": "https://t.iread.fun/downloads/iwa/dist/brook-quicclient-v1.33.0.swbn",
+    "versionedBundlePath": "/root/downloads/iwa/dist/brook-quicclient-v1.34.0.swbn",
+    "updateUrl": "https://t.iread.fun/downloads/iwa/dist/brook-quicclient-v1.34.0.swbn",
     "updateManifestPath": "/root/downloads/iwa/dist/brook-quicclient-update-manifest.json",
     "updateManifest": {
       "versions": [
         {
-          "version": "1.33.0",
-          "src": "https://t.iread.fun/downloads/iwa/dist/brook-quicclient-v1.33.0.swbn",
+          "version": "1.34.0",
+          "src": "https://t.iread.fun/downloads/iwa/dist/brook-quicclient-v1.34.0.swbn",
           "channels": [
             "default"
           ]

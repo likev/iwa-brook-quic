@@ -341,12 +341,13 @@ export class BrookTunnel {
                 expectedPayloadLen = -1; // Reset for next frame
 
                 // Pipe plain decrypted bytes to local client
-                if (plainPayload.length > 0) {
+                const plainLen = plainPayload ? plainPayload.length : 0;
+                if (plainLen > 0) {
                   if (!hasExchangedData && onLog) {
-                    onLog('info', `${logTag} 🎯 [Brook] First target byte received for ${targetStr} (${plainPayload.length}B)`);
+                    onLog('info', `${logTag} 🎯 [Brook] First target byte received for ${targetStr} (${plainLen}B)`);
                   }
                   hasExchangedData = true;
-                  totalBytesRecv += plainPayload.length;
+                  totalBytesRecv += plainLen;
                   try {
                     const t0 = (typeof performance !== 'undefined') ? performance.now() : Date.now();
                     activeWritePromise = clientWriter.write(plainPayload);
@@ -355,7 +356,7 @@ export class BrookTunnel {
                     const waitMs = ((typeof performance !== 'undefined') ? performance.now() : Date.now()) - t0;
                     BrookTunnel.globalMetrics.recordWriterWait(waitMs);
                     resetIdleTimer(60000);
-                    if (onBytes) onBytes(0, plainPayload.length);
+                    if (onBytes) onBytes(0, plainLen);
                   } catch (err) {
                     activeWritePromise = null;
                     cleanup('client_write_error', err);
@@ -541,11 +542,12 @@ export class BrookTunnel {
             for (let offset = 0; offset < value.length; offset += CHUNK_SIZE) {
               const slice = value.subarray(offset, Math.min(offset + CHUNK_SIZE, value.length));
               const sealedChunk = await sealFrame(clientCipher, cnCopy, slice);
+              const chunkLen = sealedChunk.length;
               try {
                 await quicManager.sendStreamData(streamId, sealedChunk, false);
                 BrookTunnel.globalMetrics.uploadPendingBytes = Math.max(0, BrookTunnel.globalMetrics.uploadPendingBytes - slice.length);
-                totalBytesSent += sealedChunk.length;
-                if (onBytes) onBytes(sealedChunk.length, 0);
+                totalBytesSent += chunkLen;
+                if (onBytes) onBytes(chunkLen, 0);
               } catch (err) {
                 BrookTunnel.globalMetrics.uploadPendingBytes = Math.max(0, BrookTunnel.globalMetrics.uploadPendingBytes - (value.length - offset));
                 writeFailed = true;

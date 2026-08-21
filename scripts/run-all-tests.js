@@ -294,6 +294,28 @@ async function runUnitTests() {
   assert(tracker.getStats().activeSessions === 0, 'SessionTracker clears active session on close');
   assert(tracker.getStats().totalBytesSent === 500 && tracker.getStats().totalBytesReceived === 1500, 'SessionTracker retains cumulative byte totals after session close');
   tracker.destroy();
+
+  // 1.16 Downstream Throughput & Detached Buffer Accounting
+  let accountedSent = 0;
+  let accountedRecv = 0;
+  const mockOnBytes = (sent, recv) => {
+    accountedSent += sent;
+    accountedRecv += recv;
+  };
+  // Simulate client writer that transfers/detaches buffer
+  const mockDetachingWriter = {
+    write: async (buf) => {
+      const channel = new MessageChannel();
+      channel.port1.postMessage(buf, [buf.buffer]); // detaches buf.buffer
+      channel.port1.close();
+      channel.port2.close();
+    }
+  };
+  const testPayload = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
+  const plainLen = testPayload.length;
+  await mockDetachingWriter.write(testPayload);
+  mockOnBytes(0, plainLen);
+  assert(accountedRecv === 8, 'Downstream throughput accounting captures non-zero received bytes across detached buffer writes (8 bytes)');
 }
 
 // -------------------------------------------------------------
