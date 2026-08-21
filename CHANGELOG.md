@@ -4,6 +4,24 @@ All notable changes to the **Isolated Web Apps (IWAs) Direct Sockets Suite & Bro
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.33.0] - 2026-08-21
+
+### Architectural Evolution & High-Throughput Modernization (W3C WebTransport + Web Crypto API)
+- **W3C WebTransport API Transport Architecture**:
+  - Migrated the Brook proxy transport to the browser's native **W3C WebTransport API**, replacing the pure-JS QUIC engine (`quico`) with Chromium's native C++ QUIC/H3 networking stack.
+  - Eliminated JavaScript-level packet framing, ACK management, pacing, and congestion control overhead.
+- **Hardware-Accelerated Web Crypto API (`crypto.subtle`)**:
+  - Replaced pure JavaScript `@noble/ciphers` with the **W3C Web Crypto API** (`globalThis.crypto.subtle`), mapping cryptographic operations directly to CPU hardware instructions (AES-NI / ARMv8 Crypto).
+  - Achieved up to **499 MB/s decryption throughput** (39.7×–116× speedup over pure-JS ciphers).
+- **Default `--withoutBrookProtocol=true` Mode**:
+  - Configured `--withoutBrookProtocol=true` (SHA-256 pre-hashed password key derivation) as the default mode across both client and server, removing redundant outer encryption over TLS 1.3 encrypted QUIC streams.
+- **Unified Server (`brook-quicserver.go`)**:
+  - Concurrently serves raw QUIC clients (ALPN `h3`, `brook-quic`) and browser WebTransport clients (`/brook`) on the same UDP port with dual-protocol auto-detection.
+- **256 MB High-Throughput Receive Buffer Pipeline**:
+  - Raised downstream receive buffer headroom to 256 MB in `brook-tunnel.js`, enabling uninterrupted 100 MB+ single-stream downloads at sustained 9+ MB/s.
+
+---
+
 ## [v1.32.0] - 2026-08-20
 
 ### Performance Optimizations (Single-Thread JS, Fast AES Schedules, Pipelined Direct Sockets & O(1) In-Flight Tracking)
