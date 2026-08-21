@@ -348,8 +348,9 @@ async function runUnitTests() {
     serverPort: 4433,
     path: '/brook'
   });
-  testWtMgr.activeStreams.add({ close: () => {} });
-  assert(testWtMgr.activeStreams.size === 1, 'WebTransportConnectionManager tracks active stream session (1)');
+  testWtMgr.slots[0].activeStreams.add({ close: () => {} });
+  assert(testWtMgr.activeStreams.size === 1, 'WebTransportConnectionManager tracks active stream session across pool (1)');
+  assert(testWtMgr.slots.length === 5, 'WebTransportConnectionManager maintains 5-session connection pool');
   testWtMgr.resetSession('network_offline');
   assert(testWtMgr.activeStreams.size === 0, 'resetSession clears active streams and marks state disconnected on network drop');
   assert(testWtMgr.state === 'disconnected', 'WebTransport state is cleanly disconnected after resetSession');

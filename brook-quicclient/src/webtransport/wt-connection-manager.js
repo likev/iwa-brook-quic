@@ -20,6 +20,7 @@ export class WebTransportConnectionManager {
     serverPort,
     path = '/brook',
     serverCertificateHashes = [],
+    poolSize = 5,
     onStateChange = null,
     onLog = null
   }) {
@@ -27,20 +28,50 @@ export class WebTransportConnectionManager {
     this.serverPort = serverPort;
     this.path = path.startsWith('/') ? path : `/${path}`;
     this.serverCertificateHashes = serverCertificateHashes;
+    this.poolSize = poolSize || 5;
     this.onStateChange = onStateChange;
     this.onLog = onLog;
 
-    this.transport = null;
-    this.state = ConnectionState.DISCONNECTED;
-    this.activeStreams = new Set();
-    this.totalStreamsServed = 0;
     this.isClosed = false;
-    this.nextStreamSeq = 0;
+    this.totalStreamsServed = 0;
     this.lastActivity = Date.now();
+    this.state = ConnectionState.DISCONNECTED;
+
+    // Initialize pool of independent WebTransport session slots
+    this.slots = Array.from({ length: this.poolSize }, (_, index) => ({
+      id: index,
+      transport: null,
+      state: ConnectionState.DISCONNECTED,
+      connectPromise: null,
+      activeStreams: new Set(),
+      totalStreamsServed: 0,
+      nextStreamSeq: index * 2
+    }));
   }
 
   get serverUrl() {
     return `https://${this.serverHost}:${this.serverPort}${this.path}`;
+  }
+
+  get transport() {
+    const active = this.slots.find(s => s.state === ConnectionState.CONNECTED && s.transport !== null);
+    return active ? active.transport : (this.slots[0] ? this.slots[0].transport : null);
+  }
+
+  set transport(val) {
+    if (this.slots && this.slots[0]) {
+      this.slots[0].transport = val;
+    }
+  }
+
+  get activeStreams() {
+    const combined = new Set();
+    for (const slot of this.slots) {
+      for (const st of slot.activeStreams) {
+        combined.add(st);
+      }
+    }
+    return combined;
   }
 
   static async getWebTransportClass() {
@@ -66,6 +97,19 @@ export class WebTransportConnectionManager {
     }
   }
 
+  _updateAggregateState() {
+    const connectedCount = this.slots.filter(s => s.state === ConnectionState.CONNECTED && s.transport !== null).length;
+    const connectingCount = this.slots.filter(s => s.state === ConnectionState.CONNECTING).length;
+
+    if (connectedCount > 0) {
+      this._setState(ConnectionState.CONNECTED, `Pool: ${connectedCount}/${this.poolSize} active`);
+    } else if (connectingCount > 0) {
+      this._setState(ConnectionState.CONNECTING, `Connecting pool (${connectingCount}/${this.poolSize})...`);
+    } else {
+      this._setState(ConnectionState.DISCONNECTED, 'Pool disconnected');
+    }
+  }
+
   _log(level, message, meta = null) {
     if (this.onLog) {
       this.onLog(level, message, meta);
@@ -84,9 +128,11 @@ export class WebTransportConnectionManager {
       retries: 0
     };
 
+    const connectedCount = this.slots.filter(s => s.state === ConnectionState.CONNECTED && s.transport !== null).length;
+
     return {
-      warmStandby: this.isConnected() ? 1 : 0,
-      activeSessions: this.isConnected() ? 1 : 0,
+      warmStandby: connectedCount,
+      activeSessions: connectedCount,
       handshakes: 0,
       handshakeQueue: 0,
       hostQueueTotal: dispStats.hostQueueTotal || 0,
@@ -100,47 +146,50 @@ export class WebTransportConnectionManager {
       activeTunnels: this.activeStreams.size,
       totalStreamsServed: this.totalStreamsServed,
       retries: dispStats.retries || 0,
-      packetEvictions: 0
+      packetEvictions: 0,
+      poolSize: this.poolSize,
+      connectedPoolSessions: connectedCount
     };
   }
 
   isConnected() {
-    return this.state === ConnectionState.CONNECTED && this.transport !== null;
+    return this.slots.some(s => s.state === ConnectionState.CONNECTED && s.transport !== null);
   }
 
   /**
-   * Reset active WebTransport session and clear all hanging streams (e.g. on Wi-Fi drop or interface switch).
+   * Reset all active WebTransport sessions and clear all hanging streams.
    */
   resetSession(reason = 'network_offline') {
-    // If currently connecting, do NOT abort the connecting transport mid-handshake
-    if (this.state === ConnectionState.CONNECTED && this.transport) {
-      try { this.transport.close(); } catch (e) {}
-      this.transport = null;
+    for (const slot of this.slots) {
+      if (slot.state === ConnectionState.CONNECTED && slot.transport) {
+        try { slot.transport.close(); } catch (e) {}
+        slot.transport = null;
+      }
+      for (const stream of slot.activeStreams) {
+        try { stream.close(); } catch (e) {}
+      }
+      slot.activeStreams.clear();
+      if (slot.state !== ConnectionState.CONNECTING) {
+        slot.state = ConnectionState.DISCONNECTED;
+      }
     }
-    for (const stream of this.activeStreams) {
-      try { stream.close(); } catch (e) {}
-    }
-    this.activeStreams.clear();
-    if (this.state !== ConnectionState.CONNECTING) {
-      this._setState(ConnectionState.DISCONNECTED, reason);
-    }
+    this._updateAggregateState();
   }
 
   /**
-   * Establish WebTransport connection to server.
-   * Single-flight promise ensures all concurrent callers share the same handshake.
+   * Connect a specific pool slot with single-flight deduplication.
    */
-  async connect() {
+  async _connectSlot(slot, options = {}) {
     if (this.isClosed) throw new Error('WebTransportConnectionManager is closed');
-    if (this.isConnected()) return this;
-    if (this.connectPromise) return this.connectPromise;
+    if (slot.state === ConnectionState.CONNECTED && slot.transport) return slot;
+    if (slot.connectPromise) return slot.connectPromise;
 
-    this._setState(ConnectionState.CONNECTING, 'Connecting WebTransport session...');
+    slot.state = ConnectionState.CONNECTING;
 
-    this.connectPromise = (async () => {
+    slot.connectPromise = (async () => {
       const WTClass = await WebTransportConnectionManager.getWebTransportClass();
       const url = `https://${this.serverHost}:${this.serverPort}${this.path}`;
-      this._log('info', `Connecting WebTransport to ${url}...`);
+      this._log('info', `Connecting WebTransport pool session #${slot.id + 1}/${this.poolSize} to ${url}...`);
 
       const wtOptions = {};
       if (this.serverCertificateHashes && this.serverCertificateHashes.length > 0) {
@@ -152,97 +201,136 @@ export class WebTransportConnectionManager {
 
       try {
         localTransport = new WTClass(url, wtOptions);
-        this.transport = localTransport;
+        slot.transport = localTransport;
 
         // Handle close event
         localTransport.closed
           .then(() => {
-            if (this.transport === localTransport) {
-              this.transport = null;
+            if (slot.transport === localTransport) {
+              slot.transport = null;
+              slot.state = ConnectionState.DISCONNECTED;
               if (!this.isClosed) {
-                this._setState(ConnectionState.DISCONNECTED, 'Server closed session');
-                this._log('warning', 'WebTransport session closed');
+                this._log('warning', `WebTransport pool session #${slot.id + 1} closed`);
+                this._updateAggregateState();
               }
             }
           })
           .catch((err) => {
-            if (this.transport === localTransport) {
-              this.transport = null;
+            if (slot.transport === localTransport) {
+              slot.transport = null;
+              slot.state = ConnectionState.DISCONNECTED;
               if (!this.isClosed) {
-                this._setState(ConnectionState.DISCONNECTED, `Session error: ${err.message}`);
-                this._log('warning', `WebTransport session closed: ${err.message}`);
+                this._log('warning', `WebTransport pool session #${slot.id + 1} error: ${err.message}`);
+                this._updateAggregateState();
               }
             }
           });
 
         // Strict connect timeout (default 5s)
-        const connectTimeoutMs = 5000;
+        const connectTimeoutMs = options.connectTimeoutMs || 5000;
         const timeoutPromise = new Promise((_, reject) => {
-          timer = setTimeout(() => reject(new Error(`WebTransport connection to ${url} timed out after ${connectTimeoutMs}ms`)), connectTimeoutMs);
+          timer = setTimeout(() => reject(new Error(`WebTransport pool #${slot.id + 1} timed out after ${connectTimeoutMs}ms`)), connectTimeoutMs);
         });
 
         await Promise.race([localTransport.ready, timeoutPromise]);
         if (timer) clearTimeout(timer);
 
-        this.transport = localTransport;
-        this._setState(ConnectionState.CONNECTED);
-        this._log('success', `✅ WebTransport session established to ${url}`);
-        return this;
+        slot.transport = localTransport;
+        slot.state = ConnectionState.CONNECTED;
+        this._log('success', `✅ WebTransport pool session #${slot.id + 1}/${this.poolSize} established`);
+        this._updateAggregateState();
+        return slot;
       } catch (err) {
         if (timer) clearTimeout(timer);
         if (localTransport) {
           try { localTransport.close(); } catch (e) {}
         }
-        if (this.transport === localTransport) {
-          this.transport = null;
+        if (slot.transport === localTransport) {
+          slot.transport = null;
         }
-        this._setState(ConnectionState.DISCONNECTED, `Failed: ${err.message}`);
-        this._log('error', `❌ Failed to connect WebTransport: ${err.message}`);
+        slot.state = ConnectionState.DISCONNECTED;
+        this._updateAggregateState();
         throw err;
       } finally {
-        this.connectPromise = null;
+        slot.connectPromise = null;
       }
     })();
 
-    return this.connectPromise;
+    return slot.connectPromise;
   }
 
   /**
-   * Create an on-demand bidirectional stream session for a proxy tunnel.
-   * Auto-connects WebTransport session if disconnected.
+   * Establish WebTransport connection pool across all slots in parallel.
+   */
+  async connect(options = {}) {
+    if (this.isClosed) throw new Error('WebTransportConnectionManager is closed');
+    this._setState(ConnectionState.CONNECTING, `Connecting WebTransport pool (${this.poolSize} sessions)...`);
+
+    const results = await Promise.allSettled(this.slots.map(s => this._connectSlot(s, options)));
+    const connectedCount = this.slots.filter(s => s.state === ConnectionState.CONNECTED && s.transport !== null).length;
+
+    if (connectedCount === 0) {
+      const firstError = results.find(r => r.status === 'rejected')?.reason;
+      this._setState(ConnectionState.DISCONNECTED, `All ${this.poolSize} pool connections failed`);
+      throw firstError || new Error(`Failed to connect WebTransport pool (${this.poolSize} sessions)`);
+    }
+
+    this._updateAggregateState();
+    return this;
+  }
+
+  /**
+   * Create an on-demand bidirectional stream session.
+   * Dispatches request to the least-loaded active WebTransport connection in the pool.
    */
   async createSession(options = {}) {
     if (this.isClosed) throw new Error('WebTransportConnectionManager is closed');
 
-    // Ensure underlying WebTransport session is active
-    if (!this.isConnected()) {
-      await this.connect();
+    // 1. Find all active connected slots
+    let connectedSlots = this.slots.filter(s => s.state === ConnectionState.CONNECTED && s.transport !== null);
+
+    // 2. If no slots are connected, connect pool now
+    if (connectedSlots.length === 0) {
+      await this.connect(options);
+      connectedSlots = this.slots.filter(s => s.state === ConnectionState.CONNECTED && s.transport !== null);
     }
 
-    if (!this.transport || this.state !== ConnectionState.CONNECTED) {
-      throw new Error('WebTransport is not connected');
+    if (connectedSlots.length === 0) {
+      throw new Error('No active WebTransport connections available in pool');
     }
 
-    const streamId = (this.nextStreamSeq += 4);
+    // 3. Proactively background-reconnect any disconnected slots to keep pool full
+    for (const slot of this.slots) {
+      if (slot.state === ConnectionState.DISCONNECTED && !slot.connectPromise) {
+        this._connectSlot(slot, options).catch(() => {});
+      }
+    }
+
+    // 4. Select least-loaded slot (fewest active streams)
+    connectedSlots.sort((a, b) => a.activeStreams.size - b.activeStreams.size);
+    const chosenSlot = connectedSlots[0];
+
+    const streamId = (chosenSlot.nextStreamSeq += 4);
 
     // Strict stream creation timeout (default 5s)
     const streamTimeoutMs = options.streamTimeoutMs || 5000;
     let streamTimer = null;
     const timeoutPromise = new Promise((_, reject) => {
-      streamTimer = setTimeout(() => reject(new Error(`WebTransport stream allocation timed out after ${streamTimeoutMs}ms`)), streamTimeoutMs);
+      streamTimer = setTimeout(() => reject(new Error(`WebTransport stream allocation on pool #${chosenSlot.id + 1} timed out after ${streamTimeoutMs}ms`)), streamTimeoutMs);
     });
 
     let bidiStream;
     try {
       bidiStream = await Promise.race([
-        this.transport.createBidirectionalStream(),
+        chosenSlot.transport.createBidirectionalStream(),
         timeoutPromise
       ]);
     } catch (err) {
-      if (this.transport) {
-        this._setState(ConnectionState.DISCONNECTED, 'Stream allocation failed');
-        try { this.transport.close(); } catch (e) {}
-        this.transport = null;
+      if (chosenSlot.transport) {
+        chosenSlot.state = ConnectionState.DISCONNECTED;
+        try { chosenSlot.transport.close(); } catch (e) {}
+        chosenSlot.transport = null;
+        this._updateAggregateState();
       }
       throw err;
     } finally {
@@ -253,12 +341,13 @@ export class WebTransportConnectionManager {
       bidiStream,
       streamId,
       onClose: () => {
-        this.activeStreams.delete(streamSession);
+        chosenSlot.activeStreams.delete(streamSession);
       },
       onLog: this.onLog
     });
 
-    this.activeStreams.add(streamSession);
+    chosenSlot.activeStreams.add(streamSession);
+    chosenSlot.totalStreamsServed++;
     this.totalStreamsServed++;
     this.lastActivity = Date.now();
 
@@ -315,16 +404,19 @@ export class WebTransportConnectionManager {
     this.isClosed = true;
     this._setState(ConnectionState.DISCONNECTED, 'Stopped by user');
 
-    for (const streamSession of Array.from(this.activeStreams)) {
-      try { streamSession.close(); } catch (e) {}
-    }
-    this.activeStreams.clear();
+    for (const slot of this.slots) {
+      for (const streamSession of Array.from(slot.activeStreams)) {
+        try { streamSession.close(); } catch (e) {}
+      }
+      slot.activeStreams.clear();
 
-    if (this.transport) {
-      try {
-        this.transport.close();
-      } catch (e) {}
-      this.transport = null;
+      if (slot.transport) {
+        try {
+          slot.transport.close();
+        } catch (e) {}
+        slot.transport = null;
+      }
+      slot.state = ConnectionState.DISCONNECTED;
     }
   }
 }
