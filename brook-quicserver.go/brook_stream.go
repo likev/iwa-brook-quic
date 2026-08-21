@@ -25,25 +25,75 @@ type StreamConn interface {
 	RemoteAddr() net.Addr
 }
 
+type bufferedStreamConn struct {
+	StreamConn
+	reader io.Reader
+}
+
+func (b *bufferedStreamConn) Read(p []byte) (int, error) {
+	return b.reader.Read(p)
+}
+
+func newBufferedStreamConn(conn StreamConn, initial []byte) *bufferedStreamConn {
+	return &bufferedStreamConn{
+		StreamConn: conn,
+		reader:     io.MultiReader(bytes.NewReader(initial), conn),
+	}
+}
+
 // HandleBrookStream processes an incoming Brook stream from either QUIC or WebTransport.
 func HandleBrookStream(client StreamConn, password []byte, withoutBrook bool, tcpTimeout, udpTimeout int) error {
 	defer client.Close()
 
-	if withoutBrook {
-		return handleSimpleBrookStream(client, password, tcpTimeout, udpTimeout)
-	}
-	return handleEncryptedBrookStream(client, password, tcpTimeout, udpTimeout)
-}
-
-func handleEncryptedBrookStream(client StreamConn, password []byte, tcpTimeout, udpTimeout int) error {
 	if tcpTimeout != 0 {
 		_ = client.SetDeadline(time.Now().Add(time.Duration(tcpTimeout) * time.Second))
 	}
 
-	// 1. Read Client Nonce (12 bytes)
-	cn := make([]byte, 12)
-	if _, err := io.ReadFull(client, cn); err != nil {
+	// 1. Read first 12 bytes (client nonce in Brook framing, or first 12 bytes of SHA256 in simple mode)
+	first12 := make([]byte, 12)
+	if _, err := io.ReadFull(client, first12); err != nil {
 		return fmt.Errorf("read client nonce failed: %w", err)
+	}
+
+	var passHash []byte
+	if len(password) == 32 {
+		passHash = password
+	} else {
+		passHash = SHA256Bytes(password)
+	}
+
+	// 2. Check if first 12 bytes match first 12 bytes of passHash
+	if bytes.Equal(first12, passHash[:12]) {
+		// Read remaining 22 bytes (20B of password hash + 2B payload length)
+		rem22 := make([]byte, 22)
+		if _, err := io.ReadFull(client, rem22); err == nil && bytes.Equal(rem22[:20], passHash[12:32]) {
+			// Verified simple unencrypted Brook protocol
+			header34 := append(first12, rem22...)
+			bConn := newBufferedStreamConn(client, header34)
+			return handleSimpleBrookStream(bConn, passHash, tcpTimeout, udpTimeout)
+		} else {
+			// If remainder did not match, rewind stream and proceed as encrypted
+			rewind := append(first12, rem22...)
+			bConn := newBufferedStreamConn(client, rewind)
+			return handleEncryptedBrookStream(bConn, nil, password, tcpTimeout, udpTimeout)
+		}
+	}
+
+	// 3. Normal Brook framed encrypted stream
+	return handleEncryptedBrookStream(client, first12, password, tcpTimeout, udpTimeout)
+}
+
+func handleEncryptedBrookStream(client StreamConn, cn []byte, password []byte, tcpTimeout, udpTimeout int) error {
+	if tcpTimeout != 0 {
+		_ = client.SetDeadline(time.Now().Add(time.Duration(tcpTimeout) * time.Second))
+	}
+
+	// 1. If cn was not pre-read, read it now
+	if len(cn) != 12 {
+		cn = make([]byte, 12)
+		if _, err := io.ReadFull(client, cn); err != nil {
+			return fmt.Errorf("read client nonce failed: %w", err)
+		}
 	}
 
 	// 2. Derive Client Key

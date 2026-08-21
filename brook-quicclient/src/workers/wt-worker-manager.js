@@ -8,7 +8,7 @@ export class WtWorkerManager {
     serverPort,
     path = '/brook',
     password,
-    withoutBrook = false,
+    withoutBrook = true,
     clockOffsetSec = 0,
     onStateChange = null,
     onLog = null

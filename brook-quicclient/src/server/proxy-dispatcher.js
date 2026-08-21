@@ -17,7 +17,7 @@ export class ProxyDispatcher {
     quicManager,
     sessionTracker,
     password,
-    withoutBrook = false,
+    withoutBrook = true,
     clockOffsetSec = 0,
     onLog
   }) {

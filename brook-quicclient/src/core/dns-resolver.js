@@ -29,7 +29,7 @@ export class DnsResolver {
    * @param {QuicConnectionManager} quicManager
    * @param {string} password
    * @param {Object|number} options - Options object or timeoutMs
-   * @param {boolean} [options.withoutBrook=false]
+   * @param {boolean} [options.withoutBrook=true]
    * @param {number} [options.clockOffsetSec=0]
    * @param {number} [options.timeoutMs=3500]
    * @returns {Promise<string|null>}
@@ -43,7 +43,7 @@ export class DnsResolver {
     if (cleanHost === 'localhost') return '127.0.0.1';
 
     let timeoutMs = 2000;
-    let withoutBrook = false;
+    let withoutBrook = true;
     let clockOffsetSec = 0;
 
     if (typeof options === 'number') {
@@ -115,7 +115,7 @@ export class DnsResolver {
     this.pending.clear();
   }
 
-  static async _resolveViaBrook(host, quicManager, password, { timeoutMs = 2000, withoutBrook = false, clockOffsetSec = 0 } = {}) {
+  static async _resolveViaBrook(host, quicManager, password, { timeoutMs = 2000, withoutBrook = true, clockOffsetSec = 0 } = {}) {
     let session = null;
     let streamId = null;
     try {

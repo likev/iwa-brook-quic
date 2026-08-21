@@ -63,7 +63,7 @@ export class BrookTunnel {
     dstBytes,
     leftover = new Uint8Array(0),
     password,
-    withoutBrook = false,
+    withoutBrook = true,
     clockOffsetSec = 0,
     targetStr,
     sessionId = '',

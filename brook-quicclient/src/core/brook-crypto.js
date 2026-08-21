@@ -52,10 +52,10 @@ export async function sha256(data) {
  * @param {string|Uint8Array} password - Server password
  * @param {Uint8Array} nonce12 - 12-byte nonce (salt)
  * @param {string|Uint8Array} info - HKDF info string (default: "brook")
- * @param {boolean} withoutBrook - Whether to pre-hash password with SHA-256
+ * @param {boolean} [withoutBrook=true] - Whether to pre-hash password with SHA-256 (default: true)
  * @returns {Promise<CryptoKey>} Derived AES-GCM CryptoKey
  */
-export async function deriveKey(password, nonce12, info = 'brook', withoutBrook = false) {
+export async function deriveKey(password, nonce12, info = 'brook', withoutBrook = true) {
   let pwdBytes = typeof password === 'string' ? new TextEncoder().encode(password) : password;
   if (withoutBrook) {
     pwdBytes = await sha256(pwdBytes);
@@ -88,10 +88,10 @@ export async function deriveKey(password, nonce12, info = 'brook', withoutBrook 
  * @param {string|Uint8Array} password - Server password
  * @param {Uint8Array} nonce12 - 12-byte nonce (salt)
  * @param {string|Uint8Array} info - HKDF info string (default: "brook")
- * @param {boolean} withoutBrook - Whether to pre-hash password with SHA-256
+ * @param {boolean} [withoutBrook=true] - Whether to pre-hash password with SHA-256 (default: true)
  * @returns {Promise<Uint8Array>} 32-byte raw key buffer
  */
-export async function deriveKeyBytes(password, nonce12, info = 'brook', withoutBrook = false) {
+export async function deriveKeyBytes(password, nonce12, info = 'brook', withoutBrook = true) {
   let pwdBytes = typeof password === 'string' ? new TextEncoder().encode(password) : password;
   if (withoutBrook) {
     pwdBytes = await sha256(pwdBytes);

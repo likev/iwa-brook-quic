@@ -42,7 +42,7 @@ async function runWtTunnel({
   serverPort,
   path = '/brook',
   password,
-  withoutBrook = false,
+  withoutBrook = true,
   clockOffsetSec = 0,
   port
 }) {

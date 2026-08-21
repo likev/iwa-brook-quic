@@ -51,11 +51,23 @@ async function runUnitTests() {
   // 1.1 Web Crypto Key Derivation & Hashing
   const password = '271828brook';
   const nonce = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
-  const cryptoKey = await deriveKey(password, nonce, 'brook', false);
-  assert(cryptoKey instanceof CryptoKey, 'deriveKey returns native Web Crypto CryptoKey');
 
-  const rawKey = await deriveKeyBytes(password, nonce, 'brook', false);
-  assert(rawKey instanceof Uint8Array && rawKey.length === 32, 'deriveKeyBytes returns 32-byte raw key buffer');
+  // Test WithoutBrook = true (Default)
+  const defaultCryptoKey = await deriveKey(password, nonce);
+  assert(defaultCryptoKey instanceof CryptoKey, 'deriveKey returns native Web Crypto CryptoKey with default withoutBrook=true');
+
+  const defaultRawKey = await deriveKeyBytes(password, nonce);
+  assert(defaultRawKey instanceof Uint8Array && defaultRawKey.length === 32, 'deriveKeyBytes returns 32-byte key with default withoutBrook=true');
+
+  const manualSha256 = await sha256(new TextEncoder().encode(password));
+  const derivedFromHash = await deriveKeyBytes(manualSha256, nonce, 'brook', false);
+  assert(Buffer.from(defaultRawKey).equals(Buffer.from(derivedFromHash)), 'Default deriveKey matches manual SHA256 pre-hashed password key');
+
+  // Test WithoutBrook = false (Legacy raw password)
+  const legacyCryptoKey = await deriveKey(password, nonce, 'brook', false);
+  assert(legacyCryptoKey instanceof CryptoKey, 'deriveKey returns native CryptoKey with withoutBrook=false');
+  const legacyRawKey = await deriveKeyBytes(password, nonce, 'brook', false);
+  assert(!Buffer.from(defaultRawKey).equals(Buffer.from(legacyRawKey)), 'WithoutBrook=true produces different key from withoutBrook=false');
 
   const hash = await sha256(new TextEncoder().encode('hello'));
   assert(hash instanceof Uint8Array && hash.length === 32, 'sha256 returns 32-byte digest');
@@ -68,18 +80,18 @@ async function runUnitTests() {
   // 1.3 Frame Sealing & Decryption (Round-Trip)
   const payload = new TextEncoder().encode('Hello Brook WebTransport');
   const cn = new Uint8Array(nonce);
-  const sealed = await sealFrame(cryptoKey, cn, payload);
+  const sealed = await sealFrame(defaultCryptoKey, cn, payload);
   assert(sealed.length === 18 + payload.length + 16, `Sealed frame length is correct (${sealed.length}B)`);
 
   const sn = new Uint8Array(nonce);
-  const openLen = await openLength(cryptoKey, sn, sealed.slice(0, 18));
+  const openLen = await openLength(defaultCryptoKey, sn, sealed.slice(0, 18));
   assert(openLen === payload.length, `Decrypted frame length matches original (${openLen} == ${payload.length})`);
 
-  const openedPayload = await openPayload(cryptoKey, sn, sealed.slice(18));
+  const openedPayload = await openPayload(defaultCryptoKey, sn, sealed.slice(18));
   assert(new TextDecoder().decode(openedPayload) === 'Hello Brook WebTransport', 'Decrypted payload matches original string');
 
   // 1.4 BrookCipher Class
-  const cipher = new BrookCipher(cryptoKey);
+  const cipher = new BrookCipher(defaultCryptoKey);
   const cn2 = new Uint8Array(nonce);
   const sealedFast = await sealFrame(cipher, cn2, payload);
   assert(sealedFast.length === sealed.length, 'BrookCipher sealed frame length matches standard format');
@@ -318,7 +330,10 @@ async function runE2ETests() {
     '-l', `127.0.0.1:${SERVER_PORT}`,
     '-p', PASSWORD
   ]);
-  serverProcess.stderr.on('data', d => {});
+  serverProcess.stdout.on('data', d => console.log('[GoServer]', d.toString().trim()));
+  serverProcess.stderr.on('data', d => console.error('[GoServer Err]', d.toString().trim()));
+
+  await new Promise(r => setTimeout(r, 1000));
 
   async function waitForPort(port, host = '127.0.0.1', timeoutMs = 5000) {
     const start = Date.now();
@@ -348,62 +363,10 @@ async function runE2ETests() {
     '-server', `https://127.0.0.1:${SERVER_PORT}/brook`,
     '-listen', `127.0.0.1:${BRIDGE_PORT}`
   ]);
-  bridgeProcess.stderr.on('data', d => {});
+  bridgeProcess.stdout.on('data', d => console.log('[Bridge]', d.toString().trim()));
+  bridgeProcess.stderr.on('data', d => console.error('[Bridge Err]', d.toString().trim()));
 
   await waitForPort(BRIDGE_PORT);
-
-  // Helper to open a WebTransport stream through the bridge
-  function openWtStreamSession() {
-    return new Promise((resolve, reject) => {
-      const tcp = net.createConnection({ host: '127.0.0.1', port: BRIDGE_PORT }, () => {
-        let streamCallbacks = null;
-        let isClosed = false;
-
-        tcp.on('data', (chunk) => {
-          if (streamCallbacks && streamCallbacks.onData) {
-            streamCallbacks.onData(new Uint8Array(chunk), false);
-          }
-        });
-        tcp.on('end', () => {
-          if (streamCallbacks && streamCallbacks.onData) {
-            streamCallbacks.onData(new Uint8Array(0), true);
-          }
-          if (streamCallbacks && streamCallbacks.onClose) {
-            streamCallbacks.onClose();
-          }
-          isClosed = true;
-        });
-        tcp.on('error', (err) => {
-          if (streamCallbacks && streamCallbacks.onError) {
-            streamCallbacks.onError(err);
-          }
-          isClosed = true;
-        });
-
-        const session = {
-          allocateStreamId: () => 0,
-          registerStream: (id, cb) => { streamCallbacks = cb; },
-          unregisterStream: () => {},
-          ensureConnected: async () => {},
-          sendStreamData: async (id, data, fin) => {
-            if (data && data.length > 0) {
-              await new Promise((res, rej) => {
-                tcp.write(Buffer.from(data.buffer, data.byteOffset, data.byteLength), (err) => {
-                  if (err) rej(err); else res();
-                });
-              });
-            }
-            if (fin) {
-              tcp.end();
-            }
-          },
-          close: async () => { tcp.destroy(); }
-        };
-        resolve(session);
-      });
-      tcp.on('error', reject);
-    });
-  }
 
   function createSocketAdapter(socket) {
     let readResolve = null;
@@ -465,6 +428,54 @@ async function runE2ETests() {
     return { reader, writer };
   }
 
+  // Helper to open a WebTransport stream through the bridge
+  async function openWtStreamSession() {
+    const socket = new net.Socket();
+    await new Promise((resolve, reject) => {
+      socket.connect(BRIDGE_PORT, '127.0.0.1', resolve);
+      socket.on('error', reject);
+    });
+
+    const { reader, writer } = createSocketAdapter(socket);
+    const streamHandlers = new Map();
+
+    (async () => {
+      try {
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) {
+            for (const h of streamHandlers.values()) {
+              if (h.onData) h.onData(new Uint8Array(0), true);
+              if (h.onClose) h.onClose();
+            }
+            break;
+          }
+          if (value && value.length > 0) {
+            for (const h of streamHandlers.values()) {
+              if (h.onData) h.onData(value, false);
+            }
+          }
+        }
+      } catch (e) {
+        for (const h of streamHandlers.values()) {
+          if (h.onError) h.onError(e);
+        }
+      }
+    })();
+
+    return {
+      allocateStreamId: () => 0,
+      registerStream: (id, handlers) => streamHandlers.set(id, handlers),
+      unregisterStream: (id) => streamHandlers.delete(id),
+      ensureConnected: async () => {},
+      sendStreamData: async (id, data, fin = false) => {
+        if (data && data.length > 0) await writer.write(data);
+        if (fin) await writer.close();
+      },
+      close: () => socket.destroy()
+    };
+  }
+
   // 2.4 Start SOCKS5 & HTTP Proxy Listeners
   const socks5Server = net.createServer(async (socket) => {
     const { reader, writer } = createSocketAdapter(socket);
@@ -475,7 +486,7 @@ async function runE2ETests() {
       const { dstBytes, targetStr, leftover, sendSuccess, sendFailure } = await Socks5Parser.handleHandshake(initialChunk, reader, writer);
       const wtSession = await openWtStreamSession();
 
-      await BrookTunnel.run({
+      const outcome = await BrookTunnel.run({
         clientReader: reader,
         clientWriter: writer,
         quicManager: wtSession,
@@ -484,9 +495,14 @@ async function runE2ETests() {
         password: PASSWORD,
         targetStr,
         sendSuccess,
-        sendFailure
+        sendFailure,
+        onLog: (lvl, msg) => console.log(`[SOCKS5 ${lvl}]`, msg)
       });
+      if (!outcome.success) {
+        console.error('[SOCKS5 Outcome Fail]', outcome);
+      }
     } catch (e) {
+      console.error('[SOCKS5 Handler Error]', e);
       socket.destroy();
     }
   });

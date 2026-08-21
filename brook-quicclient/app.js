@@ -68,7 +68,7 @@ async function bootstrap() {
             serverPort: config.serverPort,
             path: serverPath,
             password: config.password,
-            withoutBrook: config.withoutBrook,
+            withoutBrook: config.withoutBrook !== undefined ? config.withoutBrook : true,
             clockOffsetSec: clockDriftSec,
             onStateChange: (state, details) => {
               if (uiController) {
@@ -125,7 +125,7 @@ async function bootstrap() {
             quicManager: fallbackWtManager,
             sessionTracker,
             password: config.password,
-            withoutBrook: config.withoutBrook,
+            withoutBrook: config.withoutBrook !== undefined ? config.withoutBrook : true,
             clockOffsetSec: clockDriftSec,
             onLog: (lvl, msg, meta) => logStream.add(lvl, msg, meta)
           });

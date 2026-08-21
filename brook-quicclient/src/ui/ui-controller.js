@@ -209,7 +209,11 @@ export class UiController {
         if (this.inputSocks5Port) this.inputSocks5Port.value = s5;
         if (cfg.httpPort && this.inputHttpPort) this.inputHttpPort.value = cfg.httpPort;
         if (cfg.autoDetect !== undefined && this.toggleAutoDetect) this.toggleAutoDetect.checked = cfg.autoDetect;
-        if (cfg.withoutBrook !== undefined && this.toggleWithoutBrook) this.toggleWithoutBrook.checked = cfg.withoutBrook;
+        if (cfg.withoutBrook !== undefined && this.toggleWithoutBrook) {
+          this.toggleWithoutBrook.checked = cfg.withoutBrook;
+        } else if (this.toggleWithoutBrook) {
+          this.toggleWithoutBrook.checked = true;
+        }
       } catch (e) {}
     }
     this._updatePortInputVisibility();
@@ -222,7 +226,7 @@ export class UiController {
       socks5Port: this.inputSocks5Port?.value,
       httpPort: this.inputHttpPort?.value,
       autoDetect: this.toggleAutoDetect?.checked,
-      withoutBrook: this.toggleWithoutBrook?.checked
+      withoutBrook: this.toggleWithoutBrook ? this.toggleWithoutBrook.checked : true
     };
     localStorage.setItem('brook_iwa_config', JSON.stringify(cfg));
   }
@@ -250,7 +254,7 @@ export class UiController {
       socks5Port,
       httpPort,
       autoDetectMode: !!this.toggleAutoDetect?.checked,
-      withoutBrook: !!this.toggleWithoutBrook?.checked
+      withoutBrook: this.toggleWithoutBrook ? !!this.toggleWithoutBrook.checked : true
     };
   }
 

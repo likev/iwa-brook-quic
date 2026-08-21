@@ -15,7 +15,8 @@ func main() {
 	flagAddr := flag.String("l", "", "Listen address (e.g. :4433 or 0.0.0.0:4433)")
 	flagPassword := flag.String("p", "", "Brook secret password")
 	flagDomain := flag.String("domain", "", "Domain name for TLS autocert")
-	flagWithoutBrook := flag.Bool("withoutbrook", false, "Enable WithoutBrook unencrypted stream mode")
+	flagWithoutBrookProtocol := flag.Bool("withoutBrookProtocol", true, "Enable WithoutBrook protocol mode (default true)")
+	flagWithoutBrook := flag.Bool("withoutbrook", true, "Enable WithoutBrook protocol mode (alias for withoutBrookProtocol, default true)")
 	flagTCPTimeout := flag.Int("tcp-timeout", 0, "TCP connection idle timeout in seconds (0 for no timeout)")
 	flagUDPTimeout := flag.Int("udp-timeout", 60, "UDP connection timeout in seconds")
 	flag.Parse()
@@ -52,11 +53,17 @@ func main() {
 		domain = os.Getenv("DOMAIN")
 	}
 
-	withoutBrook := *flagWithoutBrook
-	if !withoutBrook {
-		if wb := os.Getenv("WITHOUT_BROOK"); wb == "true" || wb == "1" {
-			withoutBrook = true
-		}
+	withoutBrook := true
+	if flagWithoutBrookProtocol != nil && !*flagWithoutBrookProtocol {
+		withoutBrook = false
+	}
+	if flagWithoutBrook != nil && !*flagWithoutBrook {
+		withoutBrook = false
+	}
+	if wb := os.Getenv("WITHOUT_BROOK_PROTOCOL"); wb == "false" || wb == "0" {
+		withoutBrook = false
+	} else if wb := os.Getenv("WITHOUT_BROOK"); wb == "false" || wb == "0" {
+		withoutBrook = false
 	}
 
 	tcpTimeout := *flagTCPTimeout
