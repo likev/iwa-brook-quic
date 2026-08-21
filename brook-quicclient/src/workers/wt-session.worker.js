@@ -55,56 +55,140 @@ async function runWtTunnel({
   }
 
   const bridge = createPortStreamBridge(port);
+  let proxyReplied = false;
+  let clientDataConsumed = false;
+
+  const sendSuccessOnce = async () => {
+    if (!proxyReplied) {
+      proxyReplied = true;
+      try { await bridge.sendSuccess(); } catch (e) {}
+    }
+  };
+
+  const sendFailureOnce = async (errorCode = 0x05) => {
+    if (!proxyReplied) {
+      proxyReplied = true;
+      try { await bridge.sendFailure(errorCode); } catch (e) {}
+    }
+  };
+
+  const MAX_ATTEMPTS = 3;
+  let finalOutcome = null;
+  let lastError = null;
 
   try {
-    log('info', `Opening WebTransport stream to ${serverHost}:${serverPort}${path} for ${targetStr}`);
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      if (isClosed) break;
 
-    wtManager = new WebTransportConnectionManager({
-      serverHost,
-      serverPort,
-      path,
-      onLog: (lvl, msg, meta) => log(lvl, msg, meta)
-    });
+      const isFinalAttempt = (attempt === MAX_ATTEMPTS);
+      const attemptTimeoutMs = attempt === 1 ? 4000 : (attempt === 2 ? 6000 : 8000);
 
-    streamSession = await wtManager.createSession({
-      connectTimeoutMs: Math.min(dialTimeoutMs, 6000),
-      streamTimeoutMs: 5000
-    });
+      try {
+        if (wtManager) {
+          try { await wtManager.close(); } catch (e) {}
+          wtManager = null;
+        }
 
-    const outcome = await BrookTunnel.run({
-      clientReader: bridge.clientReader,
-      clientWriter: bridge.clientWriter,
-      quicManager: streamSession,
-      dstBytes,
-      leftover: leftover ? (leftover instanceof Uint8Array ? leftover : new Uint8Array(leftover)) : new Uint8Array(0),
-      password,
-      withoutBrook: Boolean(withoutBrook),
-      clockOffsetSec: clockOffsetSec || 0,
-      targetStr,
-      sessionId,
-      sendSuccess: bridge.sendSuccess,
-      sendFailure: bridge.sendFailure,
-      dialTimeoutMs,
-      onBytes: (sent, recv) => {
-        self.postMessage({
-          type: 'BYTES',
-          sessionId,
-          sent,
-          recv
+        wtManager = new WebTransportConnectionManager({
+          serverHost,
+          serverPort,
+          path,
+          onLog: (lvl, msg, meta) => log(lvl, msg, meta)
         });
-      },
-      onLog: (lvl, msg, meta) => log(lvl, msg, meta)
-    });
 
-    self.postMessage({
-      type: 'DONE',
-      sessionId,
-      targetStr,
-      outcome
-    });
+        streamSession = await wtManager.createSession({
+          connectTimeoutMs: attemptTimeoutMs,
+          streamTimeoutMs: 4000,
+          forceFresh: attempt > 1
+        });
+      } catch (sessErr) {
+        lastError = sessErr;
+        log('warning', `⚠️ [Attempt ${attempt}/${MAX_ATTEMPTS}] Connection to WebTransport server failed: ${sessErr.message}`);
+        if (isFinalAttempt) break;
+        await new Promise(r => setTimeout(r, 400));
+        continue;
+      }
+
+      try {
+        const outcome = await BrookTunnel.run({
+          clientReader: bridge.clientReader,
+          clientWriter: bridge.clientWriter,
+          quicManager: streamSession,
+          dstBytes,
+          leftover: leftover ? (leftover instanceof Uint8Array ? leftover : new Uint8Array(leftover)) : new Uint8Array(0),
+          password,
+          withoutBrook: Boolean(withoutBrook),
+          clockOffsetSec: clockOffsetSec || 0,
+          targetStr,
+          sessionId,
+          sendSuccess: sendSuccessOnce,
+          sendFailure: isFinalAttempt ? sendFailureOnce : null,
+          dialTimeoutMs: attemptTimeoutMs,
+          closeClientStreams: isFinalAttempt,
+          onClientDataRead: () => {
+            clientDataConsumed = true;
+          },
+          onBytes: (sent, recv) => {
+            self.postMessage({
+              type: 'BYTES',
+              sessionId,
+              sent,
+              recv
+            });
+          },
+          onLog: (lvl, msg, meta) => log(lvl, msg, meta)
+        });
+
+        finalOutcome = outcome;
+
+        if (outcome.success) {
+          lastError = null;
+          break;
+        } else {
+          lastError = outcome.error || new Error(`Brook tunnel failed (${outcome.kind})`);
+          if (streamSession) {
+            try { streamSession.close(); } catch (e) {}
+            streamSession = null;
+          }
+
+          // If client data was already consumed or server started sending payload or client aborted, do not retry
+          if (clientDataConsumed || proxyReplied || (outcome.bytesReceived && outcome.bytesReceived > 0) || outcome.kind === 'client_abort' || outcome.kind === 'client_read_error' || outcome.kind === 'rx_overflow') {
+            break;
+          }
+
+          if (attempt < MAX_ATTEMPTS) {
+            log('info', `🔄 Retrying WebTransport tunnel for ${targetStr} (attempt ${attempt + 1}/${MAX_ATTEMPTS})...`);
+            await new Promise(r => setTimeout(r, 400));
+          }
+        }
+      } catch (tunnelErr) {
+        lastError = tunnelErr;
+        if (clientDataConsumed || proxyReplied || isFinalAttempt) break;
+        await new Promise(r => setTimeout(r, 400));
+      }
+    }
+
+    if (finalOutcome && finalOutcome.success) {
+      self.postMessage({
+        type: 'DONE',
+        sessionId,
+        targetStr,
+        outcome: finalOutcome
+      });
+    } else {
+      const errMsg = lastError ? (lastError.message || String(lastError)) : 'All connection attempts failed';
+      log('error', `❌ WebTransport tunnel failed for ${targetStr}: ${errMsg}`);
+      await sendFailureOnce(0x05);
+      self.postMessage({
+        type: 'DONE',
+        sessionId,
+        targetStr,
+        outcome: finalOutcome || { success: false, kind: 'wt_worker_error', error: errMsg }
+      });
+    }
   } catch (err) {
-    log('error', `❌ WebTransport tunnel failed for ${targetStr}: ${err.message}`);
-    try { bridge.sendFailure(0x05); } catch (e) {}
+    log('error', `❌ WebTransport tunnel fatal exception for ${targetStr}: ${err.message}`);
+    await sendFailureOnce(0x05);
     self.postMessage({
       type: 'DONE',
       sessionId,
