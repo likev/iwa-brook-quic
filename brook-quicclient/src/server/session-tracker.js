@@ -58,10 +58,10 @@ export class SessionTracker {
     }, 500);
   }
 
-  createSession({ protocol, target, clientAddr = '127.0.0.1' }) {
-    const id = this.nextSessionId++;
+  createSession({ id = null, protocol = 'SOCKS5', target = 'unknown', clientAddr = '127.0.0.1' } = {}) {
+    const sid = (id !== null && id !== undefined) ? id : this.nextSessionId++;
     const session = {
-      id,
+      id: sid,
       protocol,
       target,
       clientAddr,
@@ -71,13 +71,13 @@ export class SessionTracker {
       status: 'active'
     };
 
-    this.sessions.set(id, session);
+    this.sessions.set(sid, session);
     this.totalSessionsCount++;
     return session;
   }
 
   recordBytes(sessionId, sentBytes = 0, receivedBytes = 0) {
-    const s = this.sessions.get(sessionId);
+    const s = this.sessions.get(sessionId) || this.sessions.get(Number(sessionId)) || this.sessions.get(String(sessionId));
     if (s) {
       s.bytesSent += sentBytes;
       s.bytesReceived += receivedBytes;
@@ -87,11 +87,13 @@ export class SessionTracker {
   }
 
   closeSession(sessionId) {
-    const s = this.sessions.get(sessionId);
+    const s = this.sessions.get(sessionId) || this.sessions.get(Number(sessionId)) || this.sessions.get(String(sessionId));
     if (s) {
       s.status = 'closed';
       s.endTime = Date.now();
       this.sessions.delete(sessionId);
+      this.sessions.delete(Number(sessionId));
+      this.sessions.delete(String(sessionId));
     }
   }
 

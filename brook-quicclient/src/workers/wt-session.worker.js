@@ -82,6 +82,14 @@ async function runWtTunnel({
       sendSuccess: bridge.sendSuccess,
       sendFailure: bridge.sendFailure,
       dialTimeoutMs,
+      onBytes: (sent, recv) => {
+        self.postMessage({
+          type: 'BYTES',
+          sessionId,
+          sent,
+          recv
+        });
+      },
       onLog: (lvl, msg, meta) => log(lvl, msg, meta)
     });
 

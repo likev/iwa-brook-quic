@@ -233,10 +233,15 @@ async function handleClientConnection(socket, listenerType, onDone) {
       }
     };
 
+    const protoLabel = (detectedProto === 'socks5' || detectedProto === ProtocolType.SOCKS5)
+      ? 'SOCKS5'
+      : (isConnect ? 'HTTPS CONNECT' : 'HTTP');
+
     // 3. Request QUIC Worker assignment from Main Thread
     self.postMessage({
       type: 'REQUEST_TUNNEL',
       sessionId,
+      protocol: protoLabel,
       dstBytes,
       targetStr,
       leftover,

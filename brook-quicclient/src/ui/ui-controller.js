@@ -309,6 +309,15 @@ export class UiController {
       this.btnToggle.classList.add('btn-primary');
       this.btnToggle.disabled = false;
       this.updateConnectionState(ConnectionState.DISCONNECTED, 'Stopped');
+      this.updateStats({
+        downloadSpeed: 0,
+        uploadSpeed: 0,
+        totalBytesReceived: this.lastStats?.totalBytesReceived || 0,
+        totalBytesSent: this.lastStats?.totalBytesSent || 0,
+        activeSessions: 0,
+        totalSessions: this.lastStats?.totalSessions || 0,
+        activeSessionList: []
+      });
     }
   }
 

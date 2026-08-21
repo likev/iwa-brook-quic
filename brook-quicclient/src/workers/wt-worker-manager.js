@@ -10,6 +10,7 @@ export class WtWorkerManager {
     password,
     withoutBrook = true,
     clockOffsetSec = 0,
+    sessionTracker = null,
     onStateChange = null,
     onLog = null
   }) {
@@ -19,6 +20,7 @@ export class WtWorkerManager {
     this.password = password;
     this.withoutBrook = withoutBrook;
     this.clockOffsetSec = clockOffsetSec;
+    this.sessionTracker = sessionTracker;
     this.onStateChange = onStateChange;
     this.onLog = onLog;
 
@@ -47,13 +49,21 @@ export class WtWorkerManager {
   /**
    * Spawn a new dedicated WebTransport Worker for an incoming client proxy connection.
    */
-  async spawnTunnelWorker({ sessionId, dstBytes, targetStr, leftover, dialTimeoutMs, port }) {
+  async spawnTunnelWorker({ sessionId, protocol, dstBytes, targetStr, leftover, dialTimeoutMs, port }) {
     if (this.isClosed) {
       try {
         port.postMessage({ type: 'STREAM_FAILED', errorCode: 0x01 });
         port.close();
       } catch (e) {}
       return;
+    }
+
+    if (this.sessionTracker) {
+      this.sessionTracker.createSession({
+        id: sessionId,
+        protocol: protocol || 'SOCKS5',
+        target: targetStr
+      });
     }
 
     const workerUrl = new URL('./wt-session.worker.js', import.meta.url);
@@ -74,9 +84,17 @@ export class WtWorkerManager {
         case 'LOG':
           this._log(msg.level, msg.message, msg.meta);
           break;
+        case 'BYTES':
+          if (this.sessionTracker) {
+            this.sessionTracker.recordBytes(msg.sessionId, msg.sent || 0, msg.recv || 0);
+          }
+          break;
         case 'DONE':
           if (msg.outcome && !msg.outcome.success && msg.outcome.error) {
             this._log('error', `[WT Worker #${sessionId}] Tunnel ended: ${msg.outcome.error}`);
+          }
+          if (this.sessionTracker) {
+            this.sessionTracker.closeSession(sessionId);
           }
           this._terminateWorker(sessionId);
           break;
@@ -85,6 +103,9 @@ export class WtWorkerManager {
 
     worker.onerror = (err) => {
       this._log('error', `[WT Worker #${sessionId}] Worker exception: ${err.message || err}`);
+      if (this.sessionTracker) {
+        this.sessionTracker.closeSession(sessionId);
+      }
       this._terminateWorker(sessionId);
     };
 
@@ -111,6 +132,9 @@ export class WtWorkerManager {
     const entry = this.workers.get(sessionId);
     if (entry) {
       this.workers.delete(sessionId);
+      if (this.sessionTracker) {
+        this.sessionTracker.closeSession(sessionId);
+      }
       try {
         entry.worker.postMessage({ type: 'CLOSE' });
         entry.worker.terminate();
@@ -121,6 +145,9 @@ export class WtWorkerManager {
   async close() {
     this.isClosed = true;
     for (const [id, entry] of this.workers.entries()) {
+      if (this.sessionTracker) {
+        this.sessionTracker.closeSession(id);
+      }
       try {
         entry.worker.postMessage({ type: 'CLOSE' });
         entry.worker.terminate();

@@ -271,6 +271,29 @@ async function runUnitTests() {
   assert(httpRes.targetStr === 'example.com:443', 'HttpProxyParser extracts correct target with unicode header');
   const leftoverStr = new TextDecoder().decode(httpRes.leftover);
   assert(leftoverStr === 'BODY_PAYLOAD_BYTES', `HttpProxyParser raw byte split preserves exact body without offset drift ("${leftoverStr}")`);
+
+  // 1.15 SessionTracker & Live Telemetry Engine
+  let lastStatsReceived = null;
+  const tracker = new SessionTracker({
+    onStatsUpdate: (stats) => {
+      lastStatsReceived = stats;
+    }
+  });
+
+  const sess1 = tracker.createSession({ id: 'sess-101', protocol: 'SOCKS5', target: 'example.com:443' });
+  assert(sess1.id === 'sess-101' && sess1.target === 'example.com:443', 'SessionTracker creates session with explicit ID and target');
+  assert(tracker.getStats().activeSessions === 1, 'SessionTracker tracks active session count (1)');
+  assert(tracker.getStats().totalSessions === 1, 'SessionTracker increments total session count (1)');
+
+  tracker.recordBytes('sess-101', 500, 1500);
+  const sess1Stats = tracker.getStats();
+  assert(sess1Stats.totalBytesSent === 500 && sess1Stats.totalBytesReceived === 1500, 'SessionTracker records sent and received byte counters');
+  assert(sess1Stats.activeSessionList.length === 1 && sess1Stats.activeSessionList[0].bytesSent === 500, 'SessionTracker updates per-session traffic stats');
+
+  tracker.closeSession('sess-101');
+  assert(tracker.getStats().activeSessions === 0, 'SessionTracker clears active session on close');
+  assert(tracker.getStats().totalBytesSent === 500 && tracker.getStats().totalBytesReceived === 1500, 'SessionTracker retains cumulative byte totals after session close');
+  tracker.destroy();
 }
 
 // -------------------------------------------------------------

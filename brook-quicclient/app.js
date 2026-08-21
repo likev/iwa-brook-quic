@@ -70,6 +70,7 @@ async function bootstrap() {
             password: config.password,
             withoutBrook: config.withoutBrook !== undefined ? config.withoutBrook : true,
             clockOffsetSec: clockDriftSec,
+            sessionTracker,
             onStateChange: (state, details) => {
               if (uiController) {
                 uiController.updateConnectionState(state, details);

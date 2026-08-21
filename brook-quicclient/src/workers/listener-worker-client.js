@@ -63,6 +63,7 @@ export class ListenerWorkerClient {
             if (this.wtWorkerManager) {
               this.wtWorkerManager.spawnTunnelWorker({
                 sessionId: msg.sessionId,
+                protocol: msg.protocol || 'SOCKS5',
                 dstBytes: msg.dstBytes,
                 targetStr: msg.targetStr,
                 leftover: msg.leftover,
