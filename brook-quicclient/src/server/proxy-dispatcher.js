@@ -235,11 +235,11 @@ export class ProxyDispatcher {
           throw new Error('ProxyDispatcher was stopped during dial attempt');
         }
 
-        // Create or acquire dedicated QUIC session to remote Brook server (guaranteed fresh on retries)
+        // Create or acquire multiplexed WebTransport stream session to remote Brook server
         const acqStart = Date.now();
         let quicSession;
         try {
-          quicSession = await this.quicManager.createSession({ forceFresh: attempt > 1 });
+          quicSession = await this.quicManager.createSession();
         } catch (sessErr) {
           tunnelError = sessErr;
           if (attempt === MAX_ATTEMPTS) {

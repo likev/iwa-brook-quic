@@ -112,30 +112,32 @@ export class WebTransportConnectionManager {
    * Reset active WebTransport session and clear all hanging streams (e.g. on Wi-Fi drop or interface switch).
    */
   resetSession(reason = 'network_offline') {
-    if (this.transport) {
+    // If currently connecting, do NOT abort the connecting transport mid-handshake
+    if (this.state === ConnectionState.CONNECTED && this.transport) {
       try { this.transport.close(); } catch (e) {}
       this.transport = null;
     }
-    this.connectPromise = null;
     for (const stream of this.activeStreams) {
       try { stream.close(); } catch (e) {}
     }
     this.activeStreams.clear();
-    this._setState(ConnectionState.DISCONNECTED, reason);
+    if (this.state !== ConnectionState.CONNECTING) {
+      this._setState(ConnectionState.DISCONNECTED, reason);
+    }
   }
 
   /**
    * Establish WebTransport connection to server.
-   * Deduplicates concurrent connect calls to prevent multiple handshakes.
+   * Single-flight promise ensures all concurrent callers share the same handshake.
    */
-  async connect(options = {}) {
+  async connect() {
     if (this.isClosed) throw new Error('WebTransportConnectionManager is closed');
-    if (this.isConnected() && !options.forceFresh) return this;
+    if (this.isConnected()) return this;
     if (this.connectPromise) return this.connectPromise;
 
-    this.connectPromise = (async () => {
-      this._setState(ConnectionState.CONNECTING, 'Connecting WebTransport session...');
+    this._setState(ConnectionState.CONNECTING, 'Connecting WebTransport session...');
 
+    this.connectPromise = (async () => {
       const WTClass = await WebTransportConnectionManager.getWebTransportClass();
       const url = `https://${this.serverHost}:${this.serverPort}${this.path}`;
       this._log('info', `Connecting WebTransport to ${url}...`);
@@ -145,54 +147,62 @@ export class WebTransportConnectionManager {
         wtOptions.serverCertificateHashes = this.serverCertificateHashes;
       }
 
+      let localTransport = null;
+      let timer = null;
+
       try {
-        this.transport = new WTClass(url, wtOptions);
+        localTransport = new WTClass(url, wtOptions);
+        this.transport = localTransport;
 
         // Handle close event
-        this.transport.closed
+        localTransport.closed
           .then(() => {
-            this.transport = null;
-            if (!this.isClosed) {
-              this._setState(ConnectionState.DISCONNECTED, 'Server closed session');
-              this._log('warning', 'WebTransport session closed');
+            if (this.transport === localTransport) {
+              this.transport = null;
+              if (!this.isClosed) {
+                this._setState(ConnectionState.DISCONNECTED, 'Server closed session');
+                this._log('warning', 'WebTransport session closed');
+              }
             }
           })
           .catch((err) => {
-            this.transport = null;
-            if (!this.isClosed) {
-              this._setState(ConnectionState.DISCONNECTED, `Session error: ${err.message}`);
-              this._log('warning', `WebTransport session closed: ${err.message}`);
+            if (this.transport === localTransport) {
+              this.transport = null;
+              if (!this.isClosed) {
+                this._setState(ConnectionState.DISCONNECTED, `Session error: ${err.message}`);
+                this._log('warning', `WebTransport session closed: ${err.message}`);
+              }
             }
           });
 
-        // Strict connect timeout (default 5s) prevents hanging when Wi-Fi drops or network changes
-        const connectTimeoutMs = options.connectTimeoutMs || 5000;
-        let timer = null;
+        // Strict connect timeout (default 5s)
+        const connectTimeoutMs = 5000;
         const timeoutPromise = new Promise((_, reject) => {
           timer = setTimeout(() => reject(new Error(`WebTransport connection to ${url} timed out after ${connectTimeoutMs}ms`)), connectTimeoutMs);
         });
 
-        try {
-          await Promise.race([this.transport.ready, timeoutPromise]);
-        } finally {
-          if (timer) clearTimeout(timer);
-        }
+        await Promise.race([localTransport.ready, timeoutPromise]);
+        if (timer) clearTimeout(timer);
 
+        this.transport = localTransport;
         this._setState(ConnectionState.CONNECTED);
         this._log('success', `✅ WebTransport session established to ${url}`);
         return this;
       } catch (err) {
-        if (this.transport) {
-          try { this.transport.close(); } catch (e) {}
+        if (timer) clearTimeout(timer);
+        if (localTransport) {
+          try { localTransport.close(); } catch (e) {}
+        }
+        if (this.transport === localTransport) {
           this.transport = null;
         }
         this._setState(ConnectionState.DISCONNECTED, `Failed: ${err.message}`);
         this._log('error', `❌ Failed to connect WebTransport: ${err.message}`);
         throw err;
+      } finally {
+        this.connectPromise = null;
       }
-    })().finally(() => {
-      this.connectPromise = null;
-    });
+    })();
 
     return this.connectPromise;
   }
@@ -205,12 +215,12 @@ export class WebTransportConnectionManager {
     if (this.isClosed) throw new Error('WebTransportConnectionManager is closed');
 
     // Ensure underlying WebTransport session is active
-    if (!this.isConnected() || options.forceFresh) {
-      if (options.forceFresh && this.transport) {
-        try { this.transport.close(); } catch (e) {}
-        this.transport = null;
-      }
-      await this.connect(options);
+    if (!this.isConnected()) {
+      await this.connect();
+    }
+
+    if (!this.transport || this.state !== ConnectionState.CONNECTED) {
+      throw new Error('WebTransport is not connected');
     }
 
     const streamId = (this.nextStreamSeq += 4);
@@ -229,7 +239,11 @@ export class WebTransportConnectionManager {
         timeoutPromise
       ]);
     } catch (err) {
-      this.resetSession('stream_allocation_failed');
+      if (this.transport) {
+        this._setState(ConnectionState.DISCONNECTED, 'Stream allocation failed');
+        try { this.transport.close(); } catch (e) {}
+        this.transport = null;
+      }
       throw err;
     } finally {
       if (streamTimer) clearTimeout(streamTimer);

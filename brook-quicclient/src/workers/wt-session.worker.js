@@ -98,8 +98,7 @@ async function runWtTunnel({
 
         streamSession = await wtManager.createSession({
           connectTimeoutMs: attemptTimeoutMs,
-          streamTimeoutMs: 4000,
-          forceFresh: attempt > 1
+          streamTimeoutMs: 4000
         });
       } catch (sessErr) {
         lastError = sessErr;
