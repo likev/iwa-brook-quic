@@ -61,22 +61,24 @@ async function bootstrap() {
           logStream.add('info', `⏱️ Network time sync: local clock drift is ${clockDriftSec > 0 ? '+' : ''}${clockDriftSec}s (auto-compensated)`);
         }
 
-        // 2. Setup Unified WebTransport Manager (multiplexed bidi streams over native QUIC session)
+        // 2. Setup Unified WebTransport Manager (5-session parallel QUIC pool)
         fallbackWtManager = new WebTransportConnectionManager({
           serverHost: config.serverHost,
           serverPort: config.serverPort,
           path: serverPath,
+          serverCertificateHashes: config.serverCertificateHashes || [],
+          poolSize: 5,
           onStateChange: (state, details) => {
             if (uiController) uiController.updateConnectionState(state, details);
           },
           onLog: (lvl, msg, meta) => logStream.add(lvl, msg, meta)
         });
 
-        // Pre-connect WebTransport session with auto-reconnect capability
+        // Pre-connect WebTransport session pool in parallel
         try {
           await fallbackWtManager.connect();
         } catch (e) {
-          logStream.add('warning', `Initial WebTransport connection pending: ${e.message} (will connect on first proxy request)`);
+          logStream.add('warning', `Initial WebTransport pool connection pending: ${e.message} (will connect on first proxy request)`);
         }
 
         // 3. Setup Proxy Dispatcher
@@ -138,13 +140,22 @@ async function bootstrap() {
   // Fast Wi-Fi & Network Recovery Listeners
   if (typeof window !== 'undefined') {
     window.addEventListener('offline', () => {
-      if (logStream) logStream.add('warning', '⚠️ Network/Wi-Fi connection lost (offline). Resetting WebTransport proxy session...');
+      if (logStream) logStream.add('warning', '⚠️ Network/Wi-Fi connection lost (offline). Resetting WebTransport pool sessions...');
       if (fallbackWtManager) fallbackWtManager.resetSession('network_offline');
       if (uiController) uiController.updateConnectionState('reconnecting', 'Wi-Fi Offline');
     });
 
-    window.addEventListener('online', () => {
-      if (logStream) logStream.add('success', '🌐 Network/Wi-Fi connection restored (online). Reconnecting WebTransport...');
+    window.addEventListener('online', async () => {
+      if (logStream) logStream.add('success', '🌐 Network/Wi-Fi connection restored (online). Resyncing clock & reconnecting WebTransport pool...');
+      try {
+        const drift = await WebTransportConnectionManager.measureClockDrift();
+        if (fallbackDispatcher) {
+          fallbackDispatcher.clockOffsetSec = drift;
+        }
+        if (Math.abs(drift) > 1 && logStream) {
+          logStream.add('info', `⏱️ Network time sync: clock drift updated to ${drift > 0 ? '+' : ''}${drift}s`);
+        }
+      } catch (e) {}
       if (fallbackWtManager) fallbackWtManager.connect().catch(() => {});
       if (uiController) uiController.updateConnectionState('connected', 'Online');
     });
