@@ -121,8 +121,8 @@ export class BrookTunnel {
     let dialDurationMs = 0;
     let expectedPayloadLen = -1;
 
-    // Bounded Serialized FIFO queue for downstream processing (8MB hard buffer cap)
-    const MAX_RX_BUFFER_BYTES = 8 * 1024 * 1024;
+    // Bounded Serialized FIFO queue for downstream processing (256MB buffer cap)
+    const MAX_RX_BUFFER_BYTES = 256 * 1024 * 1024;
     let rxQueuedBytes = 0;
     const rxQueue = [];
     let isProcessingRx = false;
