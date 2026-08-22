@@ -21,6 +21,7 @@ export class WebTransportConnectionManager {
     path = '/brook',
     serverCertificateHashes = [],
     poolSize = 5,
+    networkMonitor = null,
     onStateChange = null,
     onLog = null
   }) {
@@ -29,6 +30,7 @@ export class WebTransportConnectionManager {
     this.path = path.startsWith('/') ? path : `/${path}`;
     this.serverCertificateHashes = serverCertificateHashes;
     this.poolSize = poolSize || 5;
+    this.networkMonitor = networkMonitor;
     this.onStateChange = onStateChange;
     this.onLog = onLog;
 
@@ -181,6 +183,9 @@ export class WebTransportConnectionManager {
    */
   async _connectSlot(slot, options = {}) {
     if (this.isClosed) throw new Error('WebTransportConnectionManager is closed');
+    if (this.networkMonitor && !this.networkMonitor.isOnline) {
+      throw new Error('Cannot connect WebTransport slot: Network is offline');
+    }
     if (slot.state === ConnectionState.CONNECTED && slot.transport) return slot;
     if (slot.connectPromise) return slot.connectPromise;
 
@@ -264,6 +269,10 @@ export class WebTransportConnectionManager {
    */
   async connect(options = {}) {
     if (this.isClosed) throw new Error('WebTransportConnectionManager is closed');
+    if (this.networkMonitor && !this.networkMonitor.isOnline) {
+      this._setState(ConnectionState.DISCONNECTED, 'Network is offline');
+      throw new Error('Cannot connect WebTransport pool: Network is offline');
+    }
     this._setState(ConnectionState.CONNECTING, `Connecting WebTransport pool (${this.poolSize} sessions)...`);
 
     const results = await Promise.allSettled(this.slots.map(s => this._connectSlot(s, options)));
@@ -285,6 +294,9 @@ export class WebTransportConnectionManager {
    */
   async createSession(options = {}) {
     if (this.isClosed) throw new Error('WebTransportConnectionManager is closed');
+    if (this.networkMonitor && !this.networkMonitor.isOnline) {
+      throw new Error('Cannot create WebTransport stream: Network is offline');
+    }
 
     // 1. Find all active connected slots
     let connectedSlots = this.slots.filter(s => s.state === ConnectionState.CONNECTED && s.transport !== null);

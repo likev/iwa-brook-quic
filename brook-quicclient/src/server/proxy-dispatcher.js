@@ -19,6 +19,7 @@ export class ProxyDispatcher {
     password,
     withoutBrook = true,
     clockOffsetSec = 0,
+    networkMonitor = null,
     onLog
   }) {
     this.quicManager = quicManager;
@@ -26,6 +27,7 @@ export class ProxyDispatcher {
     this.password = password;
     this.withoutBrook = withoutBrook;
     this.clockOffsetSec = clockOffsetSec;
+    this.networkMonitor = networkMonitor;
     this.onLog = onLog;
 
     this.listeners = new Map(); // name -> TcpListener
@@ -132,21 +134,56 @@ export class ProxyDispatcher {
     }
   }
 
+  /**
+   * Drop all active proxy connections immediately (e.g. on network offline).
+   */
+  dropAllConnections(reason = 'network_offline') {
+    this._log('warning', `Dropping all active proxy connections (${reason})...`);
+    for (const handler of Array.from(this.activeHandlers)) {
+      try {
+        if (typeof handler.cancel === 'function') {
+          handler.cancel();
+        }
+      } catch (e) {}
+    }
+  }
+
   async _handleClient(acceptedSocket, expectedProtocol = 'auto', onComplete = null) {
-    const handlerPromise = this._processClient(acceptedSocket, expectedProtocol);
-    this.activeHandlers.add(handlerPromise);
+    if (this.networkMonitor && !this.networkMonitor.isOnline) {
+      this._log('warning', `⚠️ Dropping incoming ${expectedProtocol} connection: Network is offline`);
+      try { acceptedSocket.close(); } catch (e) {}
+      if (onComplete) onComplete();
+      return;
+    }
+
+    const handlerEntry = {
+      socket: acceptedSocket,
+      cancel: () => {
+        try { acceptedSocket.close(); } catch (e) {}
+      }
+    };
+    this.activeHandlers.add(handlerEntry);
+
     try {
-      await handlerPromise;
+      await this._processClient(acceptedSocket, expectedProtocol, handlerEntry);
     } finally {
-      this.activeHandlers.delete(handlerPromise);
+      this.activeHandlers.delete(handlerEntry);
       if (onComplete) onComplete();
     }
   }
 
-  async _processClient(acceptedSocket, expectedProtocol = 'auto') {
+  async _processClient(acceptedSocket, expectedProtocol = 'auto', handlerEntry = null) {
     let reader = null;
     let writer = null;
     let session = null;
+
+    if (handlerEntry) {
+      handlerEntry.cancel = () => {
+        try { acceptedSocket.close(); } catch (e) {}
+        try { if (reader) reader.cancel().catch(() => {}); } catch (e) {}
+        try { if (writer) writer.close().catch(() => {}); } catch (e) {}
+      };
+    }
 
     try {
       const { readable, writable, remoteAddress, remotePort } = await acceptedSocket.opened;
@@ -233,6 +270,9 @@ export class ProxyDispatcher {
       for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
         if (!this.isRunning) {
           throw new Error('ProxyDispatcher was stopped during dial attempt');
+        }
+        if (this.networkMonitor && !this.networkMonitor.isOnline) {
+          throw new Error('Network is offline');
         }
 
         // Create or acquire multiplexed WebTransport stream session to remote Brook server

@@ -23,6 +23,7 @@ import { TcpListener } from '../brook-quicclient/src/server/tcp-listener.js';
 import { LogStream } from '../brook-quicclient/src/ui/log-stream.js';
 import { SessionTracker } from '../brook-quicclient/src/server/session-tracker.js';
 import { createPortStreamBridge } from '../brook-quicclient/src/workers/worker-tunnel-bridge.js';
+import { NetworkMonitor, PROBE_URLS } from '../brook-quicclient/src/core/network-monitor.js';
 
 const execAsync = promisify(exec);
 
@@ -354,6 +355,67 @@ async function runUnitTests() {
   testWtMgr.resetSession('network_offline');
   assert(testWtMgr.activeStreams.size === 0, 'resetSession clears active streams and marks state disconnected on network drop');
   assert(testWtMgr.state === 'disconnected', 'WebTransport state is cleanly disconnected after resetSession');
+
+  // 1.19 NetworkMonitor Active 3-URL 5s/3s Probing & Offline Guarding
+  assert(PROBE_URLS.length === 3, 'NetworkMonitor contains exactly 3 verified HTTPS probe URLs');
+  assert(PROBE_URLS[0].includes('api.ipify.org'), 'Probe URL 1 is ipify');
+  assert(PROBE_URLS[1].includes('open-meteo.com'), 'Probe URL 2 is Open-Meteo');
+  assert(PROBE_URLS[2].includes('catfact.ninja'), 'Probe URL 3 is Cat Facts');
+
+  let statusTransitions = [];
+  const testMonitor = new NetworkMonitor({
+    probeUrls: PROBE_URLS,
+    checkIntervalMs: 5000,
+    timeoutMs: 3000,
+    onStatusChange: (isOnline) => statusTransitions.push(isOnline)
+  });
+
+  // Verify online probe
+  const probeOnline = await testMonitor.checkOnce();
+  assert(probeOnline === true && testMonitor.isOnline === true, 'NetworkMonitor verifies active internet connectivity via 3 CORS probe URLs');
+
+  // Verify offline when all endpoints fail
+  const failingMonitor = new NetworkMonitor({
+    probeUrls: [
+      'https://127.0.0.1:1/invalid-1',
+      'https://127.0.0.1:1/invalid-2',
+      'https://127.0.0.1:1/invalid-3'
+    ],
+    timeoutMs: 100,
+    checkIntervalMs: 5000
+  });
+  const probeOffline = await failingMonitor.checkOnce();
+  assert(probeOffline === false && failingMonitor.isOnline === false, 'NetworkMonitor identifies offline status when all 3 endpoints fail');
+
+  // Test that WebTransportConnectionManager rejects new session create when offline
+  const offlineWtMgr = new WebTransportConnectionManager({
+    serverHost: '127.0.0.1',
+    serverPort: 4433,
+    networkMonitor: failingMonitor
+  });
+  let wtOfflineRejected = false;
+  try {
+    await offlineWtMgr.createSession();
+  } catch (err) {
+    if (err.message.includes('Network is offline')) {
+      wtOfflineRejected = true;
+    }
+  }
+  assert(wtOfflineRejected, 'WebTransportConnectionManager rejects new stream allocation when network is offline');
+
+  // Test that ProxyDispatcher rejects new client connection when offline
+  let mockSocketClosed = false;
+  const mockOfflineSocket = {
+    close: () => { mockSocketClosed = true; },
+    opened: new Promise(() => {})
+  };
+  const offlineDispatcher = new ProxyDispatcher({
+    quicManager: offlineWtMgr,
+    sessionTracker: new SessionTracker({}),
+    networkMonitor: failingMonitor
+  });
+  await offlineDispatcher._handleClient(mockOfflineSocket, 'socks5');
+  assert(mockSocketClosed, 'ProxyDispatcher immediately drops incoming client connections when network is offline');
 }
 
 // -------------------------------------------------------------

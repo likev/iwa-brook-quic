@@ -11,6 +11,7 @@ import { ProxyDispatcher } from './src/server/proxy-dispatcher.js';
 import { UiController } from './src/ui/ui-controller.js';
 import { WtWorkerManager } from './src/workers/wt-worker-manager.js';
 import { ListenerWorkerClient } from './src/workers/listener-worker-client.js';
+import { NetworkMonitor } from './src/core/network-monitor.js';
 
 // 1. Initialize Trusted Types Policy for Strict IWA CSP
 initTrustedTypesPolicy();
@@ -18,6 +19,7 @@ initTrustedTypesPolicy();
 // 2. State & Components
 let logStream = null;
 let sessionTracker = null;
+let networkMonitor = null;
 let wtWorkerManager = null;
 let listenerClient = null;
 let fallbackWtManager = null;
@@ -55,19 +57,67 @@ async function bootstrap() {
       logStream.add('info', `Starting WebTransport proxy connected to https://${config.serverHost}:${config.serverPort}${serverPath}...`);
 
       try {
-        // 1. Auto-synchronize network clock drift
+        // 1. Initialize Active Network Monitor (checks 3 URLs every 5s, timeout 3s)
+        networkMonitor = new NetworkMonitor({
+          probeUrls: [
+            'https://api.ipify.org?format=json',
+            'https://api.open-meteo.com/v1/forecast?latitude=52.52&longitude=13.41&current_weather=true',
+            'https://catfact.ninja/fact'
+          ],
+          checkIntervalMs: 5000,
+          timeoutMs: 3000,
+          onStatusChange: async (isOnline) => {
+            if (!isOnline) {
+              logStream.add('warning', '⚠️ Network offline (all 3 probe endpoints failed). Dropping proxy connections & resetting WebTransport pool...');
+              if (fallbackDispatcher) {
+                fallbackDispatcher.dropAllConnections('network_offline');
+              }
+              if (fallbackWtManager) {
+                fallbackWtManager.resetSession('network_offline');
+              }
+              if (uiController) {
+                uiController.updateConnectionState('reconnecting', 'Offline (Probes Failed)');
+              }
+            } else {
+              logStream.add('success', '🌐 Network online (probe verified). Resyncing clock & reconnecting WebTransport pool...');
+              try {
+                const drift = await WebTransportConnectionManager.measureClockDrift();
+                if (fallbackDispatcher) {
+                  fallbackDispatcher.clockOffsetSec = drift;
+                }
+                if (Math.abs(drift) > 1) {
+                  logStream.add('info', `⏱️ Network time sync: clock drift updated to ${drift > 0 ? '+' : ''}${drift}s`);
+                }
+              } catch (e) {}
+
+              if (fallbackWtManager) {
+                try {
+                  await fallbackWtManager.connect();
+                } catch (e) {}
+              }
+              if (uiController) {
+                uiController.updateConnectionState('connected', 'Online');
+              }
+            }
+          },
+          onLog: (lvl, msg, meta) => logStream.add(lvl, msg, meta)
+        });
+        networkMonitor.start();
+
+        // 2. Auto-synchronize network clock drift
         const clockDriftSec = await WebTransportConnectionManager.measureClockDrift();
         if (Math.abs(clockDriftSec) > 1) {
           logStream.add('info', `⏱️ Network time sync: local clock drift is ${clockDriftSec > 0 ? '+' : ''}${clockDriftSec}s (auto-compensated)`);
         }
 
-        // 2. Setup Unified WebTransport Manager (5-session parallel QUIC pool)
+        // 3. Setup Unified WebTransport Manager (5-session parallel QUIC pool with network monitoring)
         fallbackWtManager = new WebTransportConnectionManager({
           serverHost: config.serverHost,
           serverPort: config.serverPort,
           path: serverPath,
           serverCertificateHashes: config.serverCertificateHashes || [],
           poolSize: 5,
+          networkMonitor,
           onStateChange: (state, details) => {
             if (uiController) uiController.updateConnectionState(state, details);
           },
@@ -81,13 +131,14 @@ async function bootstrap() {
           logStream.add('warning', `Initial WebTransport pool connection pending: ${e.message} (will connect on first proxy request)`);
         }
 
-        // 3. Setup Proxy Dispatcher
+        // 4. Setup Proxy Dispatcher
         fallbackDispatcher = new ProxyDispatcher({
           quicManager: fallbackWtManager,
           sessionTracker,
           password: config.password,
           withoutBrook: config.withoutBrook !== undefined ? config.withoutBrook : true,
           clockOffsetSec: clockDriftSec,
+          networkMonitor,
           onLog: (lvl, msg, meta) => logStream.add(lvl, msg, meta)
         });
 
@@ -108,6 +159,10 @@ async function bootstrap() {
         }
       } catch (err) {
         logStream.add('error', `❌ Failed to start proxy: ${err.message}`);
+        if (networkMonitor) {
+          networkMonitor.stop();
+          networkMonitor = null;
+        }
         if (fallbackDispatcher) {
           try { await fallbackDispatcher.stop(); } catch (e) {}
           fallbackDispatcher = null;
@@ -121,6 +176,11 @@ async function bootstrap() {
     },
     onStop: async () => {
       logStream.add('warning', 'Stopping all proxy services and listeners...');
+
+      if (networkMonitor) {
+        networkMonitor.stop();
+        networkMonitor = null;
+      }
 
       if (fallbackDispatcher) {
         try { await fallbackDispatcher.stop(); } catch (e) {}
@@ -136,30 +196,6 @@ async function bootstrap() {
       logStream.add('info', 'All proxy services stopped.');
     }
   });
-
-  // Fast Wi-Fi & Network Recovery Listeners
-  if (typeof window !== 'undefined') {
-    window.addEventListener('offline', () => {
-      if (logStream) logStream.add('warning', '⚠️ Network/Wi-Fi connection lost (offline). Resetting WebTransport pool sessions...');
-      if (fallbackWtManager) fallbackWtManager.resetSession('network_offline');
-      if (uiController) uiController.updateConnectionState('reconnecting', 'Wi-Fi Offline');
-    });
-
-    window.addEventListener('online', async () => {
-      if (logStream) logStream.add('success', '🌐 Network/Wi-Fi connection restored (online). Resyncing clock & reconnecting WebTransport pool...');
-      try {
-        const drift = await WebTransportConnectionManager.measureClockDrift();
-        if (fallbackDispatcher) {
-          fallbackDispatcher.clockOffsetSec = drift;
-        }
-        if (Math.abs(drift) > 1 && logStream) {
-          logStream.add('info', `⏱️ Network time sync: clock drift updated to ${drift > 0 ? '+' : ''}${drift}s`);
-        }
-      } catch (e) {}
-      if (fallbackWtManager) fallbackWtManager.connect().catch(() => {});
-      if (uiController) uiController.updateConnectionState('connected', 'Online');
-    });
-  }
 }
 
 // Start application when DOM is ready
