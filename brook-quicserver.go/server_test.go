@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -865,4 +866,408 @@ func TestAutoDetectWithoutBrookProtocol(t *testing.T) {
 		}
 		t.Logf("✅ Wrong password client rejected as expected: %v", err)
 	})
+}
+
+func TestConnectionCleanupAfterRawQUIC(t *testing.T) {
+	echoAddr, cleanupEcho := startEchoServer(t)
+	defer cleanupEcho()
+
+	password := "cleanup-quic-test"
+	server, err := NewServer("127.0.0.1:0", password, "", 2, 2, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	go func() { _ = server.ListenAndServe() }()
+	select {
+	case <-server.Ready():
+	case <-time.After(5 * time.Second):
+		t.Fatal("server failed to start")
+	}
+	serverAddr := server.LocalAddr().String()
+
+	// Measure baseline goroutines
+	runtime.GC()
+	time.Sleep(200 * time.Millisecond)
+	baseline := runtime.NumGoroutine()
+	t.Logf("Baseline goroutines: %d", baseline)
+
+	// Connect, do echo, disconnect
+	for i := 0; i < 10; i++ {
+		func() {
+			tlsConf := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"brook-quic"}}
+			conn, err := quic.DialAddr(context.Background(), serverAddr, tlsConf, &quic.Config{EnableDatagrams: true})
+			if err != nil {
+				t.Fatalf("dial %d: %v", i, err)
+			}
+			defer conn.CloseWithError(0, "")
+
+			stream, err := conn.OpenStreamSync(context.Background())
+			if err != nil {
+				t.Fatalf("open stream %d: %v", i, err)
+			}
+
+			cn, _ := GenerateNonce()
+			ck, _ := DeriveKey([]byte(password), cn, brookInfo)
+			ca, _ := NewGCMCipher(ck)
+			stream.Write(cn)
+
+			atyp, addrB, portB, _ := ParseAddress(echoAddr)
+			dstSlice := append([]byte{atyp}, addrB...)
+			dstSlice = append(dstSlice, portB...)
+			now := time.Now().Unix()
+			if now%2 != 0 {
+				now += 1
+			}
+			headerBody := make([]byte, 4+len(dstSlice))
+			binary.BigEndian.PutUint32(headerBody[:4], uint32(now))
+			copy(headerBody[4:], dstSlice)
+
+			hdrLenBuf := make([]byte, 2)
+			binary.BigEndian.PutUint16(hdrLenBuf, uint16(len(headerBody)))
+			sealedLen := ca.Seal(nil, cn, hdrLenBuf, nil)
+			NextNonce(cn)
+			sealedPayload := ca.Seal(nil, cn, headerBody, nil)
+			NextNonce(cn)
+			stream.Write(append(sealedLen, sealedPayload...))
+
+			sn := make([]byte, 12)
+			io.ReadFull(stream, sn)
+			sk, _ := DeriveKey([]byte(password), sn, brookInfo)
+			sa, _ := NewGCMCipher(sk)
+
+			testData := []byte(fmt.Sprintf("cleanup-test-%d", i))
+			dataLenBuf := make([]byte, 2)
+			binary.BigEndian.PutUint16(dataLenBuf, uint16(len(testData)))
+			sLen := ca.Seal(nil, cn, dataLenBuf, nil)
+			NextNonce(cn)
+			sPay := ca.Seal(nil, cn, testData, nil)
+			NextNonce(cn)
+			stream.Write(append(sLen, sPay...))
+
+			rLen := make([]byte, 18)
+			io.ReadFull(stream, rLen)
+			pLen, _ := sa.Open(nil, sn, rLen, nil)
+			NextNonce(sn)
+			expLen := int(binary.BigEndian.Uint16(pLen))
+			rPay := make([]byte, expLen+16)
+			io.ReadFull(stream, rPay)
+			sa.Open(nil, sn, rPay, nil)
+
+			stream.Close()
+		}()
+	}
+
+	// Wait for goroutines to wind down (quic-go transport goroutines need time)
+	runtime.GC()
+	time.Sleep(5 * time.Second)
+	runtime.GC()
+
+	current := runtime.NumGoroutine()
+	t.Logf("After 10 connections: %d goroutines (baseline was %d)", current, baseline)
+
+	// Allow margin for quic-go internal transport goroutines that linger
+	if current > baseline+30 {
+		t.Errorf("possible goroutine leak: baseline=%d, current=%d (delta=%d)", baseline, current, current-baseline)
+	}
+}
+
+func TestConnectionCleanupAfterWebTransport(t *testing.T) {
+	echoAddr, cleanupEcho := startEchoServer(t)
+	defer cleanupEcho()
+
+	password := "cleanup-wt-test"
+	server, err := NewServer("127.0.0.1:0", password, "", 2, 2, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	go func() { _ = server.ListenAndServe() }()
+	select {
+	case <-server.Ready():
+	case <-time.After(5 * time.Second):
+		t.Fatal("server failed to start")
+	}
+	serverAddr := server.LocalAddr().String()
+
+	runtime.GC()
+	time.Sleep(200 * time.Millisecond)
+	baseline := runtime.NumGoroutine()
+	t.Logf("Baseline goroutines: %d", baseline)
+
+	for i := 0; i < 10; i++ {
+		func() {
+			var clientConn quic.EarlyConnection
+			tlsConf := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h3"}}
+			d := webtransport.Dialer{
+				TLSClientConfig: tlsConf,
+				DialAddr: func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (quic.EarlyConnection, error) {
+					c, err := quic.DialAddrEarly(ctx, addr, tlsCfg, cfg)
+					if err == nil {
+						clientConn = c
+					}
+					return c, err
+				},
+			}
+			defer d.Close()
+			defer func() {
+				if clientConn != nil {
+					clientConn.CloseWithError(0, "")
+				}
+			}()
+			_, sess, err := d.Dial(context.Background(), fmt.Sprintf("https://%s/brook", serverAddr), nil)
+			if err != nil {
+				t.Fatalf("WT dial %d: %v", i, err)
+			}
+			defer sess.CloseWithError(0, "")
+
+			stream, err := sess.OpenStreamSync(context.Background())
+			if err != nil {
+				t.Fatalf("WT open stream %d: %v", i, err)
+			}
+
+			cn, _ := GenerateNonce()
+			ck, _ := DeriveKey([]byte(password), cn, brookInfo)
+			ca, _ := NewGCMCipher(ck)
+			stream.Write(cn)
+
+			atyp, addrB, portB, _ := ParseAddress(echoAddr)
+			dstSlice := append([]byte{atyp}, addrB...)
+			dstSlice = append(dstSlice, portB...)
+			now := time.Now().Unix()
+			if now%2 != 0 {
+				now += 1
+			}
+			headerBody := make([]byte, 4+len(dstSlice))
+			binary.BigEndian.PutUint32(headerBody[:4], uint32(now))
+			copy(headerBody[4:], dstSlice)
+
+			hdrLenBuf := make([]byte, 2)
+			binary.BigEndian.PutUint16(hdrLenBuf, uint16(len(headerBody)))
+			sealedLen := ca.Seal(nil, cn, hdrLenBuf, nil)
+			NextNonce(cn)
+			sealedPayload := ca.Seal(nil, cn, headerBody, nil)
+			NextNonce(cn)
+			stream.Write(append(sealedLen, sealedPayload...))
+
+			sn := make([]byte, 12)
+			io.ReadFull(stream, sn)
+			sk, _ := DeriveKey([]byte(password), sn, brookInfo)
+			sa, _ := NewGCMCipher(sk)
+
+			testData := []byte(fmt.Sprintf("wt-cleanup-test-%d", i))
+			dataLenBuf := make([]byte, 2)
+			binary.BigEndian.PutUint16(dataLenBuf, uint16(len(testData)))
+			sLen := ca.Seal(nil, cn, dataLenBuf, nil)
+			NextNonce(cn)
+			sPay := ca.Seal(nil, cn, testData, nil)
+			NextNonce(cn)
+			stream.Write(append(sLen, sPay...))
+
+			rLen := make([]byte, 18)
+			io.ReadFull(stream, rLen)
+			pLen, _ := sa.Open(nil, sn, rLen, nil)
+			NextNonce(sn)
+			expLen := int(binary.BigEndian.Uint16(pLen))
+			rPay := make([]byte, expLen+16)
+			io.ReadFull(stream, rPay)
+			sa.Open(nil, sn, rPay, nil)
+
+			stream.Close()
+		}()
+	}
+
+	runtime.GC()
+	time.Sleep(5 * time.Second)
+	runtime.GC()
+
+	current := runtime.NumGoroutine()
+	t.Logf("After 10 WT connections: %d goroutines (baseline was %d)", current, baseline)
+
+	if current > baseline+30 {
+		buf := make([]byte, 1024*1024)
+		n := runtime.Stack(buf, true)
+		t.Logf("Running goroutines:\n%s", string(buf[:n]))
+		t.Errorf("possible goroutine leak: baseline=%d, current=%d (delta=%d)", baseline, current, current-baseline)
+	}
+}
+
+func TestProbeTimeoutCleansUp(t *testing.T) {
+	password := "probe-timeout-test"
+	server, err := NewServer("127.0.0.1:0", password, "", 2, 2, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	go func() { _ = server.ListenAndServe() }()
+	select {
+	case <-server.Ready():
+	case <-time.After(5 * time.Second):
+		t.Fatal("server failed to start")
+	}
+	serverAddr := server.LocalAddr().String()
+
+	runtime.GC()
+	time.Sleep(200 * time.Millisecond)
+	baseline := runtime.NumGoroutine()
+	t.Logf("Baseline goroutines: %d", baseline)
+
+	// Connect with h3 ALPN but never open any streams — should trigger probe timeout
+	for i := 0; i < 5; i++ {
+		func() {
+			tlsConf := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h3"}}
+			conn, err := quic.DialAddr(context.Background(), serverAddr, tlsConf, &quic.Config{EnableDatagrams: true})
+			if err != nil {
+				t.Fatalf("dial %d: %v", i, err)
+			}
+			// Don't open any streams, just wait for server to timeout
+			time.Sleep(4 * time.Second)
+			conn.CloseWithError(0, "test done")
+		}()
+	}
+
+	runtime.GC()
+	time.Sleep(5 * time.Second)
+	runtime.GC()
+
+	current := runtime.NumGoroutine()
+	t.Logf("After 5 probe-timeout connections: %d goroutines (baseline was %d)", current, baseline)
+
+	if current > baseline+20 {
+		t.Errorf("possible goroutine leak from probe timeouts: baseline=%d, current=%d (delta=%d)", baseline, current, current-baseline)
+	}
+}
+
+func TestManyConnectionsNoGoroutineLeak(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping stress test in short mode")
+	}
+
+	echoAddr, cleanupEcho := startEchoServer(t)
+	defer cleanupEcho()
+
+	password := "stress-leak-test"
+	server, err := NewServer("127.0.0.1:0", password, "", 2, 2, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	go func() { _ = server.ListenAndServe() }()
+	select {
+	case <-server.Ready():
+	case <-time.After(5 * time.Second):
+		t.Fatal("server failed to start")
+	}
+	serverAddr := server.LocalAddr().String()
+
+	runtime.GC()
+	time.Sleep(500 * time.Millisecond)
+	baseline := runtime.NumGoroutine()
+	t.Logf("Baseline goroutines: %d", baseline)
+
+	const N = 50
+	var wg sync.WaitGroup
+
+	for i := 0; i < N; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			tlsConf := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"brook-quic"}}
+			conn, err := quic.DialAddr(context.Background(), serverAddr, tlsConf, &quic.Config{EnableDatagrams: true})
+			if err != nil {
+				t.Errorf("dial %d: %v", idx, err)
+				return
+			}
+			defer conn.CloseWithError(0, "")
+
+			stream, err := conn.OpenStreamSync(context.Background())
+			if err != nil {
+				t.Errorf("open stream %d: %v", idx, err)
+				return
+			}
+
+			cn, _ := GenerateNonce()
+			ck, _ := DeriveKey([]byte(password), cn, brookInfo)
+			ca, _ := NewGCMCipher(ck)
+			stream.Write(cn)
+
+			atyp, addrB, portB, _ := ParseAddress(echoAddr)
+			dstSlice := append([]byte{atyp}, addrB...)
+			dstSlice = append(dstSlice, portB...)
+			now := time.Now().Unix()
+			if now%2 != 0 {
+				now += 1
+			}
+			headerBody := make([]byte, 4+len(dstSlice))
+			binary.BigEndian.PutUint32(headerBody[:4], uint32(now))
+			copy(headerBody[4:], dstSlice)
+
+			hdrLenBuf := make([]byte, 2)
+			binary.BigEndian.PutUint16(hdrLenBuf, uint16(len(headerBody)))
+			sealedLen := ca.Seal(nil, cn, hdrLenBuf, nil)
+			NextNonce(cn)
+			sealedPayload := ca.Seal(nil, cn, headerBody, nil)
+			NextNonce(cn)
+			stream.Write(append(sealedLen, sealedPayload...))
+
+			sn := make([]byte, 12)
+			if _, err := io.ReadFull(stream, sn); err != nil {
+				t.Errorf("read sn %d: %v", idx, err)
+				return
+			}
+			sk, _ := DeriveKey([]byte(password), sn, brookInfo)
+			sa, _ := NewGCMCipher(sk)
+
+			testData := []byte(fmt.Sprintf("stress-%d", idx))
+			dataLenBuf := make([]byte, 2)
+			binary.BigEndian.PutUint16(dataLenBuf, uint16(len(testData)))
+			sLen := ca.Seal(nil, cn, dataLenBuf, nil)
+			NextNonce(cn)
+			sPay := ca.Seal(nil, cn, testData, nil)
+			NextNonce(cn)
+			stream.Write(append(sLen, sPay...))
+
+			rLen := make([]byte, 18)
+			if _, err := io.ReadFull(stream, rLen); err != nil {
+				t.Errorf("read resp len %d: %v", idx, err)
+				return
+			}
+			pLen, _ := sa.Open(nil, sn, rLen, nil)
+			NextNonce(sn)
+			expLen := int(binary.BigEndian.Uint16(pLen))
+			rPay := make([]byte, expLen+16)
+			if _, err := io.ReadFull(stream, rPay); err != nil {
+				t.Errorf("read resp pay %d: %v", idx, err)
+				return
+			}
+			plain, _ := sa.Open(nil, sn, rPay, nil)
+			if string(plain) != string(testData) {
+				t.Errorf("mismatch %d: expected %q got %q", idx, string(testData), string(plain))
+			}
+
+			stream.Close()
+		}(i)
+	}
+
+	wg.Wait()
+
+	// Allow goroutines to settle (quic-go transport goroutines need time)
+	runtime.GC()
+	time.Sleep(5 * time.Second)
+	runtime.GC()
+
+	current := runtime.NumGoroutine()
+	t.Logf("After %d connections: %d goroutines (baseline was %d, delta=%d)", N, current, baseline, current-baseline)
+
+	// With the leak fixed, goroutine count should return close to baseline.
+	// Allow margin for quic-go internal transport goroutines that linger.
+	if current > baseline+50 {
+		t.Errorf("goroutine leak detected: baseline=%d, current=%d (delta=%d, expected <50)", baseline, current, current-baseline)
+	} else {
+		t.Logf("✅ No goroutine leak: %d goroutines within acceptable range of baseline %d", current, baseline)
+	}
 }

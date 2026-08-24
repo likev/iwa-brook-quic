@@ -86,9 +86,9 @@ type Server struct {
 	Cert         []byte
 	CertKey      []byte
 
-	ready     chan struct{}
-	ctx       context.Context
-	cancel    context.CancelFunc
+	ready      chan struct{}
+	ctx        context.Context
+	cancel     context.CancelFunc
 	packetConn net.PacketConn
 	listener   *quic.EarlyListener
 	wtServer   *webtransport.Server
@@ -207,6 +207,7 @@ func (s *Server) dispatchConnection(conn quic.EarlyConnection) {
 	// 1. Direct ALPN match
 	if alpn == "brook-quic" || alpn == "brook" {
 		HandleRawQUICConn(conn, s.Password, s.WithoutBrook, s.TCPTimeout, s.UDPTimeout, nil)
+		conn.CloseWithError(0, "done")
 		return
 	}
 
@@ -233,43 +234,68 @@ func (s *Server) dispatchConnection(conn quic.EarlyConnection) {
 
 	select {
 	case ustr := <-uniChan:
+		// Cancel probeCtx immediately to stop the losing probe goroutine
+		// before ServeQUICConn tries to accept streams on the same connection.
+		cancel()
 		// Client opened a unidirectional stream (HTTP/3 Control Stream). This is WebTransport!
+		// Drain any orphaned bidi stream from the losing probe goroutine.
+		go func() {
+			select {
+			case orphan := <-bidiChan:
+				orphan.Close()
+			default:
+			}
+		}()
 		iconn := &interceptedConn{
 			EarlyConnection: conn,
 			uniStreams:      []quic.ReceiveStream{ustr},
 		}
-		go func() {
-			if err := s.wtServer.ServeQUICConn(iconn); err != nil && err != http.ErrServerClosed {
-				log.Printf("[WebTransport] Session ended: %v", err)
-			}
-		}()
+		// ServeQUICConn manages the connection lifecycle; do not close conn here.
+		if err := s.wtServer.ServeQUICConn(iconn); err != nil && err != http.ErrServerClosed {
+			log.Printf("[WebTransport] Session ended: %v", err)
+		}
 
 	case bstr := <-bidiChan:
+		// Cancel probeCtx immediately to stop the losing probe goroutine
+		// before handlers try to accept streams on the same connection.
+		cancel()
+
 		// Client opened a bidirectional stream first. Peek first byte to inspect frame type.
 		buf := make([]byte, 1)
 		n, err := bstr.Read(buf)
 		if err != nil {
 			bstr.Close()
+			conn.CloseWithError(0, "read error")
 			return
 		}
 		firstByte := buf[0]
 
 		if firstByte == 0x01 || firstByte == 0x41 {
 			// HTTP/3 HEADERS frame (0x01) or WebTransport stream frame (0x41)
+			// The uni stream (HTTP/3 control stream) is needed by ServeQUICConn,
+			// so do NOT drain it — it will be consumed via the connection.
 			sStream := newBufferedStream(bstr, buf[:n])
 			iconn := &interceptedConn{
 				EarlyConnection: conn,
 				bidiStreams:     []quic.Stream{sStream},
 			}
-			go func() {
-				if err := s.wtServer.ServeQUICConn(iconn); err != nil && err != http.ErrServerClosed {
-					log.Printf("[WebTransport] Session ended: %v", err)
-				}
-			}()
+			// ServeQUICConn manages the connection lifecycle; do not close conn here.
+			if err := s.wtServer.ServeQUICConn(iconn); err != nil && err != http.ErrServerClosed {
+				log.Printf("[WebTransport] Session ended: %v", err)
+			}
 		} else {
 			// Raw Brook QUIC stream (starts with 12-byte random client nonce)
+			// Drain any orphaned uni stream from the losing probe goroutine.
+			go func() {
+				select {
+				case orphan := <-uniChan:
+					orphan.CancelRead(0)
+				default:
+				}
+			}()
 			sStream := newBufferedStream(bstr, buf[:n])
-			go HandleRawQUICConn(conn, s.Password, s.WithoutBrook, s.TCPTimeout, s.UDPTimeout, sStream)
+			HandleRawQUICConn(conn, s.Password, s.WithoutBrook, s.TCPTimeout, s.UDPTimeout, sStream)
+			conn.CloseWithError(0, "done")
 		}
 
 	case <-probeCtx.Done():

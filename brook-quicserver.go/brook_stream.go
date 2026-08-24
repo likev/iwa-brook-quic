@@ -274,6 +274,8 @@ func handleEncryptedBrookStream(client StreamConn, cn []byte, rawPass, passHash 
 		defer wg.Done()
 		lenChunk := make([]byte, 18)
 		payloadChunk := make([]byte, 65536)
+		plainLenBuf := make([]byte, 0, 2)
+		plainDataBuf := make([]byte, 0, 65536)
 
 		for {
 			if timeout != 0 {
@@ -282,7 +284,8 @@ func handleEncryptedBrookStream(client StreamConn, cn []byte, rawPass, passHash 
 			if _, err := io.ReadFull(client, lenChunk); err != nil {
 				return
 			}
-			plainL, err := ca.Open(nil, cn, lenChunk, nil)
+			plainLenBuf = plainLenBuf[:0]
+			plainL, err := ca.Open(plainLenBuf, cn, lenChunk, nil)
 			if err != nil {
 				return
 			}
@@ -299,7 +302,8 @@ func handleEncryptedBrookStream(client StreamConn, cn []byte, rawPass, passHash 
 			if _, err := io.ReadFull(client, payloadChunk[:l+16]); err != nil {
 				return
 			}
-			plainData, err := ca.Open(nil, cn, payloadChunk[:l+16], nil)
+			plainDataBuf = plainDataBuf[:0]
+			plainData, err := ca.Open(plainDataBuf, cn, payloadChunk[:l+16], nil)
 			if err != nil {
 				return
 			}
