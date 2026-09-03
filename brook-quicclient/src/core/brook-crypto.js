@@ -11,17 +11,19 @@
  * @param {Uint8Array} nonce12 - 12-byte nonce modified in place
  */
 export function nextNonce(nonce12) {
-  let v = (BigInt(nonce12[0])) |
-          (BigInt(nonce12[1]) << 8n) |
-          (BigInt(nonce12[2]) << 16n) |
-          (BigInt(nonce12[3]) << 24n) |
-          (BigInt(nonce12[4]) << 32n) |
-          (BigInt(nonce12[5]) << 40n) |
-          (BigInt(nonce12[6]) << 48n) |
-          (BigInt(nonce12[7]) << 56n);
-  v = (v + 1n) & 0xFFFFFFFFFFFFFFFFn;
-  for (let i = 0; i < 8; i++) {
-    nonce12[i] = Number((v >> BigInt(i * 8)) & 0xFFn);
+  const low = (nonce12[0] | (nonce12[1] << 8) | (nonce12[2] << 16) | (nonce12[3] << 24)) >>> 0;
+  const newLow = (low + 1) >>> 0;
+  nonce12[0] = newLow & 0xFF;
+  nonce12[1] = (newLow >>> 8) & 0xFF;
+  nonce12[2] = (newLow >>> 16) & 0xFF;
+  nonce12[3] = (newLow >>> 24) & 0xFF;
+  if (newLow === 0) {
+    const high = (nonce12[4] | (nonce12[5] << 8) | (nonce12[6] << 16) | (nonce12[7] << 24)) >>> 0;
+    const newHigh = (high + 1) >>> 0;
+    nonce12[4] = newHigh & 0xFF;
+    nonce12[5] = (newHigh >>> 8) & 0xFF;
+    nonce12[6] = (newHigh >>> 16) & 0xFF;
+    nonce12[7] = (newHigh >>> 24) & 0xFF;
   }
 }
 
@@ -46,6 +48,61 @@ export async function sha256(data) {
   return new Uint8Array(digest);
 }
 
+const baseKeyCache = new Map(); // cacheKey -> CryptoKey
+const baseKeyPending = new Map(); // cacheKey -> Promise<CryptoKey>
+const MAX_BASE_KEY_CACHE = 8;
+
+function cacheKeyFor(password, withoutBrook) {
+  if (typeof password === 'string') return `s:${password}:${withoutBrook}`;
+  if (password instanceof Uint8Array) {
+    // Passwords are small (<128B); hex prefix + length is cheap and collision-safe
+    // for the cache key (cryptographic safety comes from the key itself, not the key string).
+    let hex = '';
+    const n = Math.min(password.length, 64);
+    for (let i = 0; i < n; i++) hex += password[i].toString(16).padStart(2, '0');
+    return `b:${password.length}:${hex}:${withoutBrook}`;
+  }
+  return `o:${String(password)}:${withoutBrook}`;
+}
+
+async function getBaseKey(password, withoutBrook) {
+  const cacheKey = cacheKeyFor(password, withoutBrook);
+  const hit = baseKeyCache.get(cacheKey);
+  if (hit) {
+    // LRU refresh
+    baseKeyCache.delete(cacheKey);
+    baseKeyCache.set(cacheKey, hit);
+    return hit;
+  }
+  const inflight = baseKeyPending.get(cacheKey);
+  if (inflight) return inflight;
+  const p = (async () => {
+    try {
+      let pwdBytes = typeof password === 'string' ? new TextEncoder().encode(password) : password;
+      if (withoutBrook) {
+        pwdBytes = await sha256(pwdBytes);
+      }
+      const k = await globalThis.crypto.subtle.importKey(
+        'raw',
+        pwdBytes,
+        'HKDF',
+        false,
+        ['deriveKey', 'deriveBits']
+      );
+      if (baseKeyCache.size >= MAX_BASE_KEY_CACHE) {
+        const oldest = baseKeyCache.keys().next().value;
+        baseKeyCache.delete(oldest);
+      }
+      baseKeyCache.set(cacheKey, k);
+      return k;
+    } finally {
+      baseKeyPending.delete(cacheKey);
+    }
+  })();
+  baseKeyPending.set(cacheKey, p);
+  return p;
+}
+
 /**
  * Derive an AES-GCM CryptoKey using HKDF-SHA256 via Web Crypto API.
  *
@@ -56,18 +113,8 @@ export async function sha256(data) {
  * @returns {Promise<CryptoKey>} Derived AES-GCM CryptoKey
  */
 export async function deriveKey(password, nonce12, info = 'brook', withoutBrook = true) {
-  let pwdBytes = typeof password === 'string' ? new TextEncoder().encode(password) : password;
-  if (withoutBrook) {
-    pwdBytes = await sha256(pwdBytes);
-  }
   const infoBytes = typeof info === 'string' ? new TextEncoder().encode(info) : info;
-  const baseKey = await globalThis.crypto.subtle.importKey(
-    'raw',
-    pwdBytes,
-    'HKDF',
-    false,
-    ['deriveKey', 'deriveBits']
-  );
+  const baseKey = await getBaseKey(password, withoutBrook);
   return await globalThis.crypto.subtle.deriveKey(
     {
       name: 'HKDF',
@@ -92,18 +139,8 @@ export async function deriveKey(password, nonce12, info = 'brook', withoutBrook 
  * @returns {Promise<Uint8Array>} 32-byte raw key buffer
  */
 export async function deriveKeyBytes(password, nonce12, info = 'brook', withoutBrook = true) {
-  let pwdBytes = typeof password === 'string' ? new TextEncoder().encode(password) : password;
-  if (withoutBrook) {
-    pwdBytes = await sha256(pwdBytes);
-  }
   const infoBytes = typeof info === 'string' ? new TextEncoder().encode(info) : info;
-  const baseKey = await globalThis.crypto.subtle.importKey(
-    'raw',
-    pwdBytes,
-    'HKDF',
-    false,
-    ['deriveBits']
-  );
+  const baseKey = await getBaseKey(password, withoutBrook);
   const bits = await globalThis.crypto.subtle.deriveBits(
     {
       name: 'HKDF',

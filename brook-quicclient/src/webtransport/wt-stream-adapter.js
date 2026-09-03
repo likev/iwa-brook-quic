@@ -14,6 +14,7 @@ export class WtStreamSession {
     this.writer = bidiStream.writable.getWriter();
     this.streamHandlers = new Map();
     this._pendingChunks = [];
+    this._pendingBytes = 0;
     this.isClosed = false;
     this.isConnected = true;
 
@@ -29,6 +30,7 @@ export class WtStreamSession {
     if (this._pendingChunks.length > 0) {
       const pending = this._pendingChunks;
       this._pendingChunks = [];
+      this._pendingBytes = 0;
       for (const item of pending) {
         if (handlers.onData) handlers.onData(item.data, item.fin);
         if (item.fin && handlers.onClose) handlers.onClose();
@@ -66,6 +68,21 @@ export class WtStreamSession {
   }
 
   async _startReadPump() {
+    const MAX_PENDING_BYTES = 4 * 1024 * 1024;
+    const failPendingOverflow = (droppedBytes) => {
+      // Bounded queue overflow: fail fast instead of silently dropping bytes,
+      // which would corrupt GCM framing and surface as decrypt_error downstream.
+      if (this.onLog) {
+        try { this.onLog('error', `WT stream ${this.streamId} pending buffer overflow (${droppedBytes}B dropped). Closing stream.`); } catch (e) {}
+      }
+      const h = this.streamHandlers.get(this.streamId);
+      if (h && h.onError) {
+        try { h.onError(new Error('WT pending buffer overflow')); } catch (e) {}
+      }
+      this._pendingChunks = [];
+      this._pendingBytes = 0;
+      this.close();
+    };
     try {
       while (!this.isClosed) {
         const { value, done } = await this.reader.read();
@@ -89,7 +106,12 @@ export class WtStreamSession {
           if (handler && handler.onData) {
             handler.onData(value, false);
           } else {
+            if (this._pendingBytes + value.length > MAX_PENDING_BYTES) {
+              failPendingOverflow(value.length);
+              break;
+            }
             this._pendingChunks.push({ data: value, fin: false });
+            this._pendingBytes += value.length;
           }
         }
       }

@@ -30,15 +30,17 @@ type WebTransportHandler struct {
 	withoutBrook bool
 	tcpTimeout   int
 	udpTimeout   int
+	streamSem    chan struct{}
 }
 
-func NewWebTransportHandler(wtServer *webtransport.Server, password []byte, withoutBrook bool, tcpTimeout, udpTimeout int) *WebTransportHandler {
+func NewWebTransportHandler(wtServer *webtransport.Server, password []byte, withoutBrook bool, tcpTimeout, udpTimeout int, streamSem chan struct{}) *WebTransportHandler {
 	return &WebTransportHandler{
 		server:       wtServer,
 		password:     password,
 		withoutBrook: withoutBrook,
 		tcpTimeout:   tcpTimeout,
 		udpTimeout:   udpTimeout,
+		streamSem:    streamSem,
 	}
 }
 
@@ -62,6 +64,16 @@ func (h *WebTransportHandler) HandleUpgrade(w http.ResponseWriter, r *http.Reque
 				return
 			}
 
+			if h.streamSem != nil {
+				select {
+				case h.streamSem <- struct{}{}:
+				default:
+					str.CancelRead(0)
+					_ = str.Close()
+					continue
+				}
+			}
+
 			conn := &WTStreamConn{
 				Stream:     str,
 				localAddr:  localAddr,
@@ -69,8 +81,13 @@ func (h *WebTransportHandler) HandleUpgrade(w http.ResponseWriter, r *http.Reque
 			}
 
 			go func(c StreamConn) {
+				if h.streamSem != nil {
+					defer func() { <-h.streamSem }()
+				}
 				if err := HandleBrookStream(c, h.password, h.withoutBrook, h.tcpTimeout, h.udpTimeout); err != nil {
-					log.Printf("[WebTransport] Stream error from %s: %v", remoteAddr, err)
+					if !isNormalStreamClose(err) {
+						log.Printf("[WebTransport] Stream error from %s: %v", remoteAddr, err)
+					}
 				}
 			}(conn)
 		}

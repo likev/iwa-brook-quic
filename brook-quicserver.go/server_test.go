@@ -1271,3 +1271,192 @@ func TestManyConnectionsNoGoroutineLeak(t *testing.T) {
 		t.Logf("✅ No goroutine leak: %d goroutines within acceptable range of baseline %d", current, baseline)
 	}
 }
+
+func TestBidiOpenNoDataTimeout(t *testing.T) {
+	password := "testpassword123"
+	server, err := NewServer("127.0.0.1:0", password, "", 10, 10, false)
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+	defer server.Close()
+
+	go func() {
+		_ = server.ListenAndServe()
+	}()
+
+	select {
+	case <-server.Ready():
+	case <-time.After(5 * time.Second):
+		t.Fatal("server failed to start within 5s")
+	}
+	serverAddr := server.LocalAddr().String()
+
+	tlsConf := &tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"h3", "brook-quic"},
+	}
+
+	conn, err := quic.DialAddr(context.Background(), serverAddr, tlsConf, &quic.Config{EnableDatagrams: true})
+	if err != nil {
+		t.Fatalf("QUIC dial failed: %v", err)
+	}
+	defer conn.CloseWithError(0, "")
+
+	// Open bidi stream and send NO data
+	stream, err := conn.OpenStreamSync(context.Background())
+	if err != nil {
+		t.Fatalf("open stream failed: %v", err)
+	}
+	defer stream.Close()
+
+	// Wait for server to timeout on bidi read (3s deadline) and close stream/conn
+	readBuf := make([]byte, 10)
+	done := make(chan struct{})
+	go func() {
+		_, _ = stream.Read(readBuf)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		t.Log("✅ dispatchConnection exited and closed stream on bidi read timeout within 5s")
+	case <-time.After(5 * time.Second):
+		t.Fatal("❌ dispatchConnection hung: did not exit within 5s on bidi-first with no data")
+	}
+}
+
+func TestConcurrentHalfCloseNoTimeout(t *testing.T) {
+	echoAddr, cleanupEcho := startEchoServer(t)
+	defer cleanupEcho()
+
+	password := "testpassword123"
+	// Test with tcpTimeout=0 (production default) to ensure half-close unblocks and no stall
+	server, err := NewServer("127.0.0.1:0", password, "", 0, 10, false)
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+	defer server.Close()
+
+	go func() {
+		_ = server.ListenAndServe()
+	}()
+
+	select {
+	case <-server.Ready():
+	case <-time.After(5 * time.Second):
+		t.Fatal("server failed to start within 5s")
+	}
+	serverAddr := server.LocalAddr().String()
+
+	runtime.GC()
+	time.Sleep(200 * time.Millisecond)
+	baseline := runtime.NumGoroutine()
+	t.Logf("Baseline goroutines: %d", baseline)
+
+	tlsConf := &tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"brook-quic"},
+	}
+
+	const N = 5
+	for i := 0; i < N; i++ {
+		func(idx int) {
+			conn, err := quic.DialAddr(context.Background(), serverAddr, tlsConf, &quic.Config{EnableDatagrams: true})
+			if err != nil {
+				t.Fatalf("QUIC dial failed: %v", err)
+			}
+			defer conn.CloseWithError(0, "")
+
+			stream, err := conn.OpenStreamSync(context.Background())
+			if err != nil {
+				t.Fatalf("open stream failed: %v", err)
+			}
+			defer stream.Close()
+
+			cn, _ := GenerateNonce()
+			stream.Write(cn)
+			ck, _ := DeriveKey([]byte(password), cn, brookInfo)
+			ca, _ := NewGCMCipher(ck)
+
+			atyp, addrB, portB, err := ParseAddress(echoAddr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			dstSlice := append([]byte{atyp}, addrB...)
+			dstSlice = append(dstSlice, portB...)
+			now := time.Now().Unix()
+			if now%2 != 0 {
+				now += 1
+			}
+			hPayload := make([]byte, 4+len(dstSlice))
+			binary.BigEndian.PutUint32(hPayload[:4], uint32(now))
+			copy(hPayload[4:], dstSlice)
+			sLen := make([]byte, 2)
+			binary.BigEndian.PutUint16(sLen, uint16(len(hPayload)))
+			encLen := ca.Seal(nil, cn, sLen, nil)
+			NextNonce(cn)
+			encPayload := ca.Seal(nil, cn, hPayload, nil)
+			NextNonce(cn)
+			stream.Write(append(encLen, encPayload...))
+
+			sn := make([]byte, 12)
+			if _, err := io.ReadFull(stream, sn); err != nil {
+				t.Fatalf("read sn: %v", err)
+			}
+			sk, _ := DeriveKey([]byte(password), sn, brookInfo)
+			sa, _ := NewGCMCipher(sk)
+
+			// Send echo payload
+			testMsg := []byte("half-close-test-data")
+			msgLen := make([]byte, 2)
+			binary.BigEndian.PutUint16(msgLen, uint16(len(testMsg)))
+			sMsgLen := ca.Seal(nil, cn, msgLen, nil)
+			NextNonce(cn)
+			sMsgPayload := ca.Seal(nil, cn, testMsg, nil)
+			NextNonce(cn)
+			stream.Write(append(sMsgLen, sMsgPayload...))
+
+			// Read echo response
+			respLenBuf := make([]byte, 18)
+			if _, err := io.ReadFull(stream, respLenBuf); err != nil {
+				t.Fatalf("read resp len: %v", err)
+			}
+			pLen, _ := sa.Open(nil, sn, respLenBuf, nil)
+			NextNonce(sn)
+			rLen := int(binary.BigEndian.Uint16(pLen))
+			respPayloadBuf := make([]byte, rLen+16)
+			if _, err := io.ReadFull(stream, respPayloadBuf); err != nil {
+				t.Fatalf("read resp payload: %v", err)
+			}
+			plain, _ := sa.Open(nil, sn, respPayloadBuf, nil)
+			NextNonce(sn)
+			if string(plain) != string(testMsg) {
+				t.Fatalf("mismatch: %s", string(plain))
+			}
+
+			// Close stream (simulates client half-close / FIN).
+			// With the unblockOther + effectiveTimeout fix, server HandleBrookStream
+			// must unwind both copy legs within ~5s (peer deadline) + 10s Wait fallback.
+			start := time.Now()
+			_ = stream.Close()
+			// Give server a moment to observe FIN; client side close is immediate.
+			_ = start
+		}(i)
+	}
+
+	// Server copy legs use 5s peer deadline + 10s Wait fallback, so 15s is the
+	// hard upper bound. Assert goroutines return near baseline well before that.
+	runtime.GC()
+	time.Sleep(6 * time.Second)
+	runtime.GC()
+
+	current := runtime.NumGoroutine()
+	t.Logf("After %d half-closed streams (tcpTimeout=0): %d goroutines (baseline %d)", N, current, baseline)
+	if current > baseline+30 {
+		buf := make([]byte, 512*1024)
+		n := runtime.Stack(buf, true)
+		t.Logf("Running goroutines:\n%s", string(buf[:n]))
+		t.Fatalf("half-close goroutine leak with tcpTimeout=0: baseline=%d current=%d (delta=%d)", baseline, current, current-baseline)
+	}
+	t.Log("✅ Half-close unwound promptly with tcpTimeout=0, no stall")
+}

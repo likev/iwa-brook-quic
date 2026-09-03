@@ -93,6 +93,7 @@ async function runWtTunnel({
           serverHost,
           serverPort,
           path,
+          poolSize: 1,
           onLog: (lvl, msg, meta) => log(lvl, msg, meta)
         });
 

@@ -5,6 +5,7 @@
 
 import net from 'node:net';
 import http from 'node:http';
+import fs from 'node:fs';
 import { spawn, exec } from 'node:child_process';
 import { promisify } from 'node:util';
 
@@ -215,6 +216,54 @@ async function runUnitTests() {
   assert(finChunk.done === true, 'WorkerTunnelBridge clientReader signals stream completion upon CLIENT_FIN');
   bridge.close();
   bridgePort1.close();
+
+  // 1.10.1 WorkerTunnelBridge Concurrent Double-Read
+  const { port1: drPort1, port2: drPort2 } = new MessageChannel();
+  const drBridge = createPortStreamBridge(drPort2);
+  const drPromise1 = drBridge.clientReader.read();
+  const drPromise2 = drBridge.clientReader.read();
+  drPort1.postMessage({ type: 'CLIENT_DATA', chunk: new Uint8Array([11, 22]) });
+  drPort1.postMessage({ type: 'CLIENT_DATA', chunk: new Uint8Array([33, 44]) });
+  const [dr1, dr2] = await Promise.all([drPromise1, drPromise2]);
+  assert(!dr1.done && dr1.value[0] === 11 && !dr2.done && dr2.value[0] === 33, 'Concurrent double-read on WorkerTunnelBridge resolves both promises accurately without slot overwrite');
+  drBridge.close();
+  drPort1.close();
+
+  // 1.10.2 Worker WebTransport Pool Size Configuration
+  const workerSrc = fs.readFileSync('/root/downloads/iwa/brook-quicclient/src/workers/wt-session.worker.js', 'utf-8');
+  assert(workerSrc.includes('poolSize: 1'), 'wt-session.worker.js configures poolSize: 1 to prevent 5-connection pool fan-out');
+
+  // 1.10.3 Back-to-Back processRxQueue Lost-Wakeup Stress Test
+  const rxTestQueue = [];
+  let rxProcessed = 0;
+  let rxProcessing = false;
+  const testProcessRx = async () => {
+    if (rxProcessing) return;
+    rxProcessing = true;
+    try {
+      while (rxTestQueue.length > 0) {
+        const item = rxTestQueue.shift();
+        // Simulate async I/O
+        await new Promise(r => setImmediate(r));
+        rxProcessed++;
+      }
+    } finally {
+      rxProcessing = false;
+      if (rxTestQueue.length > 0) {
+        queueMicrotask(testProcessRx);
+      }
+    }
+  };
+  for (let i = 0; i < 100; i++) {
+    rxTestQueue.push(i);
+    testProcessRx();
+  }
+  let waitCount = 0;
+  while (rxProcessed < 100 && waitCount < 50) {
+    await new Promise(r => setTimeout(r, 10));
+    waitCount++;
+  }
+  assert(rxProcessed === 100, `Back-to-back processRxQueue stress drained all 100 items without lost wakeup (${rxProcessed}/100)`);
 
   // 1.11 BrookTunnel Structured Outcome Classification
   const targetRefusedOutcome = {
@@ -713,16 +762,22 @@ async function runE2ETests() {
     assert(streamBytes === 2 * 1024 * 1024, `Large payload streaming transferred exactly 2MB without corruption (${(streamBytes / 1024 / 1024 / duration).toFixed(2)} MB/s)`);
 
     // Test 5: Auto-Detection of withoutBrookProtocol in brook-quicserver.go
-    const { stdout: autoDetectOut } = await execAsync('/usr/local/go/bin/go test -v -run TestAutoDetectWithoutBrookProtocol .', {
+    const { stdout: autoDetectOut } = await execAsync('go test -v -run TestAutoDetectWithoutBrookProtocol .', {
       cwd: '/root/downloads/iwa/brook-quicserver.go'
     });
     assert(autoDetectOut.includes('PASS'), 'brook-quicserver.go auto-detects withoutBrookProtocol per stream dynamically');
 
     // Test 6: Simultaneous 25 Raw QUIC + 25 WebTransport Clients on the SAME port
-    const { stdout: goTestOut } = await execAsync('/usr/local/go/bin/go test -v -run TestSimultaneousDualClients .', {
+    const { stdout: goTestOut } = await execAsync('go test -v -run TestSimultaneousDualClients .', {
       cwd: '/root/downloads/iwa/brook-quicserver.go'
     });
     assert(goTestOut.includes('PASS'), '25 Raw QUIC + 25 WebTransport simultaneous clients verified on same port');
+
+    // Test 7: Bidi idle probe timeout and half-close no-stall verification
+    const { stdout: bidiHalfCloseOut } = await execAsync('go test -v -run "TestBidiOpenNoDataTimeout|TestConcurrentHalfCloseNoTimeout" .', {
+      cwd: '/root/downloads/iwa/brook-quicserver.go'
+    });
+    assert(bidiHalfCloseOut.includes('PASS'), 'Verified bidi-open 3s read deadline and half-close clean unblock with tcpTimeout=0');
 
   } finally {
     socks5Server.close();

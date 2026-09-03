@@ -23,7 +23,7 @@ func (c *RawQUICStreamConn) RemoteAddr() net.Addr {
 }
 
 // HandleRawQUICConn handles streams from a legacy / raw Brook QUIC connection.
-func HandleRawQUICConn(conn quic.Connection, password []byte, withoutBrook bool, tcpTimeout, udpTimeout int, firstStream quic.Stream) {
+func HandleRawQUICConn(conn quic.Connection, password []byte, withoutBrook bool, tcpTimeout, udpTimeout int, firstStream quic.Stream, streamSem chan struct{}) {
 	remoteAddr := conn.RemoteAddr()
 	localAddr := conn.LocalAddr()
 
@@ -31,14 +31,29 @@ func HandleRawQUICConn(conn quic.Connection, password []byte, withoutBrook bool,
 
 	// If a first stream was already accepted during protocol detection, process it immediately
 	if firstStream != nil {
+		if streamSem != nil {
+			select {
+			case streamSem <- struct{}{}:
+			default:
+				firstStream.CancelRead(0)
+				_ = firstStream.Close()
+				return
+			}
+		}
+
 		sConn := &RawQUICStreamConn{
 			Stream:     firstStream,
 			localAddr:  localAddr,
 			remoteAddr: remoteAddr,
 		}
 		go func(c StreamConn) {
+			if streamSem != nil {
+				defer func() { <-streamSem }()
+			}
 			if err := HandleBrookStream(c, password, withoutBrook, tcpTimeout, udpTimeout); err != nil {
-				log.Printf("[QUIC] Stream error from %s: %v", remoteAddr, err)
+				if !isNormalStreamClose(err) {
+					log.Printf("[QUIC] Stream error from %s: %v", remoteAddr, err)
+				}
 			}
 		}(sConn)
 	}
@@ -51,6 +66,16 @@ func HandleRawQUICConn(conn quic.Connection, password []byte, withoutBrook bool,
 			return
 		}
 
+		if streamSem != nil {
+			select {
+			case streamSem <- struct{}{}:
+			default:
+				st.CancelRead(0)
+				_ = st.Close()
+				continue
+			}
+		}
+
 		sConn := &RawQUICStreamConn{
 			Stream:     st,
 			localAddr:  localAddr,
@@ -58,8 +83,13 @@ func HandleRawQUICConn(conn quic.Connection, password []byte, withoutBrook bool,
 		}
 
 		go func(c StreamConn) {
+			if streamSem != nil {
+				defer func() { <-streamSem }()
+			}
 			if err := HandleBrookStream(c, password, withoutBrook, tcpTimeout, udpTimeout); err != nil {
-				log.Printf("[QUIC] Stream error from %s: %v", remoteAddr, err)
+				if !isNormalStreamClose(err) {
+					log.Printf("[QUIC] Stream error from %s: %v", remoteAddr, err)
+				}
 			}
 		}(sConn)
 	}

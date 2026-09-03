@@ -121,8 +121,8 @@ export class BrookTunnel {
     let dialDurationMs = 0;
     let expectedPayloadLen = -1;
 
-    // Bounded Serialized FIFO queue for downstream processing (256MB buffer cap)
-    const MAX_RX_BUFFER_BYTES = 256 * 1024 * 1024;
+    // Bounded Serialized FIFO queue for downstream processing (16MB buffer cap)
+    const MAX_RX_BUFFER_BYTES = 16 * 1024 * 1024;
     let rxQueuedBytes = 0;
     const rxQueue = [];
     let isProcessingRx = false;
@@ -250,7 +250,7 @@ export class BrookTunnel {
 
           if (data && data.length > 0) {
             if (rxOffset > 0) {
-              rxBuffer = rxBuffer.subarray(rxOffset);
+              rxBuffer = rxBuffer.slice(rxOffset);
               rxOffset = 0;
             }
             if (rxBuffer.length === 0) {
@@ -366,9 +366,9 @@ export class BrookTunnel {
               }
             }
 
-            // Immediately trim rxBuffer to retain only unconsumed remainder
+            // Immediately trim rxBuffer to retain only unconsumed remainder (slice ensures previous ArrayBuffer can be GC'd)
             if (rxOffset > 0) {
-              rxBuffer = rxOffset === rxBuffer.length ? new Uint8Array(0) : rxBuffer.subarray(rxOffset);
+              rxBuffer = rxOffset === rxBuffer.length ? new Uint8Array(0) : rxBuffer.slice(rxOffset);
               rxOffset = 0;
             }
           }
@@ -407,6 +407,9 @@ export class BrookTunnel {
         cleanup('rx_error', err);
       } finally {
         isProcessingRx = false;
+        if (rxQueue.length > 0 && !isTerminated) {
+          queueMicrotask(processRxQueue);
+        }
         if (rxQueuedBytes < 1024 * 1024 && rxHighWaterLogged) {
           rxHighWaterLogged = false;
           if (onLog) {
@@ -473,7 +476,7 @@ export class BrookTunnel {
       // Step C: If there is leftover data (e.g. rewritten HTTP request), seal and send immediately
       if (leftover && leftover.length > 0) {
         hasExchangedData = true;
-        const CHUNK_SIZE = 16384;
+        const CHUNK_SIZE = 32768;
         for (let offset = 0; offset < leftover.length; offset += CHUNK_SIZE) {
           const slice = leftover.subarray(offset, Math.min(offset + CHUNK_SIZE, leftover.length));
           const sealedLeftover = await sealFrame(clientCipher, cnCopy, slice);
@@ -537,7 +540,7 @@ export class BrookTunnel {
             }
             hasExchangedData = true;
             resetIdleTimer();
-            const CHUNK_SIZE = 16384;
+            const CHUNK_SIZE = 32768;
             let writeFailed = false;
             for (let offset = 0; offset < value.length; offset += CHUNK_SIZE) {
               const slice = value.subarray(offset, Math.min(offset + CHUNK_SIZE, value.length));

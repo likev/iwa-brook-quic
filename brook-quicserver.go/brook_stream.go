@@ -14,6 +14,37 @@ import (
 
 var brookInfo = []byte("brook")
 
+var (
+	// Pool for TCP frames: 2 + 16 + 2014 + 16 = 2048 bytes
+	tcpFramePool = sync.Pool{
+		New: func() any {
+			b := make([]byte, 2048)
+			return &b
+		},
+	}
+	// Pool for TCP raw payload: 2014 bytes
+	tcpRawPool = sync.Pool{
+		New: func() any {
+			b := make([]byte, 2014)
+			return &b
+		},
+	}
+	// Pool for 64KB buffers (UDP frames, payloadChunk, and simple stream buffers)
+	buf64kPool = sync.Pool{
+		New: func() any {
+			b := make([]byte, 65536)
+			return &b
+		},
+	}
+	// Pool for UDP frame buffer (2 + 16 + 65473 + 16 = 65507 bytes)
+	udpFramePool = sync.Pool{
+		New: func() any {
+			b := make([]byte, 65507)
+			return &b
+		},
+	}
+)
+
 // StreamConn is an interface representing a stream connection that can be read, written, and closed.
 type StreamConn interface {
 	io.Reader
@@ -227,23 +258,45 @@ func handleEncryptedBrookStream(client StreamConn, cn []byte, rawPass, passHash 
 	var wg sync.WaitGroup
 	wg.Add(2)
 
+	doneOnce := sync.Once{}
+	unblockOther := func() {
+		doneOnce.Do(func() {
+			// Propagate close / unblock peer leg with a 5-second deadline
+			_ = remote.SetDeadline(time.Now().Add(5 * time.Second))
+			_ = client.SetDeadline(time.Now().Add(5 * time.Second))
+		})
+	}
+
+	effectiveTimeout := timeout
+	if effectiveTimeout == 0 {
+		effectiveTimeout = 300
+	}
+
 	// Remote -> Client (Encrypt & Send to Client)
 	go func() {
 		defer wg.Done()
-		// In official Brook stream protocol (txthinking/brook), client buffers are:
-		// TCP: 2048 bytes total (payload max: 2048 - 2 - 16 - 16 = 2014 bytes)
-		// UDP: 65507 bytes total (payload max: 65507 - 2 - 16 - 16 = 65473 bytes)
-		maxPayload := 2014
-		if !isTCP {
-			maxPayload = 65473
+		defer unblockOther()
+
+		var rawBuf []byte
+		var frameBuf []byte
+		if isTCP {
+			rawPtr := tcpRawPool.Get().(*[]byte)
+			framePtr := tcpFramePool.Get().(*[]byte)
+			defer tcpRawPool.Put(rawPtr)
+			defer tcpFramePool.Put(framePtr)
+			rawBuf = *rawPtr
+			frameBuf = *framePtr
+		} else {
+			rawPtr := buf64kPool.Get().(*[]byte)
+			framePtr := udpFramePool.Get().(*[]byte)
+			defer buf64kPool.Put(rawPtr)
+			defer udpFramePool.Put(framePtr)
+			rawBuf = (*rawPtr)[:65473]
+			frameBuf = *framePtr
 		}
-		rawBuf := make([]byte, maxPayload)
-		frameBuf := make([]byte, 2+16+maxPayload+16)
 
 		for {
-			if timeout != 0 {
-				_ = remote.SetReadDeadline(time.Now().Add(time.Duration(timeout) * time.Second))
-			}
+			_ = remote.SetReadDeadline(time.Now().Add(time.Duration(effectiveTimeout) * time.Second))
 			n, err := remote.Read(rawBuf)
 			if n > 0 {
 				// 1. Seal length (2B)
@@ -256,9 +309,7 @@ func handleEncryptedBrookStream(client StreamConn, cn []byte, rawPass, passHash 
 				NextNonce(sn)
 
 				totalLen := 18 + n + 16
-				if timeout != 0 {
-					_ = client.SetWriteDeadline(time.Now().Add(time.Duration(timeout) * time.Second))
-				}
+				_ = client.SetWriteDeadline(time.Now().Add(time.Duration(effectiveTimeout) * time.Second))
 				if _, werr := client.Write(frameBuf[:totalLen]); werr != nil {
 					return
 				}
@@ -272,15 +323,20 @@ func handleEncryptedBrookStream(client StreamConn, cn []byte, rawPass, passHash 
 	// Client -> Remote (Decrypt & Send to Remote)
 	go func() {
 		defer wg.Done()
+		defer unblockOther()
+
 		lenChunk := make([]byte, 18)
-		payloadChunk := make([]byte, 65536)
+		payloadChunkPtr := buf64kPool.Get().(*[]byte)
+		plainDataBufPtr := buf64kPool.Get().(*[]byte)
+		defer buf64kPool.Put(payloadChunkPtr)
+		defer buf64kPool.Put(plainDataBufPtr)
+
+		payloadChunk := *payloadChunkPtr
 		plainLenBuf := make([]byte, 0, 2)
-		plainDataBuf := make([]byte, 0, 65536)
+		plainDataBuf := (*plainDataBufPtr)[:0]
 
 		for {
-			if timeout != 0 {
-				_ = client.SetReadDeadline(time.Now().Add(time.Duration(timeout) * time.Second))
-			}
+			_ = client.SetReadDeadline(time.Now().Add(time.Duration(effectiveTimeout) * time.Second))
 			if _, err := io.ReadFull(client, lenChunk); err != nil {
 				return
 			}
@@ -309,16 +365,26 @@ func handleEncryptedBrookStream(client StreamConn, cn []byte, rawPass, passHash 
 			}
 			NextNonce(cn)
 
-			if timeout != 0 {
-				_ = remote.SetWriteDeadline(time.Now().Add(time.Duration(timeout) * time.Second))
-			}
+			_ = remote.SetWriteDeadline(time.Now().Add(time.Duration(effectiveTimeout) * time.Second))
 			if _, err := remote.Write(plainData); err != nil {
 				return
 			}
 		}
 	}()
 
-	wg.Wait()
+	waitCh := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(waitCh)
+	}()
+
+	select {
+	case <-waitCh:
+	case <-time.After(10 * time.Second):
+		_ = remote.Close()
+		_ = client.Close()
+		<-waitCh
+	}
 	return nil
 }
 
@@ -380,21 +446,33 @@ func handleSimpleBrookStream(client StreamConn, password []byte, tcpTimeout, udp
 	}
 	defer remote.Close()
 
+	effectiveTimeout := timeout
+	if effectiveTimeout == 0 {
+		effectiveTimeout = 300
+	}
+
 	var wg sync.WaitGroup
 	wg.Add(2)
 
+	doneOnce := sync.Once{}
+	unblockOther := func() {
+		doneOnce.Do(func() {
+			_ = remote.SetDeadline(time.Now().Add(5 * time.Second))
+			_ = client.SetDeadline(time.Now().Add(5 * time.Second))
+		})
+	}
+
 	go func() {
 		defer wg.Done()
-		buf := make([]byte, 32768)
+		defer unblockOther()
+		bufPtr := buf64kPool.Get().(*[]byte)
+		defer buf64kPool.Put(bufPtr)
+		buf := (*bufPtr)[:32768]
 		for {
-			if timeout != 0 {
-				_ = remote.SetReadDeadline(time.Now().Add(time.Duration(timeout) * time.Second))
-			}
+			_ = remote.SetReadDeadline(time.Now().Add(time.Duration(effectiveTimeout) * time.Second))
 			n, err := remote.Read(buf)
 			if n > 0 {
-				if timeout != 0 {
-					_ = client.SetWriteDeadline(time.Now().Add(time.Duration(timeout) * time.Second))
-				}
+				_ = client.SetWriteDeadline(time.Now().Add(time.Duration(effectiveTimeout) * time.Second))
 				if _, werr := client.Write(buf[:n]); werr != nil {
 					return
 				}
@@ -407,16 +485,15 @@ func handleSimpleBrookStream(client StreamConn, password []byte, tcpTimeout, udp
 
 	go func() {
 		defer wg.Done()
-		buf := make([]byte, 32768)
+		defer unblockOther()
+		bufPtr := buf64kPool.Get().(*[]byte)
+		defer buf64kPool.Put(bufPtr)
+		buf := (*bufPtr)[:32768]
 		for {
-			if timeout != 0 {
-				_ = client.SetReadDeadline(time.Now().Add(time.Duration(timeout) * time.Second))
-			}
+			_ = client.SetReadDeadline(time.Now().Add(time.Duration(effectiveTimeout) * time.Second))
 			n, err := client.Read(buf)
 			if n > 0 {
-				if timeout != 0 {
-					_ = remote.SetWriteDeadline(time.Now().Add(time.Duration(timeout) * time.Second))
-				}
+				_ = remote.SetWriteDeadline(time.Now().Add(time.Duration(effectiveTimeout) * time.Second))
 				if _, werr := remote.Write(buf[:n]); werr != nil {
 					return
 				}
@@ -427,6 +504,18 @@ func handleSimpleBrookStream(client StreamConn, password []byte, tcpTimeout, udp
 		}
 	}()
 
-	wg.Wait()
+	waitCh := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(waitCh)
+	}()
+
+	select {
+	case <-waitCh:
+	case <-time.After(10 * time.Second):
+		_ = remote.Close()
+		_ = client.Close()
+		<-waitCh
+	}
 	return nil
 }

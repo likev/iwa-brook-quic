@@ -301,9 +301,21 @@ export class WebTransportConnectionManager {
     // 1. Find all active connected slots
     let connectedSlots = this.slots.filter(s => s.state === ConnectionState.CONNECTED && s.transport !== null);
 
-    // 2. If no slots are connected, connect pool now
+    // 2. If no slots are connected, connect pool now (lazy connect 1 slot, warm rest in background)
     if (connectedSlots.length === 0) {
-      await this.connect(options);
+      if (this.slots.length <= 1) {
+        await this.connect(options);
+      } else {
+        // Connect the first slot immediately so the request is served without storm delay,
+        // and warm up the remaining slots in the background.
+        await this._connectSlot(this.slots[0], options);
+        this._updateAggregateState();
+        for (let i = 1; i < this.slots.length; i++) {
+          if (this.slots[i].state === ConnectionState.DISCONNECTED && !this.slots[i].connectPromise) {
+            this._connectSlot(this.slots[i], options).catch(() => {});
+          }
+        }
+      }
       connectedSlots = this.slots.filter(s => s.state === ConnectionState.CONNECTED && s.transport !== null);
     }
 

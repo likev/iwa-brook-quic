@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -16,6 +17,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -24,6 +26,20 @@ import (
 	"github.com/quic-go/webtransport-go"
 	"golang.org/x/crypto/acme/autocert"
 )
+
+func isNormalStreamClose(err error) bool {
+	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || errors.Is(err, context.Canceled) {
+		return true
+	}
+	s := err.Error()
+	return strings.Contains(s, "EOF") ||
+		strings.Contains(s, "closed") ||
+		strings.Contains(s, "canceled") ||
+		strings.Contains(s, "cancel") ||
+		strings.Contains(s, "done") ||
+		strings.Contains(s, "Application error 0x0") ||
+		strings.Contains(s, "no recent network activity")
+}
 
 type bufferedStream struct {
 	quic.Stream
@@ -86,13 +102,19 @@ type Server struct {
 	Cert         []byte
 	CertKey      []byte
 
+	readyOnce  sync.Once
 	ready      chan struct{}
 	ctx        context.Context
 	cancel     context.CancelFunc
+
+	mu         sync.RWMutex
+	closed     bool
 	packetConn net.PacketConn
 	listener   *quic.EarlyListener
 	wtServer   *webtransport.Server
 	httpServer *http.Server
+
+	streamSem  chan struct{}
 }
 
 // NewServer creates a new unified Brook QUIC + WebTransport server.
@@ -111,6 +133,7 @@ func NewServer(addr, password, domain string, tcpTimeout, udpTimeout int, withou
 		ready:        make(chan struct{}),
 		ctx:          ctx,
 		cancel:       cancel,
+		streamSem:    make(chan struct{}, 2048),
 	}, nil
 }
 
@@ -121,6 +144,8 @@ func (s *Server) Ready() <-chan struct{} {
 
 // LocalAddr returns the local listening address.
 func (s *Server) LocalAddr() net.Addr {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if s.packetConn != nil {
 		return s.packetConn.LocalAddr()
 	}
@@ -134,10 +159,18 @@ func (s *Server) ListenAndServe() error {
 		return fmt.Errorf("setup TLS failed: %w", err)
 	}
 
+	maxIdleTimeout := time.Duration(s.UDPTimeout) * time.Second
+	if maxIdleTimeout <= 0 {
+		maxIdleTimeout = 60 * time.Second
+	}
+
 	quicConfig := &quic.Config{
-		EnableDatagrams: true,
-		MaxIdleTimeout:  time.Duration(s.UDPTimeout) * time.Second,
-		Allow0RTT:       true,
+		EnableDatagrams:       true,
+		MaxIdleTimeout:        maxIdleTimeout,
+		Allow0RTT:             true,
+		MaxIncomingStreams:    256,
+		MaxIncomingUniStreams: 256,
+		KeepAlivePeriod:       15 * time.Second,
 	}
 
 	// Resolve UDP address
@@ -150,17 +183,37 @@ func (s *Server) ListenAndServe() error {
 	if err != nil {
 		return fmt.Errorf("listen UDP on %s failed: %w", udpAddr, err)
 	}
+	_ = conn.SetReadBuffer(2500000)
+	_ = conn.SetWriteBuffer(2500000)
+
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		_ = conn.Close()
+		return net.ErrClosed
+	}
 	s.packetConn = conn
+	s.mu.Unlock()
 
 	tr := &quic.Transport{Conn: conn}
 	ln, err := tr.ListenEarly(tlsConfig, quicConfig)
 	if err != nil {
 		return fmt.Errorf("quic listen failed: %w", err)
 	}
+
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		_ = ln.Close()
+		return net.ErrClosed
+	}
 	s.listener = ln
+	s.mu.Unlock()
 
 	// Signal that server is bound and ready
-	close(s.ready)
+	s.readyOnce.Do(func() {
+		close(s.ready)
+	})
 
 	// Setup WebTransport / HTTP/3 server
 	mux := http.NewServeMux()
@@ -176,7 +229,7 @@ func (s *Server) ListenAndServe() error {
 		},
 	}
 
-	wtHandler := NewWebTransportHandler(s.wtServer, s.Password, s.WithoutBrook, s.TCPTimeout, s.UDPTimeout)
+	wtHandler := NewWebTransportHandler(s.wtServer, s.Password, s.WithoutBrook, s.TCPTimeout, s.UDPTimeout, s.streamSem)
 
 	// Register WebTransport endpoints on common paths
 	mux.HandleFunc("/", wtHandler.HandleUpgrade)
@@ -206,7 +259,7 @@ func (s *Server) dispatchConnection(conn quic.EarlyConnection) {
 
 	// 1. Direct ALPN match
 	if alpn == "brook-quic" || alpn == "brook" {
-		HandleRawQUICConn(conn, s.Password, s.WithoutBrook, s.TCPTimeout, s.UDPTimeout, nil)
+		HandleRawQUICConn(conn, s.Password, s.WithoutBrook, s.TCPTimeout, s.UDPTimeout, nil, s.streamSem)
 		conn.CloseWithError(0, "done")
 		return
 	}
@@ -251,7 +304,7 @@ func (s *Server) dispatchConnection(conn quic.EarlyConnection) {
 			uniStreams:      []quic.ReceiveStream{ustr},
 		}
 		// ServeQUICConn manages the connection lifecycle; do not close conn here.
-		if err := s.wtServer.ServeQUICConn(iconn); err != nil && err != http.ErrServerClosed {
+		if err := s.wtServer.ServeQUICConn(iconn); err != nil && err != http.ErrServerClosed && !isNormalStreamClose(err) {
 			log.Printf("[WebTransport] Session ended: %v", err)
 		}
 
@@ -261,6 +314,8 @@ func (s *Server) dispatchConnection(conn quic.EarlyConnection) {
 		cancel()
 
 		// Client opened a bidirectional stream first. Peek first byte to inspect frame type.
+		// Bound with 3-second read deadline to prevent DoS/goroutine leak from idle clients.
+		_ = bstr.SetReadDeadline(time.Now().Add(3 * time.Second))
 		buf := make([]byte, 1)
 		n, err := bstr.Read(buf)
 		if err != nil {
@@ -268,6 +323,7 @@ func (s *Server) dispatchConnection(conn quic.EarlyConnection) {
 			conn.CloseWithError(0, "read error")
 			return
 		}
+		_ = bstr.SetReadDeadline(time.Time{})
 		firstByte := buf[0]
 
 		if firstByte == 0x01 || firstByte == 0x41 {
@@ -280,12 +336,14 @@ func (s *Server) dispatchConnection(conn quic.EarlyConnection) {
 				bidiStreams:     []quic.Stream{sStream},
 			}
 			// ServeQUICConn manages the connection lifecycle; do not close conn here.
-			if err := s.wtServer.ServeQUICConn(iconn); err != nil && err != http.ErrServerClosed {
+			if err := s.wtServer.ServeQUICConn(iconn); err != nil && err != http.ErrServerClosed && !isNormalStreamClose(err) {
 				log.Printf("[WebTransport] Session ended: %v", err)
 			}
 		} else {
 			// Raw Brook QUIC stream (starts with 12-byte random client nonce)
 			// Drain any orphaned uni stream from the losing probe goroutine.
+			// The losing probe goroutine was cancelled above via cancel(); if it managed to
+			// accept right before cancellation, drain and cancel to prevent resource leakage.
 			go func() {
 				select {
 				case orphan := <-uniChan:
@@ -294,7 +352,7 @@ func (s *Server) dispatchConnection(conn quic.EarlyConnection) {
 				}
 			}()
 			sStream := newBufferedStream(bstr, buf[:n])
-			HandleRawQUICConn(conn, s.Password, s.WithoutBrook, s.TCPTimeout, s.UDPTimeout, sStream)
+			HandleRawQUICConn(conn, s.Password, s.WithoutBrook, s.TCPTimeout, s.UDPTimeout, sStream, s.streamSem)
 			conn.CloseWithError(0, "done")
 		}
 
@@ -331,12 +389,19 @@ func (s *Server) setupTLS() (*tls.Config, error) {
 		if httpPort == "" {
 			httpPort = "80"
 		}
+		s.mu.Lock()
+		if s.closed {
+			s.mu.Unlock()
+			return nil, net.ErrClosed
+		}
 		s.httpServer = &http.Server{
 			Addr:    ":" + httpPort,
 			Handler: m.HTTPHandler(nil),
 		}
+		srv := s.httpServer
+		s.mu.Unlock()
 		go func() {
-			_ = s.httpServer.ListenAndServe()
+			_ = srv.ListenAndServe()
 		}()
 
 		return &tls.Config{
@@ -407,15 +472,30 @@ func (s *Server) cleanAddr(addr string) string {
 
 // Close stops the server and frees resources.
 func (s *Server) Close() error {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil
+	}
+	s.closed = true
+	httpServer := s.httpServer
+	listener := s.listener
+	packetConn := s.packetConn
+	s.mu.Unlock()
+
 	s.cancel()
-	if s.httpServer != nil {
-		_ = s.httpServer.Close()
+	s.readyOnce.Do(func() {
+		close(s.ready)
+	})
+
+	if httpServer != nil {
+		_ = httpServer.Close()
 	}
-	if s.listener != nil {
-		_ = s.listener.Close()
+	if listener != nil {
+		_ = listener.Close()
 	}
-	if s.packetConn != nil {
-		_ = s.packetConn.Close()
+	if packetConn != nil {
+		_ = packetConn.Close()
 	}
 	return nil
 }

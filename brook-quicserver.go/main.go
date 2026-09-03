@@ -17,7 +17,7 @@ func main() {
 	flagDomain := flag.String("domain", "", "Domain name for TLS autocert")
 	flagWithoutBrookProtocol := flag.Bool("withoutBrookProtocol", true, "Enable WithoutBrook protocol mode (default true)")
 	flagWithoutBrook := flag.Bool("withoutbrook", true, "Enable WithoutBrook protocol mode (alias for withoutBrookProtocol, default true)")
-	flagTCPTimeout := flag.Int("tcp-timeout", 0, "TCP connection idle timeout in seconds (0 for no timeout)")
+	flagTCPTimeout := flag.Int("tcp-timeout", 300, "TCP connection idle timeout in seconds (default 300s)")
 	flagUDPTimeout := flag.Int("udp-timeout", 60, "UDP connection timeout in seconds")
 	flag.Parse()
 

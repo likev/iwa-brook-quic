@@ -160,21 +160,27 @@ export class ProxyDispatcher {
       socket: acceptedSocket,
       cancel: () => {
         try { acceptedSocket.close(); } catch (e) {}
-      }
+      },
+      promise: null
     };
     this.activeHandlers.add(handlerEntry);
 
-    try {
-      await this._processClient(acceptedSocket, expectedProtocol, handlerEntry);
-    } finally {
-      this.activeHandlers.delete(handlerEntry);
-      if (onComplete) onComplete();
-    }
+    const clientPromise = (async () => {
+      try {
+        await this._processClient(acceptedSocket, expectedProtocol, handlerEntry);
+      } finally {
+        this.activeHandlers.delete(handlerEntry);
+        if (onComplete) onComplete();
+      }
+    })();
+    handlerEntry.promise = clientPromise;
+    await clientPromise;
   }
 
   async _processClient(acceptedSocket, expectedProtocol = 'auto', handlerEntry = null) {
     let reader = null;
     let writer = null;
+    let quicSession = null;
     let session = null;
 
     if (handlerEntry) {
@@ -182,6 +188,7 @@ export class ProxyDispatcher {
         try { acceptedSocket.close(); } catch (e) {}
         try { if (reader) reader.cancel().catch(() => {}); } catch (e) {}
         try { if (writer) writer.close().catch(() => {}); } catch (e) {}
+        try { if (quicSession) quicSession.close(); } catch (e) {}
       };
     }
 
@@ -195,6 +202,8 @@ export class ProxyDispatcher {
       let readTimer = null;
       try {
         const readPromise = reader.read();
+        // Avoid unhandled rejection if timeout wins and the pending read later rejects.
+        readPromise.catch(() => {});
         const timeoutPromise = new Promise((_, reject) => {
           readTimer = setTimeout(() => reject(new Error('Client initial read timed out (idle connection)')), 10000);
         });
@@ -202,14 +211,18 @@ export class ProxyDispatcher {
         clearTimeout(readTimer);
         if (readResult.done || !readResult.value || readResult.value.length === 0) {
           await reader.cancel().catch(() => {});
+          try { reader.releaseLock(); } catch (e) {}
           await writer.close().catch(() => {});
+          try { writer.releaseLock(); } catch (e) {}
           return;
         }
         initialChunk = readResult.value;
       } catch (readErr) {
         if (readTimer) clearTimeout(readTimer);
         await reader.cancel().catch(() => {});
+        try { reader.releaseLock(); } catch (e) {}
         await writer.close().catch(() => {});
+        try { writer.releaseLock(); } catch (e) {}
         return;
       }
 
@@ -276,8 +289,9 @@ export class ProxyDispatcher {
         }
 
         // Create or acquire multiplexed WebTransport stream session to remote Brook server
-        const acqStart = Date.now();
-        let quicSession;
+        // Assign to outer `quicSession` (no shadowing) so handlerEntry.cancel()
+        // closes the live session on dropAllConnections/stop().
+        quicSession = null;
         try {
           quicSession = await this.quicManager.createSession();
         } catch (sessErr) {
@@ -389,9 +403,16 @@ export class ProxyDispatcher {
     }
     this.listeners.clear();
 
-    // 2. Await active handlers
+    // 2. Cancel and await active handlers
     if (this.activeHandlers.size > 0) {
-      await Promise.allSettled(Array.from(this.activeHandlers));
+      const handlers = Array.from(this.activeHandlers);
+      for (const h of handlers) {
+        try {
+          if (typeof h.cancel === 'function') h.cancel();
+        } catch (e) {}
+      }
+      const promises = handlers.map(h => h.promise).filter(Boolean);
+      await Promise.allSettled(promises);
       this.activeHandlers.clear();
     }
   }

@@ -5,8 +5,24 @@
 
 export function createPortStreamBridge(port) {
   const readQueue = [];
-  let pendingReadResolve = null;
+  const pendingReadResolvers = [];
   let isClosed = false;
+  let readQueueBytes = 0;
+  const MAX_READ_QUEUE_BYTES = 4 * 1024 * 1024; // 4MB bounded queue
+
+  const abortInbound = (reason) => {
+    if (isClosed) return;
+    isClosed = true;
+    readQueue.length = 0;
+    readQueueBytes = 0;
+    while (pendingReadResolvers.length > 0) {
+      const resolve = pendingReadResolvers.shift();
+      resolve({ value: undefined, done: true });
+    }
+    try {
+      port.postMessage({ type: 'STREAM_ERROR', error: reason || 'Inbound queue overflow' });
+    } catch (e) {}
+  };
 
   if (port && port.start) {
     try { port.start(); } catch (e) {}
@@ -15,30 +31,36 @@ export function createPortStreamBridge(port) {
   port.onmessage = (event) => {
     const msg = event.data;
     if (!msg) return;
+    if (isClosed && (msg.type === 'CLIENT_DATA' || msg.type === 'CLIENT_FIN')) return;
 
     if (msg.type === 'CLIENT_DATA') {
       const chunk = msg.chunk instanceof Uint8Array ? msg.chunk : new Uint8Array(msg.chunk);
-      if (pendingReadResolve) {
-        const resolve = pendingReadResolve;
-        pendingReadResolve = null;
+      if (pendingReadResolvers.length > 0) {
+        const resolve = pendingReadResolvers.shift();
         resolve({ value: chunk, done: false });
       } else {
+        if (readQueueBytes + chunk.length > MAX_READ_QUEUE_BYTES) {
+          // Fail fast instead of silently dropping bytes (would corrupt framing).
+          abortInbound(`Inbound queue overflow (${readQueueBytes + chunk.length}B > ${MAX_READ_QUEUE_BYTES}B)`);
+          return;
+        }
         readQueue.push({ value: chunk, done: false });
+        readQueueBytes += chunk.length;
       }
     } else if (msg.type === 'CLIENT_FIN') {
       isClosed = true;
-      if (pendingReadResolve) {
-        const resolve = pendingReadResolve;
-        pendingReadResolve = null;
-        resolve({ value: undefined, done: true });
+      if (pendingReadResolvers.length > 0) {
+        while (pendingReadResolvers.length > 0) {
+          const resolve = pendingReadResolvers.shift();
+          resolve({ value: undefined, done: true });
+        }
       } else {
         readQueue.push({ value: undefined, done: true });
       }
     } else if (msg.type === 'CLIENT_ABORT') {
       isClosed = true;
-      if (pendingReadResolve) {
-        const resolve = pendingReadResolve;
-        pendingReadResolve = null;
+      while (pendingReadResolvers.length > 0) {
+        const resolve = pendingReadResolvers.shift();
         resolve({ value: undefined, done: true });
       }
     }
@@ -47,18 +69,26 @@ export function createPortStreamBridge(port) {
   const clientReader = {
     read: () => {
       if (readQueue.length > 0) {
-        return Promise.resolve(readQueue.shift());
+        const item = readQueue.shift();
+        if (item && item.value) {
+          readQueueBytes = Math.max(0, readQueueBytes - item.value.length);
+        }
+        return Promise.resolve(item);
       }
       if (isClosed) {
         return Promise.resolve({ value: undefined, done: true });
       }
       return new Promise((resolve) => {
-        pendingReadResolve = resolve;
+        pendingReadResolvers.push(resolve);
       });
     },
     releaseLock: () => {},
     cancel: async () => {
       isClosed = true;
+      while (pendingReadResolvers.length > 0) {
+        const resolve = pendingReadResolvers.shift();
+        resolve({ value: undefined, done: true });
+      }
       try {
         port.postMessage({ type: 'STREAM_CANCEL' });
       } catch (e) {}
