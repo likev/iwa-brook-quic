@@ -1,7 +1,7 @@
 {
   "name": "TCP Client - Isolated Web App",
   "short_name": "TCP Client",
-  "version": "1.35.0",
+  "version": "1.36.0",
   "update_manifest_url": "https://t.iread.fun/downloads/iwa/dist/client-update-manifest.json",
   "id": "/",
   "start_url": "/",

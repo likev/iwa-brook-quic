@@ -4,6 +4,23 @@ All notable changes to the **Isolated Web Apps (IWAs) Direct Sockets Suite & Bro
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.36.0] - 2026-09-03
+
+### Race, Deadlock, Memory Leak & Performance Fixes
+- **Go server (`brook-quicserver.go`)**:
+  - Guarded `packetConn/listener/httpServer` with `RWMutex+closed+readyOnce` (fix `Close` vs `ListenAndServe` race).
+  - 3s bidi peek read deadline (fix `dispatchConnection` DoS leak), `effectiveTimeout 300s` default, `unblockOther+10s Wait` half-close propagation.
+  - Bounded fan-out: `streamSem 2048`, `MaxIncomingStreams/UniStreams 256`, `KeepAlive 15s`.
+  - `sync.Pool` frame buffers, `SO_RCVBUF/SNDBUF 2.5MB`, `isNormalStreamClose` log gating, `tcp-timeout` default `300s`.
+- **JS client (`brook-quicclient`)**:
+  - Fixed `processRxQueue` lost wakeup, multi-pending-read queue, 4MB bounded queues with fail-fast close (no silent drop).
+  - Fixed `ProxyDispatcher quicSession` shadowing so `dropAll/stop` closes live session; `stop()` awaits handler promises.
+  - `MAX_RX 256MB->16MB`, `subarray->slice`, upstream `CHUNK 16k->32k`, fast `nextNonce`, HKDF baseKey `LRU(8)+single-flight`.
+  - `wt-session.worker poolSize:1`, lazy slot-0 connect + background warm.
+- **Tests**: `TestBidiOpenNoDataTimeout`, `TestConcurrentHalfCloseNoTimeout` (goroutine assert), bridge double-read / poolSize / lost-wakeup checks.
+
+---
+
 ## [v1.35.0] - 2026-08-21
 
 ### High-Throughput Stream Multiplexing & Resilient Client Auto-Recovery
