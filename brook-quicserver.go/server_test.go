@@ -18,7 +18,7 @@ import (
 )
 
 // startEchoServer starts a local TCP echo server and returns its address.
-func startEchoServer(t *testing.T) (string, func()) {
+func startEchoServer(t testing.TB) (string, func()) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("failed to start echo server: %v", err)
@@ -1150,7 +1150,7 @@ func TestManyConnectionsNoGoroutineLeak(t *testing.T) {
 	defer cleanupEcho()
 
 	password := "stress-leak-test"
-	server, err := NewServer("127.0.0.1:0", password, "", 2, 2, false)
+	server, err := NewServer("127.0.0.1:0", password, "", 15, 15, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1177,7 +1177,12 @@ func TestManyConnectionsNoGoroutineLeak(t *testing.T) {
 		go func(idx int) {
 			defer wg.Done()
 			tlsConf := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"brook-quic"}}
-			conn, err := quic.DialAddr(context.Background(), serverAddr, tlsConf, &quic.Config{EnableDatagrams: true})
+			quicConf := &quic.Config{
+				EnableDatagrams:      true,
+				HandshakeIdleTimeout: 15 * time.Second,
+				MaxIdleTimeout:       15 * time.Second,
+			}
+			conn, err := quic.DialAddr(context.Background(), serverAddr, tlsConf, quicConf)
 			if err != nil {
 				t.Errorf("dial %d: %v", idx, err)
 				return
@@ -1459,4 +1464,273 @@ func TestConcurrentHalfCloseNoTimeout(t *testing.T) {
 		t.Fatalf("half-close goroutine leak with tcpTimeout=0: baseline=%d current=%d (delta=%d)", baseline, current, current-baseline)
 	}
 	t.Log("✅ Half-close unwound promptly with tcpTimeout=0, no stall")
+}
+
+func BenchmarkRawQUICBrookProtocol(b *testing.B) {
+	echoAddr, cleanupEcho := startEchoServer(b)
+	defer cleanupEcho()
+
+	password := "testpassword123"
+	server, err := NewServer("127.0.0.1:0", password, "", 0, 10, false)
+	if err != nil {
+		b.Fatalf("failed to create server: %v", err)
+	}
+	defer server.Close()
+
+	go func() {
+		_ = server.ListenAndServe()
+	}()
+
+	select {
+	case <-server.Ready():
+	case <-time.After(5 * time.Second):
+		b.Fatal("server failed to start within 5s")
+	}
+	serverAddr := server.LocalAddr().String()
+
+	tlsConf := &tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"brook-quic"},
+	}
+
+	clientQuicConfig := &quic.Config{
+		EnableDatagrams:                true,
+		InitialStreamReceiveWindow:     4 * 1024 * 1024,
+		MaxStreamReceiveWindow:         16 * 1024 * 1024,
+		InitialConnectionReceiveWindow: 8 * 1024 * 1024,
+		MaxConnectionReceiveWindow:     32 * 1024 * 1024,
+	}
+
+	conn, err := quic.DialAddr(context.Background(), serverAddr, tlsConf, clientQuicConfig)
+	if err != nil {
+		b.Fatalf("QUIC dial failed: %v", err)
+	}
+	defer conn.CloseWithError(0, "")
+
+	stream, err := conn.OpenStreamSync(context.Background())
+	if err != nil {
+		b.Fatalf("open stream failed: %v", err)
+	}
+	defer stream.Close()
+
+	cn, _ := GenerateNonce()
+	stream.Write(cn)
+	ck, _ := DeriveKey([]byte(password), cn, brookInfo)
+	ca, _ := NewGCMCipher(ck)
+
+	atyp, addrB, portB, err := ParseAddress(echoAddr)
+	if err != nil {
+		b.Fatal(err)
+	}
+	dstSlice := append([]byte{atyp}, addrB...)
+	dstSlice = append(dstSlice, portB...)
+	now := time.Now().Unix()
+	if now%2 != 0 {
+		now += 1
+	}
+	hPayload := make([]byte, 4+len(dstSlice))
+	binary.BigEndian.PutUint32(hPayload[:4], uint32(now))
+	copy(hPayload[4:], dstSlice)
+	sLen := make([]byte, 2)
+	binary.BigEndian.PutUint16(sLen, uint16(len(hPayload)))
+	encLen := ca.Seal(nil, cn, sLen, nil)
+	NextNonce(cn)
+	encPayload := ca.Seal(nil, cn, hPayload, nil)
+	NextNonce(cn)
+	stream.Write(append(encLen, encPayload...))
+
+	sn := make([]byte, 12)
+	if _, err := io.ReadFull(stream, sn); err != nil {
+		b.Fatalf("read sn: %v", err)
+	}
+	sk, _ := DeriveKey([]byte(password), sn, brookInfo)
+	sa, _ := NewGCMCipher(sk)
+
+	chunkSize := 16384
+	chunk := make([]byte, chunkSize)
+	for i := range chunk {
+		chunk[i] = byte(i)
+	}
+
+	totalBytes := 10 * 1024 * 1024 // 10MB
+	numChunks := totalBytes / chunkSize
+
+	b.ResetTimer()
+	b.SetBytes(int64(totalBytes))
+
+	for iter := 0; iter < b.N; iter++ {
+		errCh := make(chan error, 2)
+
+		// Sender
+		go func() {
+			msgLen := make([]byte, 2)
+			binary.BigEndian.PutUint16(msgLen, uint16(chunkSize))
+			for i := 0; i < numChunks; i++ {
+				sMsgLen := ca.Seal(nil, cn, msgLen, nil)
+				NextNonce(cn)
+				sMsgPayload := ca.Seal(nil, cn, chunk, nil)
+				NextNonce(cn)
+				if _, err := stream.Write(append(sMsgLen, sMsgPayload...)); err != nil {
+					errCh <- err
+					return
+				}
+			}
+			errCh <- nil
+		}()
+
+		// Receiver
+		go func() {
+			respLenBuf := make([]byte, 18)
+			respPayloadBuf := make([]byte, chunkSize+16)
+			received := 0
+			for received < totalBytes {
+				if _, err := io.ReadFull(stream, respLenBuf); err != nil {
+					errCh <- err
+					return
+				}
+				pLen, err := sa.Open(nil, sn, respLenBuf, nil)
+				if err != nil {
+					errCh <- err
+					return
+				}
+				NextNonce(sn)
+				rLen := int(binary.BigEndian.Uint16(pLen))
+				if _, err := io.ReadFull(stream, respPayloadBuf[:rLen+16]); err != nil {
+					errCh <- err
+					return
+				}
+				_, err = sa.Open(nil, sn, respPayloadBuf[:rLen+16], nil)
+				if err != nil {
+					errCh <- err
+					return
+				}
+				NextNonce(sn)
+				received += rLen
+			}
+			errCh <- nil
+		}()
+
+		for i := 0; i < 2; i++ {
+			if err := <-errCh; err != nil {
+				b.Fatalf("transfer error: %v", err)
+			}
+		}
+	}
+}
+
+func BenchmarkRawQUICSimpleBrookProtocol(b *testing.B) {
+	echoAddr, cleanupEcho := startEchoServer(b)
+	defer cleanupEcho()
+
+	password := "testpassword123"
+	server, err := NewServer("127.0.0.1:0", password, "", 0, 10, true)
+	if err != nil {
+		b.Fatalf("failed to create server: %v", err)
+	}
+	defer server.Close()
+
+	go func() {
+		_ = server.ListenAndServe()
+	}()
+
+	select {
+	case <-server.Ready():
+	case <-time.After(5 * time.Second):
+		b.Fatal("server failed to start within 5s")
+	}
+	serverAddr := server.LocalAddr().String()
+
+	tlsConf := &tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"brook-quic"},
+	}
+
+	clientQuicConfig := &quic.Config{
+		EnableDatagrams:                true,
+		InitialStreamReceiveWindow:     4 * 1024 * 1024,
+		MaxStreamReceiveWindow:         16 * 1024 * 1024,
+		InitialConnectionReceiveWindow: 8 * 1024 * 1024,
+		MaxConnectionReceiveWindow:     32 * 1024 * 1024,
+	}
+
+	conn, err := quic.DialAddr(context.Background(), serverAddr, tlsConf, clientQuicConfig)
+	if err != nil {
+		b.Fatalf("QUIC dial failed: %v", err)
+	}
+	defer conn.CloseWithError(0, "")
+
+	stream, err := conn.OpenStreamSync(context.Background())
+	if err != nil {
+		b.Fatalf("open stream failed: %v", err)
+	}
+	defer stream.Close()
+
+	passHash := SHA256Bytes([]byte(password))
+
+	atyp, addrB, portB, err := ParseAddress(echoAddr)
+	if err != nil {
+		b.Fatal(err)
+	}
+	dstSlice := append([]byte{atyp}, addrB...)
+	dstSlice = append(dstSlice, portB...)
+	now := time.Now().Unix()
+	if now%2 != 0 {
+		now += 1
+	}
+	hPayload := make([]byte, 4+len(dstSlice))
+	binary.BigEndian.PutUint32(hPayload[:4], uint32(now))
+	copy(hPayload[4:], dstSlice)
+
+	hdr34 := make([]byte, 34)
+	copy(hdr34[:32], passHash)
+	binary.BigEndian.PutUint16(hdr34[32:34], uint16(len(hPayload)))
+	stream.Write(append(hdr34, hPayload...))
+
+	chunkSize := 16384
+	chunk := make([]byte, chunkSize)
+	for i := range chunk {
+		chunk[i] = byte(i)
+	}
+
+	totalBytes := 10 * 1024 * 1024 // 10MB
+	numChunks := totalBytes / chunkSize
+
+	b.ResetTimer()
+	b.SetBytes(int64(totalBytes))
+
+	for iter := 0; iter < b.N; iter++ {
+		errCh := make(chan error, 2)
+
+		// Sender
+		go func() {
+			for i := 0; i < numChunks; i++ {
+				if _, err := stream.Write(chunk); err != nil {
+					errCh <- err
+					return
+				}
+			}
+			errCh <- nil
+		}()
+
+		// Receiver
+		go func() {
+			respBuf := make([]byte, chunkSize)
+			received := 0
+			for received < totalBytes {
+				n, err := stream.Read(respBuf)
+				if err != nil {
+					errCh <- err
+					return
+				}
+				received += n
+			}
+			errCh <- nil
+		}()
+
+		for i := 0; i < 2; i++ {
+			if err := <-errCh; err != nil {
+				b.Fatalf("transfer error: %v", err)
+			}
+		}
+	}
 }

@@ -15,31 +15,10 @@ import (
 var brookInfo = []byte("brook")
 
 var (
-	// Pool for TCP frames: 2 + 16 + 2014 + 16 = 2048 bytes
-	tcpFramePool = sync.Pool{
-		New: func() any {
-			b := make([]byte, 2048)
-			return &b
-		},
-	}
-	// Pool for TCP raw payload: 2014 bytes
-	tcpRawPool = sync.Pool{
-		New: func() any {
-			b := make([]byte, 2014)
-			return &b
-		},
-	}
-	// Pool for 64KB buffers (UDP frames, payloadChunk, and simple stream buffers)
+	// Pool for 64KB buffers (stream frames, payloadChunk, and simple stream buffers)
 	buf64kPool = sync.Pool{
 		New: func() any {
 			b := make([]byte, 65536)
-			return &b
-		},
-	}
-	// Pool for UDP frame buffer (2 + 16 + 65473 + 16 = 65507 bytes)
-	udpFramePool = sync.Pool{
-		New: func() any {
-			b := make([]byte, 65507)
 			return &b
 		},
 	}
@@ -277,40 +256,56 @@ func handleEncryptedBrookStream(client StreamConn, cn []byte, rawPass, passHash 
 		defer wg.Done()
 		defer unblockOther()
 
-		var rawBuf []byte
-		var frameBuf []byte
-		if isTCP {
-			rawPtr := tcpRawPool.Get().(*[]byte)
-			framePtr := tcpFramePool.Get().(*[]byte)
-			defer tcpRawPool.Put(rawPtr)
-			defer tcpFramePool.Put(framePtr)
-			rawBuf = *rawPtr
-			frameBuf = *framePtr
-		} else {
-			rawPtr := buf64kPool.Get().(*[]byte)
-			framePtr := udpFramePool.Get().(*[]byte)
-			defer buf64kPool.Put(rawPtr)
-			defer udpFramePool.Put(framePtr)
-			rawBuf = (*rawPtr)[:65473]
-			frameBuf = *framePtr
+		maxFramePayload := 2014
+		if !isTCP {
+			maxFramePayload = 65473
 		}
 
+		rawPtr := buf64kPool.Get().(*[]byte)
+		batchPtr := buf64kPool.Get().(*[]byte)
+		defer buf64kPool.Put(rawPtr)
+		defer buf64kPool.Put(batchPtr)
+
+		// For TCP, read up to 32224 bytes (16 * 2014) to fill batchBuf (<= 32768 bytes).
+		// For UDP, read up to 65473 bytes (1 frame, <= 65507 bytes).
+		rawBuf := (*rawPtr)[:32224]
+		if !isTCP {
+			rawBuf = (*rawPtr)[:65473]
+		}
+		batchBuf := *batchPtr
+		var lenPlain [2]byte
+
 		for {
-			_ = remote.SetReadDeadline(time.Now().Add(time.Duration(effectiveTimeout) * time.Second))
+			if timeout != 0 {
+				_ = remote.SetReadDeadline(time.Now().Add(time.Duration(timeout) * time.Second))
+			}
 			n, err := remote.Read(rawBuf)
 			if n > 0 {
-				// 1. Seal length (2B)
-				binary.BigEndian.PutUint16(frameBuf[:2], uint16(n))
-				sa.Seal(frameBuf[:0], sn, frameBuf[:2], nil)
-				NextNonce(sn)
+				batchLen := 0
+				for offset := 0; offset < n; {
+					chunk := n - offset
+					if chunk > maxFramePayload {
+						chunk = maxFramePayload
+					}
 
-				// 2. Seal payload (nB)
-				sa.Seal(frameBuf[18:18], sn, rawBuf[:n], nil)
-				NextNonce(sn)
+					// 1. Seal length (2B) -> 18B
+					binary.BigEndian.PutUint16(lenPlain[:], uint16(chunk))
+					sa.Seal(batchBuf[batchLen:batchLen], sn, lenPlain[:], nil)
+					NextNonce(sn)
+					batchLen += 18
 
-				totalLen := 18 + n + 16
-				_ = client.SetWriteDeadline(time.Now().Add(time.Duration(effectiveTimeout) * time.Second))
-				if _, werr := client.Write(frameBuf[:totalLen]); werr != nil {
+					// 2. Seal payload (chunk B) -> chunk + 16B
+					sa.Seal(batchBuf[batchLen:batchLen], sn, rawBuf[offset:offset+chunk], nil)
+					NextNonce(sn)
+					batchLen += chunk + 16
+
+					offset += chunk
+				}
+
+				if timeout != 0 {
+					_ = client.SetWriteDeadline(time.Now().Add(time.Duration(timeout) * time.Second))
+				}
+				if _, werr := client.Write(batchBuf[:batchLen]); werr != nil {
 					return
 				}
 			}
@@ -336,7 +331,9 @@ func handleEncryptedBrookStream(client StreamConn, cn []byte, rawPass, passHash 
 		plainDataBuf := (*plainDataBufPtr)[:0]
 
 		for {
-			_ = client.SetReadDeadline(time.Now().Add(time.Duration(effectiveTimeout) * time.Second))
+			if timeout != 0 {
+				_ = client.SetReadDeadline(time.Now().Add(time.Duration(timeout) * time.Second))
+			}
 			if _, err := io.ReadFull(client, lenChunk); err != nil {
 				return
 			}
@@ -365,7 +362,9 @@ func handleEncryptedBrookStream(client StreamConn, cn []byte, rawPass, passHash 
 			}
 			NextNonce(cn)
 
-			_ = remote.SetWriteDeadline(time.Now().Add(time.Duration(effectiveTimeout) * time.Second))
+			if timeout != 0 {
+				_ = remote.SetWriteDeadline(time.Now().Add(time.Duration(timeout) * time.Second))
+			}
 			if _, err := remote.Write(plainData); err != nil {
 				return
 			}

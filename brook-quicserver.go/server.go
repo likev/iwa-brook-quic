@@ -165,12 +165,15 @@ func (s *Server) ListenAndServe() error {
 	}
 
 	quicConfig := &quic.Config{
-		EnableDatagrams:       true,
-		MaxIdleTimeout:        maxIdleTimeout,
-		Allow0RTT:             true,
-		MaxIncomingStreams:    256,
-		MaxIncomingUniStreams: 256,
-		KeepAlivePeriod:       15 * time.Second,
+		EnableDatagrams:                true,
+		MaxIdleTimeout:                 maxIdleTimeout,
+		Allow0RTT:                      true,
+		MaxIncomingStreams:             1024,
+		MaxIncomingUniStreams:          1024,
+		InitialStreamReceiveWindow:     4 * 1024 * 1024,
+		MaxStreamReceiveWindow:         16 * 1024 * 1024,
+		InitialConnectionReceiveWindow: 8 * 1024 * 1024,
+		MaxConnectionReceiveWindow:     32 * 1024 * 1024,
 	}
 
 	// Resolve UDP address
