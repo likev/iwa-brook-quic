@@ -4,6 +4,24 @@ All notable changes to the **Isolated Web Apps (IWAs) Direct Sockets Suite & Bro
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.37.0] - 2026-09-09
+
+### Connection Termination, Fail-as-Success Guarding & Throughput Enhancements
+- **JS Client (`brook-quicclient`)**:
+  - **Strict Outcome Classification**: Tunnels are only classified as `success` when `both_closed` is confirmed with valid received data bytes and framing completeness; default/inconclusive terminations resolve to `unknown` instead of false positives.
+  - **FIN vs Transport Closure Separation**: Differentiated graceful remote server `serverFinReceived` from premature `transportClosed` drops; immediate `transport_closed` failures upon abort or broken WebTransport streams.
+  - **Bounded Half-Close Idle Timeouts**: Replaced extendable 30s idle timer with strict, bounded half-close idle timeouts (10s on remote FIN, 15s on client-write done) to prevent hanging half-closed connections.
+  - **Worker Tunnel Bridge Robustness**: `CLIENT_ABORT` rejects pending reads rather than incorrectly resolving with `{ done: true }`; reaper and offline flush report explicit failures.
+  - **Dispatcher & Socket Lifecycle**: Ensured accepted sockets are always cleaned up in `finally`; per-attempt verification on retry outcomes.
+- **Go Server (`brook-quicserver.go`)**:
+  - **Relay Error Propagation**: Relay returns the first non-normal error instead of silently returning `nil`; proper TCP half-close propagation (`CloseWrite`).
+  - **Narrowed Normal Stream Close**: Gated normal stream closure strictly to typed QUIC errors (`ApplicationErrorCode(0)`, `NoError`); 10s teardown now reports timeout error.
+  - **Raw QUIC Brook Throughput**: Eliminated redundant deadline syscall explosion during bulk transfers; decoupled TCP reads (32KB buffer) and batch-sealed 2014B frames into single QUIC stream writes; configured high-throughput QUIC receive flow control windows (4MB/16MB stream, 8MB/32MB connection).
+- **Tests & Verification**:
+  - Enhanced outcome classification tests with strict success and abort assertions; added bridge client abort / FIN tests (83/83 unit & live E2E passing).
+
+---
+
 ## [v1.36.0] - 2026-09-03
 
 ### Race, Deadlock, Memory Leak & Performance Fixes
