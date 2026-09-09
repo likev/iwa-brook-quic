@@ -7,17 +7,20 @@ export function createPortStreamBridge(port) {
   const readQueue = [];
   const pendingReadResolvers = [];
   let isClosed = false;
+  let abortError = null;
   let readQueueBytes = 0;
   const MAX_READ_QUEUE_BYTES = 4 * 1024 * 1024; // 4MB bounded queue
 
   const abortInbound = (reason) => {
     if (isClosed) return;
     isClosed = true;
+    abortError = new Error(reason || 'Inbound queue overflow');
     readQueue.length = 0;
     readQueueBytes = 0;
     while (pendingReadResolvers.length > 0) {
-      const resolve = pendingReadResolvers.shift();
-      resolve({ value: undefined, done: true });
+      const resolver = pendingReadResolvers.shift();
+      if (resolver.reject) resolver.reject(abortError);
+      else resolver({ value: undefined, done: true });
     }
     try {
       port.postMessage({ type: 'STREAM_ERROR', error: reason || 'Inbound queue overflow' });
@@ -36,7 +39,8 @@ export function createPortStreamBridge(port) {
     if (msg.type === 'CLIENT_DATA') {
       const chunk = msg.chunk instanceof Uint8Array ? msg.chunk : new Uint8Array(msg.chunk);
       if (pendingReadResolvers.length > 0) {
-        const resolve = pendingReadResolvers.shift();
+        const resolver = pendingReadResolvers.shift();
+        const resolve = resolver.resolve || resolver;
         resolve({ value: chunk, done: false });
       } else {
         if (readQueueBytes + chunk.length > MAX_READ_QUEUE_BYTES) {
@@ -51,7 +55,8 @@ export function createPortStreamBridge(port) {
       isClosed = true;
       if (pendingReadResolvers.length > 0) {
         while (pendingReadResolvers.length > 0) {
-          const resolve = pendingReadResolvers.shift();
+          const resolver = pendingReadResolvers.shift();
+          const resolve = resolver.resolve || resolver;
           resolve({ value: undefined, done: true });
         }
       } else {
@@ -59,15 +64,22 @@ export function createPortStreamBridge(port) {
       }
     } else if (msg.type === 'CLIENT_ABORT') {
       isClosed = true;
+      abortError = new Error(msg.reason || 'Client connection aborted');
+      readQueue.length = 0;
+      readQueueBytes = 0;
       while (pendingReadResolvers.length > 0) {
-        const resolve = pendingReadResolvers.shift();
-        resolve({ value: undefined, done: true });
+        const resolver = pendingReadResolvers.shift();
+        if (resolver.reject) resolver.reject(abortError);
+        else resolver({ value: undefined, done: true });
       }
     }
   };
 
   const clientReader = {
     read: () => {
+      if (abortError) {
+        return Promise.reject(abortError);
+      }
       if (readQueue.length > 0) {
         const item = readQueue.shift();
         if (item && item.value) {
@@ -78,15 +90,16 @@ export function createPortStreamBridge(port) {
       if (isClosed) {
         return Promise.resolve({ value: undefined, done: true });
       }
-      return new Promise((resolve) => {
-        pendingReadResolvers.push(resolve);
+      return new Promise((resolve, reject) => {
+        pendingReadResolvers.push({ resolve, reject });
       });
     },
     releaseLock: () => {},
     cancel: async () => {
       isClosed = true;
       while (pendingReadResolvers.length > 0) {
-        const resolve = pendingReadResolvers.shift();
+        const resolver = pendingReadResolvers.shift();
+        const resolve = resolver.resolve || resolver;
         resolve({ value: undefined, done: true });
       }
       try {

@@ -271,9 +271,7 @@ async function runUnitTests() {
     serverHandshakeDone: true,
     totalBytesRecv: 0
   };
-  const isSuccessRefused = targetRefusedOutcome.terminationReason === 'both_closed' ||
-                           targetRefusedOutcome.terminationReason === 'normal' ||
-                           (targetRefusedOutcome.terminationReason === 'transport_closed' && targetRefusedOutcome.totalBytesRecv > 0);
+  const isSuccessRefused = targetRefusedOutcome.terminationReason === 'both_closed';
   assert(isSuccessRefused === false, 'Target dial refused with 0 bytes is classified as failure (success: false)');
 
   const successTransferOutcome = {
@@ -281,10 +279,62 @@ async function runUnitTests() {
     serverHandshakeDone: true,
     totalBytesRecv: 5120
   };
-  const isSuccessTransferred = successTransferOutcome.terminationReason === 'both_closed' ||
-                              successTransferOutcome.terminationReason === 'normal' ||
-                              (successTransferOutcome.terminationReason === 'transport_closed' && successTransferOutcome.totalBytesRecv > 0);
-  assert(isSuccessTransferred === true, 'Transport closed after data transfer (>0 bytes) is classified as success (success: true)');
+  const isSuccessTransferred = successTransferOutcome.terminationReason === 'both_closed';
+  assert(isSuccessTransferred === false, 'Abrupt transport_closed mid-transfer is classified as failure (success: false)');
+
+  const cleanOutcome = {
+    terminationReason: 'both_closed',
+    serverHandshakeDone: true,
+    totalBytesRecv: 5120
+  };
+  const isSuccessClean = cleanOutcome.terminationReason === 'both_closed';
+  assert(isSuccessClean === true, 'Orderly both_closed after data transfer is classified as success (success: true)');
+
+  const idleTimeoutOutcome = {
+    terminationReason: 'idle_timeout',
+    serverHandshakeDone: true,
+    totalBytesRecv: 5120
+  };
+  assert(idleTimeoutOutcome.terminationReason !== 'both_closed', 'Idle timeout is classified as failure (success: false)');
+
+  // 1.11b Worker Tunnel Bridge: CLIENT_ABORT rejection and CLIENT_FIN completion
+  const mockPort1 = {
+    postMessage: () => {},
+    onmessage: null,
+    start: () => {},
+    close: () => {}
+  };
+  const bridge1 = createPortStreamBridge(mockPort1);
+  const pendingRead1 = bridge1.clientReader.read();
+  mockPort1.onmessage({ data: { type: 'CLIENT_ABORT', reason: 'socket reset' } });
+  let read1Rejected = false;
+  try {
+    await pendingRead1;
+  } catch (e) {
+    read1Rejected = true;
+    assert(e.message === 'socket reset', `CLIENT_ABORT rejects pending reader with reason (${e.message})`);
+  }
+  assert(read1Rejected, 'CLIENT_ABORT rejects pending reader instead of resolving done:true');
+
+  let subsequentReadRejected = false;
+  try {
+    await bridge1.clientReader.read();
+  } catch (e) {
+    subsequentReadRejected = true;
+  }
+  assert(subsequentReadRejected, 'Subsequent reader.read() after CLIENT_ABORT rejects immediately');
+
+  const mockPort2 = {
+    postMessage: () => {},
+    onmessage: null,
+    start: () => {},
+    close: () => {}
+  };
+  const bridge2 = createPortStreamBridge(mockPort2);
+  const pendingRead2 = bridge2.clientReader.read();
+  mockPort2.onmessage({ data: { type: 'CLIENT_FIN' } });
+  const read2Res = await pendingRead2;
+  assert(read2Res.done === true, 'CLIENT_FIN resolves pending reader with { done: true }');
 
   // 1.12 LogStream Historical Log Preservation
   const testLogStream = new LogStream({ container: null, maxLogs: 10 });

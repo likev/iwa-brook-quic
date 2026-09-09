@@ -36,7 +36,7 @@ export class WtWorkerManager {
         // If a worker has been around with zero activity for > 30s, force terminate it
         if (ageMs > 30000) {
           this._log('warning', `[WT Worker #${id}] Reaping stalled worker for ${entry.targetStr} (inactive for ${Math.round(ageMs / 1000)}s)`);
-          this._terminateWorker(id);
+          this._terminateWorker(id, 'worker_reaped', `Worker reaped after ${Math.round(ageMs / 1000)}s stall`);
         }
       }
     }, 5000);
@@ -67,16 +67,9 @@ export class WtWorkerManager {
   flushStalledSessions(reason = 'network_offline') {
     if (this.workers.size === 0) return;
     this._log('warning', `⚡ Flushing ${this.workers.size} active worker session(s) due to ${reason}`);
-    for (const [id, entry] of this.workers.entries()) {
-      if (this.sessionTracker) {
-        this.sessionTracker.closeSession(id);
-      }
-      try {
-        entry.worker.postMessage({ type: 'CLOSE' });
-        entry.worker.terminate();
-      } catch (e) {}
+    for (const id of Array.from(this.workers.keys())) {
+      this._terminateWorker(id, reason, `Session flushed due to ${reason}`);
     }
-    this.workers.clear();
   }
 
   /**
@@ -126,7 +119,13 @@ export class WtWorkerManager {
           break;
         case 'DONE':
           if (msg.outcome && !msg.outcome.success && msg.outcome.error) {
-            this._log('error', `[WT Worker #${sessionId}] Tunnel ended: ${msg.outcome.error}`);
+            const kind = msg.outcome.kind;
+            const bytes = msg.outcome.bytesReceived || 0;
+            if ((kind === 'idle_timeout' || kind === 'transport_closed') && bytes > 0) {
+              this._log('info', `[WT Worker #${sessionId}] Proxy session closed (${kind}, ${bytes}B transferred)`);
+            } else {
+              this._log('error', `[WT Worker #${sessionId}] Tunnel ended: ${msg.outcome.error}`);
+            }
           }
           if (this.sessionTracker) {
             this.sessionTracker.closeSession(sessionId);
@@ -163,15 +162,18 @@ export class WtWorkerManager {
     );
   }
 
-  _terminateWorker(sessionId) {
+  _terminateWorker(sessionId, reason = 'normal', error = null) {
     const entry = this.workers.get(sessionId);
     if (entry) {
       this.workers.delete(sessionId);
       if (this.sessionTracker) {
         this.sessionTracker.closeSession(sessionId);
       }
+      if (reason !== 'normal') {
+        this._log('error', `[WT Worker #${sessionId}] Tunnel ended: ${error || reason}`);
+      }
       try {
-        entry.worker.postMessage({ type: 'CLOSE' });
+        entry.worker.postMessage({ type: 'CLOSE', reason, error });
         entry.worker.terminate();
       } catch (e) {}
     }

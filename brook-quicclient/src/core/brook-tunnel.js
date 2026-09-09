@@ -84,7 +84,8 @@ export class BrookTunnel {
     let isTerminated = false;
     let clientReadClosed = false;
     let clientWriteClosed = false;
-    let serverRxClosed = false;
+    let serverFinReceived = false;
+    let transportClosed = false;
     let hasExchangedData = false;
     let successSent = false;
     let activeWritePromise = null;
@@ -103,7 +104,7 @@ export class BrookTunnel {
     });
 
     let cleanupPromise = null;
-    let terminationReason = 'normal';
+    let terminationReason = 'unknown';
     let terminationError = null;
 
     // 1. Prepare Cryptographic Context
@@ -135,20 +136,28 @@ export class BrookTunnel {
     const resetIdleTimer = (durationMs = null) => {
       if (idleTimer) clearTimeout(idleTimer);
       if (!isTerminated) {
-        // Fast-recovery keep-alive timeout: 30s active, 15s speculative
-        const timeout = durationMs !== null ? durationMs : (hasExchangedData ? 30000 : 15000);
+        let timeout;
+        if (durationMs !== null) {
+          timeout = durationMs;
+        } else if (serverFinReceived) {
+          timeout = 10000;
+        } else if (clientReadClosed) {
+          timeout = 15000;
+        } else {
+          timeout = hasExchangedData ? 30000 : 15000;
+        }
         idleTimer = setTimeout(() => {
           if (!isTerminated) {
             if (totalBytesRecv === 0 && onLog) {
               onLog('info', `${logTag} ℹ️ Speculative connection for ${targetStr} idle for ${(timeout / 1000).toFixed(0)}s (closed by idle timer).`);
             }
-            cleanup('idle_timeout');
+            cleanup('idle_timeout', new Error(`Connection idle timeout after ${timeout}ms`));
           }
         }, timeout);
       }
     };
 
-    const cleanup = (reason = 'normal', err = null) => {
+    const cleanup = (reason = 'unknown', err = null) => {
       if (cleanupPromise) return cleanupPromise;
       isTerminated = true;
       terminationReason = reason;
@@ -230,7 +239,19 @@ export class BrookTunnel {
     };
 
     const checkFullClose = () => {
-      if (clientReadClosed && serverRxClosed) {
+      if (clientReadClosed && serverFinReceived) {
+        if (!serverHandshakeDone) {
+          cleanup('client_abort', new Error('Connection closed before handshake completed'));
+          return;
+        }
+        if (expectedPayloadLen !== -1 || rxBuffer.length - rxOffset > 0) {
+          cleanup('framing_error', new Error('Stream closed with incomplete frame in buffer'));
+          return;
+        }
+        if (totalBytesRecv === 0) {
+          cleanup('target_dial_refused', new Error('Target closed connection with 0 bytes'));
+          return;
+        }
         cleanup('both_closed');
       }
     };
@@ -377,13 +398,18 @@ export class BrookTunnel {
             if (!serverHandshakeDone && onLog) {
               onLog('warning', `${logTag} ⚠️ Brook server closed stream before sending server nonce for ${targetStr}. Possible client clock drift (diff > 60s) or invalid password.`);
             }
-            serverRxClosed = true;
+            serverFinReceived = true;
 
             if (!clientWriteClosed) {
               clientWriteClosed = true;
               try {
                 await clientWriter.close().catch(() => {});
               } catch (e) {}
+            }
+
+            if (expectedPayloadLen !== -1 || rxOffset < rxBuffer.length) {
+              cleanup('framing_error', new Error('Server sent FIN with incomplete frame in buffer'));
+              return;
             }
 
             // If target closed with 0 bytes, fail fast immediately (target dial refused, dropped, or redundant pre-connect)
@@ -396,7 +422,7 @@ export class BrookTunnel {
             }
 
             checkFullClose();
-            if (serverRxClosed && !clientReadClosed && !isTerminated) {
+            if (serverFinReceived && !clientReadClosed && !isTerminated) {
               // Bounded half-close: allow client 10s to complete reading
               resetIdleTimer(10000);
             }
@@ -409,6 +435,8 @@ export class BrookTunnel {
         isProcessingRx = false;
         if (rxQueue.length > 0 && !isTerminated) {
           queueMicrotask(processRxQueue);
+        } else if (transportClosed && !isTerminated && !serverFinReceived) {
+          cleanup('transport_closed', new Error('Underlying transport closed before server FIN'));
         }
         if (rxQueuedBytes < 1024 * 1024 && rxHighWaterLogged) {
           rxHighWaterLogged = false;
@@ -443,11 +471,12 @@ export class BrookTunnel {
           processRxQueue();
         },
         onClose: () => {
-          serverRxClosed = true;
-          if (rxQueue.length === 0 && !isProcessingRx) {
-            checkFullClose();
-            if (!isTerminated && !clientReadClosed) {
-              resetIdleTimer(10000);
+          transportClosed = true;
+          if (rxQueue.length === 0 && !isProcessingRx && !isTerminated) {
+            if (!serverFinReceived) {
+              cleanup('transport_closed', new Error('Underlying transport closed before server FIN'));
+            } else {
+              checkFullClose();
             }
           }
         },
@@ -511,7 +540,7 @@ export class BrookTunnel {
           try {
             readResult = await clientReader.read();
           } catch (err) {
-            cleanup(serverHandshakeDone ? 'client_read_error' : 'client_abort', err);
+            cleanup('client_abort', err);
             break;
           }
 
@@ -519,14 +548,14 @@ export class BrookTunnel {
           if (done) {
             clientReadClosed = true;
             if (!serverHandshakeDone) {
-              cleanup('client_abort');
+              cleanup('client_abort', new Error('Client closed before server dial completed'));
               break;
             }
             try {
               await quicManager.sendStreamData(streamId, new Uint8Array(0), true);
             } catch (e) {}
             checkFullClose();
-            if (!isTerminated && !serverRxClosed) {
+            if (!isTerminated && !serverFinReceived) {
               // Client closed its write side; allow server bounded time to complete response
               resetIdleTimer(15000);
             }
@@ -565,7 +594,7 @@ export class BrookTunnel {
         }
 
         // If client finished sending but server is still replying, await completion
-        if (!isTerminated && !serverRxClosed) {
+        if (!isTerminated && !serverFinReceived) {
           await completionPromise;
         }
       }
@@ -576,12 +605,7 @@ export class BrookTunnel {
       await (cleanupPromise || cleanup('loop_exit'));
     }
 
-    const isSuccess = terminationReason === 'both_closed' ||
-                      terminationReason === 'normal' ||
-                      (terminationReason === 'transport_closed' && totalBytesRecv > 0) ||
-                      (terminationReason === 'client_abort' && totalBytesRecv > 0) ||
-                      (terminationReason === 'client_read_error' && totalBytesRecv > 0) ||
-                      (terminationReason === 'idle_timeout' && totalBytesRecv > 0);
+    const isSuccess = terminationReason === 'both_closed';
 
     return {
       success: isSuccess,

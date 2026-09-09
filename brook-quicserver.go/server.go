@@ -28,17 +28,28 @@ import (
 )
 
 func isNormalStreamClose(err error) bool {
-	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || errors.Is(err, context.Canceled) {
+	if err == nil {
+		return true
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || errors.Is(err, context.Canceled) || errors.Is(err, io.ErrClosedPipe) {
+		return true
+	}
+	var se *quic.StreamError
+	if errors.As(err, &se) && (se.ErrorCode == 0 || se.ErrorCode == 0x100) {
+		return true
+	}
+	var ae *quic.ApplicationError
+	if errors.As(err, &ae) && (ae.ErrorCode == 0 || ae.ErrorCode == 0x100) {
+		return true
+	}
+	var idleErr *quic.IdleTimeoutError
+	if errors.As(err, &idleErr) {
 		return true
 	}
 	s := err.Error()
-	return strings.Contains(s, "EOF") ||
-		strings.Contains(s, "closed") ||
-		strings.Contains(s, "canceled") ||
-		strings.Contains(s, "cancel") ||
-		strings.Contains(s, "done") ||
-		strings.Contains(s, "Application error 0x0") ||
-		strings.Contains(s, "no recent network activity")
+	return strings.Contains(s, "Application error 0x0") ||
+		strings.Contains(s, "no recent network activity") ||
+		strings.Contains(s, "use of closed network connection")
 }
 
 type bufferedStream struct {

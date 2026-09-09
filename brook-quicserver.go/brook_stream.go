@@ -237,6 +237,16 @@ func handleEncryptedBrookStream(client StreamConn, cn []byte, rawPass, passHash 
 	var wg sync.WaitGroup
 	wg.Add(2)
 
+	var relayErr error
+	var errOnce sync.Once
+	recordErr := func(err error) {
+		if err != nil && !isNormalStreamClose(err) {
+			errOnce.Do(func() {
+				relayErr = err
+			})
+		}
+	}
+
 	doneOnce := sync.Once{}
 	unblockOther := func() {
 		doneOnce.Do(func() {
@@ -306,10 +316,18 @@ func handleEncryptedBrookStream(client StreamConn, cn []byte, rawPass, passHash 
 					_ = client.SetWriteDeadline(time.Now().Add(time.Duration(timeout) * time.Second))
 				}
 				if _, werr := client.Write(batchBuf[:batchLen]); werr != nil {
+					recordErr(fmt.Errorf("client stream write failed: %w", werr))
 					return
 				}
 			}
 			if err != nil {
+				if !errors.Is(err, io.EOF) {
+					recordErr(fmt.Errorf("remote read failed: %w", err))
+				} else {
+					if closer, ok := client.(interface{ Close() error }); ok {
+						_ = closer.Close()
+					}
+				}
 				return
 			}
 		}
@@ -335,11 +353,19 @@ func handleEncryptedBrookStream(client StreamConn, cn []byte, rawPass, passHash 
 				_ = client.SetReadDeadline(time.Now().Add(time.Duration(timeout) * time.Second))
 			}
 			if _, err := io.ReadFull(client, lenChunk); err != nil {
+				if !errors.Is(err, io.EOF) {
+					recordErr(fmt.Errorf("read client frame length failed: %w", err))
+				} else {
+					if tc, ok := remote.(*net.TCPConn); ok {
+						_ = tc.CloseWrite()
+					}
+				}
 				return
 			}
 			plainLenBuf = plainLenBuf[:0]
 			plainL, err := ca.Open(plainLenBuf, cn, lenChunk, nil)
 			if err != nil {
+				recordErr(fmt.Errorf("decrypt client frame length failed: %w", err))
 				return
 			}
 			NextNonce(cn)
@@ -349,15 +375,18 @@ func handleEncryptedBrookStream(client StreamConn, cn []byte, rawPass, passHash 
 				continue
 			}
 			if l > len(payloadChunk)-16 {
+				recordErr(fmt.Errorf("client frame payload length too large (%d)", l))
 				return
 			}
 
 			if _, err := io.ReadFull(client, payloadChunk[:l+16]); err != nil {
+				recordErr(fmt.Errorf("read client payload failed (truncated): %w", err))
 				return
 			}
 			plainDataBuf = plainDataBuf[:0]
 			plainData, err := ca.Open(plainDataBuf, cn, payloadChunk[:l+16], nil)
 			if err != nil {
+				recordErr(fmt.Errorf("decrypt client payload failed: %w", err))
 				return
 			}
 			NextNonce(cn)
@@ -366,6 +395,7 @@ func handleEncryptedBrookStream(client StreamConn, cn []byte, rawPass, passHash 
 				_ = remote.SetWriteDeadline(time.Now().Add(time.Duration(timeout) * time.Second))
 			}
 			if _, err := remote.Write(plainData); err != nil {
+				recordErr(fmt.Errorf("remote write failed: %w", err))
 				return
 			}
 		}
@@ -383,8 +413,11 @@ func handleEncryptedBrookStream(client StreamConn, cn []byte, rawPass, passHash 
 		_ = remote.Close()
 		_ = client.Close()
 		<-waitCh
+		if relayErr == nil {
+			relayErr = errors.New("relay teardown timed out after 10s")
+		}
 	}
-	return nil
+	return relayErr
 }
 
 func handleSimpleBrookStream(client StreamConn, password []byte, tcpTimeout, udpTimeout int) error {
@@ -453,6 +486,16 @@ func handleSimpleBrookStream(client StreamConn, password []byte, tcpTimeout, udp
 	var wg sync.WaitGroup
 	wg.Add(2)
 
+	var relayErr error
+	var errOnce sync.Once
+	recordErr := func(err error) {
+		if err != nil && !isNormalStreamClose(err) {
+			errOnce.Do(func() {
+				relayErr = err
+			})
+		}
+	}
+
 	doneOnce := sync.Once{}
 	unblockOther := func() {
 		doneOnce.Do(func() {
@@ -473,10 +516,18 @@ func handleSimpleBrookStream(client StreamConn, password []byte, tcpTimeout, udp
 			if n > 0 {
 				_ = client.SetWriteDeadline(time.Now().Add(time.Duration(effectiveTimeout) * time.Second))
 				if _, werr := client.Write(buf[:n]); werr != nil {
+					recordErr(fmt.Errorf("client write failed: %w", werr))
 					return
 				}
 			}
 			if err != nil {
+				if !errors.Is(err, io.EOF) {
+					recordErr(fmt.Errorf("remote read failed: %w", err))
+				} else {
+					if closer, ok := client.(interface{ Close() error }); ok {
+						_ = closer.Close()
+					}
+				}
 				return
 			}
 		}
@@ -494,10 +545,18 @@ func handleSimpleBrookStream(client StreamConn, password []byte, tcpTimeout, udp
 			if n > 0 {
 				_ = remote.SetWriteDeadline(time.Now().Add(time.Duration(effectiveTimeout) * time.Second))
 				if _, werr := remote.Write(buf[:n]); werr != nil {
+					recordErr(fmt.Errorf("remote write failed: %w", werr))
 					return
 				}
 			}
 			if err != nil {
+				if !errors.Is(err, io.EOF) {
+					recordErr(fmt.Errorf("client read failed: %w", err))
+				} else {
+					if tc, ok := remote.(*net.TCPConn); ok {
+						_ = tc.CloseWrite()
+					}
+				}
 				return
 			}
 		}
@@ -515,6 +574,9 @@ func handleSimpleBrookStream(client StreamConn, password []byte, tcpTimeout, udp
 		_ = remote.Close()
 		_ = client.Close()
 		<-waitCh
+		if relayErr == nil {
+			relayErr = errors.New("raw relay teardown timed out after 10s")
+		}
 	}
-	return nil
+	return relayErr
 }

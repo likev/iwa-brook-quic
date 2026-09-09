@@ -152,7 +152,7 @@ async function runWtTunnel({
           }
 
           // If client data was already consumed or server started sending payload or client aborted, do not retry
-          if (clientDataConsumed || proxyReplied || (outcome.bytesReceived && outcome.bytesReceived > 0) || outcome.kind === 'client_abort' || outcome.kind === 'client_read_error' || outcome.kind === 'rx_overflow') {
+          if (clientDataConsumed || proxyReplied || (outcome.bytesReceived && outcome.bytesReceived > 0) || outcome.kind === 'client_abort' || outcome.kind === 'rx_overflow') {
             break;
           }
 

@@ -277,6 +277,7 @@ export class ProxyDispatcher {
       });
 
       let tunnelError = null;
+      let finalOutcome = null;
       let clientDataConsumed = false;
       const MAX_ATTEMPTS = 3;
 
@@ -337,6 +338,8 @@ export class ProxyDispatcher {
             onLog: (lvl, msg) => this._log(lvl, msg)
           });
 
+          finalOutcome = outcome;
+
           if (outcome.success) {
             tunnelError = null;
             break;
@@ -346,14 +349,14 @@ export class ProxyDispatcher {
               quicSession.close();
             }
 
-            const bytesReceived = session ? session.bytesReceived : 0;
-            if (clientDataConsumed || proxyReplied || bytesReceived > 0 || outcome.kind === 'client_abort' || outcome.kind === 'client_read_error' || outcome.kind === 'rx_overflow') {
+            const bytesReceived = outcome ? outcome.bytesReceived : 0;
+            if (clientDataConsumed || proxyReplied || bytesReceived > 0 || outcome.kind === 'client_abort' || outcome.kind === 'rx_overflow') {
               break;
             }
 
             if (attempt < MAX_ATTEMPTS) {
               this.totalRetries++;
-              this._log('warning', `[#${session.id}] ⚠️ [Brook] Dial attempt ${attempt} for ${targetStr} failed (${outcome.kind}). Retrying with fresh session (${attempt + 1}/${MAX_ATTEMPTS})...`);
+              this._log('warning', `[#${session?.id}] ⚠️ [Brook] Dial attempt ${attempt} for ${targetStr} failed (${outcome.kind}). Retrying with fresh session (${attempt + 1}/${MAX_ATTEMPTS})...`);
               await new Promise(r => setTimeout(r, 300));
             }
           }
@@ -369,21 +372,20 @@ export class ProxyDispatcher {
       if (tunnelError) {
         await sendFailureOnce(0x05);
         // Normal keep-alive socket expiration or clean transport closure after data exchange is not a critical error
-        if ((tunnelError.message.includes('idle_timeout') || tunnelError.message.includes('transport_closed')) && session && session.bytesReceived > 0) {
-          // Quiet normal termination
+        if ((finalOutcome?.kind === 'idle_timeout' || finalOutcome?.kind === 'transport_closed') && finalOutcome?.bytesReceived > 0) {
+          this._log('info', `[#${session?.id}] Proxy session closed (${finalOutcome.kind}, ${finalOutcome.bytesReceived}B transferred)`);
         } else {
-          throw tunnelError;
+          this._log('warning', `Proxy session error: ${tunnelError.message || tunnelError}`);
         }
       }
     } catch (err) {
-      if (!err.message.includes('idle_timeout') && !err.message.includes('transport_closed')) {
+      if (!err.message?.includes('idle_timeout') && !err.message?.includes('transport_closed')) {
         this._log('warning', `Proxy session error: ${err.message}`);
       }
-
+    } finally {
       try { if (reader) await reader.cancel().catch(() => {}); } catch (e) {}
       try { if (writer) await writer.close().catch(() => {}); } catch (e) {}
       try { await acceptedSocket.close().catch(() => {}); } catch (e) {}
-    } finally {
       try { if (reader) reader.releaseLock(); } catch (e) {}
       try { if (writer) writer.releaseLock(); } catch (e) {}
       if (session) {
