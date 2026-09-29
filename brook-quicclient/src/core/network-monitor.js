@@ -24,12 +24,15 @@ export class NetworkMonitor {
     probeUrls = PROBE_URLS,
     checkIntervalMs = 5000,
     timeoutMs = 3000,
+    maxConsecutiveFailures = 3,
     onStatusChange = null,
     onLog = null
   } = {}) {
     this.probeUrls = [...probeUrls];
     this.checkIntervalMs = checkIntervalMs;
     this.timeoutMs = timeoutMs;
+    this.maxConsecutiveFailures = maxConsecutiveFailures;
+    this.consecutiveFailures = 0;
     this.onStatusChange = onStatusChange;
     this.onLog = onLog;
 
@@ -61,6 +64,7 @@ export class NetworkMonitor {
         try {
           const resp = await fetch(url, {
             method: 'GET',
+            mode: 'cors',
             cache: 'no-store',
             signal: controller.signal
           });
@@ -79,15 +83,21 @@ export class NetworkMonitor {
       const wasOnline = this.isOnline;
       this.isOnline = anySuccess;
 
-      if (wasOnline !== anySuccess) {
-        if (!anySuccess) {
+      if (anySuccess) {
+        this.consecutiveFailures = 0;
+      } else {
+        this.consecutiveFailures++;
+      }
+
+      if (wasOnline !== this.isOnline) {
+        if (!this.isOnline) {
           this._log('warning', `⚠️ Network offline: All ${this.probeUrls.length} probe endpoints failed (timeout: ${this.timeoutMs}ms).`);
         } else {
           this._log('success', `🌐 Network online: Connectivity verified across probe endpoints.`);
         }
         if (this.onStatusChange) {
           try {
-            this.onStatusChange(anySuccess);
+            this.onStatusChange(this.isOnline);
           } catch (e) {}
         }
       }

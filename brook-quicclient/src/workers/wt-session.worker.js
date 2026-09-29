@@ -84,18 +84,15 @@ async function runWtTunnel({
       const attemptTimeoutMs = attempt === 1 ? 4000 : (attempt === 2 ? 6000 : 8000);
 
       try {
-        if (wtManager) {
-          try { await wtManager.close(); } catch (e) {}
-          wtManager = null;
+        if (!wtManager) {
+          wtManager = new WebTransportConnectionManager({
+            serverHost,
+            serverPort,
+            path,
+            poolSize: 1,
+            onLog: (lvl, msg, meta) => log(lvl, msg, meta)
+          });
         }
-
-        wtManager = new WebTransportConnectionManager({
-          serverHost,
-          serverPort,
-          path,
-          poolSize: 1,
-          onLog: (lvl, msg, meta) => log(lvl, msg, meta)
-        });
 
         streamSession = await wtManager.createSession({
           connectTimeoutMs: attemptTimeoutMs,
@@ -103,6 +100,10 @@ async function runWtTunnel({
         });
       } catch (sessErr) {
         lastError = sessErr;
+        if (wtManager) {
+          try { await wtManager.close(); } catch (e) {}
+          wtManager = null;
+        }
         log('warning', `⚠️ [Attempt ${attempt}/${MAX_ATTEMPTS}] Connection to WebTransport server failed: ${sessErr.message}`);
         if (isFinalAttempt) break;
         await new Promise(r => setTimeout(r, 400));

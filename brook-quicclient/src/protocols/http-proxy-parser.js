@@ -40,11 +40,11 @@ export class HttpProxyParser {
     let headerBytesLen = findHeaderEnd(buf);
 
     while (headerBytesLen === -1) {
-      if (buf.length > 8192) {
+      if (buf.length > 65536) {
         try {
           await writer.write(new TextEncoder().encode('HTTP/1.1 431 Request Header Fields Too Large\r\n\r\n'));
         } catch (e) {}
-        throw new Error('HTTP header too large (> 8KB)');
+        throw new Error('HTTP header too large (> 64KB)');
       }
 
       const remainingMs = timeoutMs - (Date.now() - startTime);
@@ -134,8 +134,15 @@ export class HttpProxyParser {
       }
 
       const version = parts[2] || 'HTTP/1.1';
-      const newFirstLine = `${method} ${path} ${version}`;
-      const rewrittenHeaders = newFirstLine + headerStr.substring(firstLineEnd);
+      const newFirstLine = `${method} ${path} ${version}\r\n`;
+      const headerLines = headerStr.substring(firstLineEnd).split(/\r?\n/);
+      const filteredLines = [];
+      for (const line of headerLines) {
+        if (!line.trim()) continue;
+        if (/^proxy-/i.test(line)) continue;
+        filteredLines.push(line);
+      }
+      const rewrittenHeaders = newFirstLine + filteredLines.join('\r\n') + '\r\n\r\n';
       const rewrittenHeaderBytes = new TextEncoder().encode(rewrittenHeaders);
 
       const bodyLeftover = buf.slice(headerBytesLen);

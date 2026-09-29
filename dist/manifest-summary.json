@@ -43,18 +43,18 @@
   },
   {
     "name": "brook-quicclient",
-    "version": "1.37.0",
+    "version": "1.38.0",
     "bundleId": "5uad6swnv66tot24df52mjr7nc7pmnmwmmxofkkshietmn3nthqqaaic",
     "origin": "isolated-app://5uad6swnv66tot24df52mjr7nc7pmnmwmmxofkkshietmn3nthqqaaic/",
     "bundlePath": "/root/downloads/iwa/dist/brook-quicclient.swbn",
-    "versionedBundlePath": "/root/downloads/iwa/dist/brook-quicclient-v1.37.0.swbn",
-    "updateUrl": "https://t.iread.fun/downloads/iwa/dist/brook-quicclient-v1.37.0.swbn",
+    "versionedBundlePath": "/root/downloads/iwa/dist/brook-quicclient-v1.38.0.swbn",
+    "updateUrl": "https://t.iread.fun/downloads/iwa/dist/brook-quicclient-v1.38.0.swbn",
     "updateManifestPath": "/root/downloads/iwa/dist/brook-quicclient-update-manifest.json",
     "updateManifest": {
       "versions": [
         {
-          "version": "1.37.0",
-          "src": "https://t.iread.fun/downloads/iwa/dist/brook-quicclient-v1.37.0.swbn",
+          "version": "1.38.0",
+          "src": "https://t.iread.fun/downloads/iwa/dist/brook-quicclient-v1.38.0.swbn",
           "channels": [
             "default"
           ]

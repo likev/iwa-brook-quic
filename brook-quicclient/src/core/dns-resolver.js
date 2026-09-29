@@ -137,6 +137,7 @@ export class DnsResolver {
       let sn = null;
       let sk = null;
       let rxBuf = new Uint8Array(0);
+      let expectedLen = -1;
 
       const ips = await new Promise((resolve, reject) => {
         const timer = setTimeout(() => reject(new Error('DNS resolution timed out')), timeoutMs);
@@ -155,15 +156,23 @@ export class DnsResolver {
               sk = await deriveKey(password, sn, 'brook', withoutBrook);
             }
 
-            if (sk && rxBuf.length >= 18) {
+            if (sk && expectedLen === -1 && rxBuf.length >= 18) {
               try {
-                const payloadLen = await openLength(sk, sn, rxBuf.slice(0, 18));
-                if (rxBuf.length >= 18 + payloadLen + 16) {
-                  const plain = await openPayload(sk, sn, rxBuf.slice(18, 18 + payloadLen + 16));
-                  clearTimeout(timer);
-                  const parsed = this._parseDnsResponse(plain);
-                  resolve(parsed);
-                }
+                expectedLen = await openLength(sk, sn, rxBuf.slice(0, 18));
+                rxBuf = rxBuf.slice(18);
+              } catch (e) {
+                clearTimeout(timer);
+                reject(e);
+                return;
+              }
+            }
+
+            if (sk && expectedLen !== -1 && rxBuf.length >= expectedLen + 16) {
+              try {
+                const plain = await openPayload(sk, sn, rxBuf.slice(0, expectedLen + 16));
+                clearTimeout(timer);
+                const parsed = this._parseDnsResponse(plain);
+                resolve(parsed);
               } catch (e) {
                 clearTimeout(timer);
                 reject(e);

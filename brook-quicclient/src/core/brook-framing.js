@@ -138,7 +138,11 @@ export async function openLength(cipherOrKey, nonce12, chunk18) {
   const iv = new Uint8Array(nonce12);
   nextNonce(nonce12);
   const lenBuf = await cipher.decrypt(iv, chunk18);
-  return (lenBuf[0] << 8) | lenBuf[1];
+  const len = (lenBuf[0] << 8) | lenBuf[1];
+  if (len > 65535 - 16) {
+    throw new Error(`Frame length exceeds maximum allowed limit: ${len}`);
+  }
+  return len;
 }
 
 /**

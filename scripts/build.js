@@ -20,6 +20,12 @@ function buildApp(name, keyName = null) {
   const manifestData = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
   const version = manifestData.version || '1.0.0';
 
+  // Ensure .well-known/manifest.webmanifest is always synchronized
+  const wellKnownDir = path.join(appDir, '.well-known');
+  if (fs.existsSync(wellKnownDir)) {
+    fs.copyFileSync(manifestPath, path.join(wellKnownDir, 'manifest.webmanifest'));
+  }
+
   const unsignedWbn = path.join(distDir, `${name}.wbn`);
   const signedSwbn = path.join(distDir, `${name}.swbn`);
   const versionedSwbn = path.join(distDir, `${name}-v${version}.swbn`);

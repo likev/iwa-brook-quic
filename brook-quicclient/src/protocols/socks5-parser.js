@@ -67,6 +67,21 @@ export class Socks5Parser {
     const nMethods = buf[1];
     await ensureBytes(2 + nMethods);
 
+    const methods = buf.subarray(2, 2 + nMethods);
+    let hasNoAuth = false;
+    for (let i = 0; i < methods.length; i++) {
+      if (methods[i] === 0x00) {
+        hasNoAuth = true;
+        break;
+      }
+    }
+    if (!hasNoAuth) {
+      try {
+        await writer.write(new Uint8Array([0x05, 0xFF]));
+      } catch (e) {}
+      throw new Error('SOCKS5 client did not offer NO_AUTH (0x00) authentication');
+    }
+
     // Reply NO AUTH (0x05 0x00)
     await writer.write(new Uint8Array([0x05, 0x00]));
 
@@ -101,6 +116,9 @@ export class Socks5Parser {
       // Domain Name: 1 byte len + domain bytes + 2 bytes port
       await ensureBytes(5);
       const domainLen = buf[4];
+      if (domainLen === 0) {
+        throw new Error('Invalid SOCKS5 domain name: length is 0');
+      }
       dstAddrLen = 1 + domainLen;
       await ensureBytes(4 + dstAddrLen + 2);
       const domain = new TextDecoder().decode(buf.subarray(5, 5 + domainLen));

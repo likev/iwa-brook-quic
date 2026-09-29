@@ -33,8 +33,8 @@ export class WtWorkerManager {
       const now = Date.now();
       for (const [id, entry] of this.workers.entries()) {
         const ageMs = now - (entry.lastActivity || entry.createdAt);
-        // If a worker has been around with zero activity for > 30s, force terminate it
-        if (ageMs > 30000) {
+        // If a worker has been around with zero activity for > 120s, force terminate it
+        if (ageMs > 120000) {
           this._log('warning', `[WT Worker #${id}] Reaping stalled worker for ${entry.targetStr} (inactive for ${Math.round(ageMs / 1000)}s)`);
           this._terminateWorker(id, 'worker_reaped', `Worker reaped after ${Math.round(ageMs / 1000)}s stall`);
         }
@@ -106,6 +106,7 @@ export class WtWorkerManager {
     worker.onmessage = (event) => {
       const msg = event.data;
       if (!msg) return;
+      entry.lastActivity = Date.now();
 
       switch (msg.type) {
         case 'LOG':

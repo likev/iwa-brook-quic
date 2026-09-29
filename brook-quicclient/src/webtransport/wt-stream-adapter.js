@@ -58,7 +58,11 @@ export class WtStreamSession {
     }
     const u8 = data instanceof Uint8Array ? data : new Uint8Array(data);
     if (u8.length > 0) {
-      await this.writer.write(u8);
+      const writePromise = this.writer.write(u8);
+      const writeTimeout = new Promise((_, reject) => {
+        setTimeout(() => reject(new Error('WebTransport stream write timed out after 15s')), 15000);
+      });
+      await Promise.race([writePromise, writeTimeout]);
     }
     if (fin) {
       try {

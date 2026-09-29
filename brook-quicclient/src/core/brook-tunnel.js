@@ -140,11 +140,11 @@ export class BrookTunnel {
         if (durationMs !== null) {
           timeout = durationMs;
         } else if (serverFinReceived) {
-          timeout = 10000;
-        } else if (clientReadClosed) {
           timeout = 15000;
+        } else if (clientReadClosed) {
+          timeout = 30000;
         } else {
-          timeout = hasExchangedData ? 30000 : 15000;
+          timeout = hasExchangedData ? 60000 : 30000;
         }
         idleTimer = setTimeout(() => {
           if (!isTerminated) {
@@ -188,9 +188,14 @@ export class BrookTunnel {
           rxQueuedBytes = 0;
         }
 
-        // Await active write promise before attempting to close writer
+        // Await active write promise before attempting to close writer with 5s bounded grace
         if (activeWritePromise) {
-          try { await activeWritePromise.catch(() => {}); } catch (e) {}
+          try {
+            await Promise.race([
+              activeWritePromise.catch(() => {}),
+              new Promise(r => setTimeout(r, 5000))
+            ]);
+          } catch (e) {}
           activeWritePromise = null;
         }
 
@@ -371,7 +376,11 @@ export class BrookTunnel {
                   totalBytesRecv += plainLen;
                   try {
                     const t0 = (typeof performance !== 'undefined') ? performance.now() : Date.now();
-                    activeWritePromise = clientWriter.write(plainPayload);
+                    const writePromise = clientWriter.write(plainPayload);
+                    const writeTimeout = new Promise((_, reject) => {
+                      setTimeout(() => reject(new Error('clientWriter.write timed out after 15s')), 15000);
+                    });
+                    activeWritePromise = Promise.race([writePromise, writeTimeout]);
                     await activeWritePromise;
                     activeWritePromise = null;
                     const waitMs = ((typeof performance !== 'undefined') ? performance.now() : Date.now()) - t0;
@@ -412,10 +421,10 @@ export class BrookTunnel {
               return;
             }
 
-            // If target closed with 0 bytes, fail fast immediately (target dial refused, dropped, or redundant pre-connect)
-            if (totalBytesRecv === 0) {
+            // If target closed with 0 bytes before handshake completed, fail fast immediately (target dial refused or dropped)
+            if (!serverHandshakeDone && totalBytesRecv === 0) {
               if (onLog) {
-                onLog('warning', `${logTag} ⚠️ [Brook] Target ${targetStr} closed connection with 0 bytes (dial refused, dropped, or redundant pre-connect)`);
+                onLog('warning', `${logTag} ⚠️ [Brook] Target ${targetStr} closed connection before handshake (dial refused or dropped)`);
               }
               cleanup('target_dial_refused', new Error('Target connection refused (0 bytes)'));
               return;
@@ -605,7 +614,8 @@ export class BrookTunnel {
       await (cleanupPromise || cleanup('loop_exit'));
     }
 
-    const isSuccess = terminationReason === 'both_closed';
+    const isSuccess = terminationReason === 'both_closed' ||
+      (serverHandshakeDone && totalBytesRecv > 0 && (terminationReason === 'idle_timeout' || terminationReason === 'client_closed' || terminationReason === 'transport_closed'));
 
     return {
       success: isSuccess,

@@ -9,7 +9,6 @@ import { ProtocolDetector, ProtocolType } from '../protocols/protocol-detector.j
 import { Socks5Parser } from '../protocols/socks5-parser.js';
 import { HttpProxyParser } from '../protocols/http-proxy-parser.js';
 import { BrookTunnel } from '../core/brook-tunnel.js';
-import { DnsResolver } from '../core/dns-resolver.js';
 import { encodeAddress, parseHostPort } from '../core/byte-utils.js';
 
 export class ProxyDispatcher {
@@ -350,7 +349,7 @@ export class ProxyDispatcher {
             }
 
             const bytesReceived = outcome ? outcome.bytesReceived : 0;
-            if (clientDataConsumed || proxyReplied || bytesReceived > 0 || outcome.kind === 'client_abort' || outcome.kind === 'rx_overflow') {
+            if (clientDataConsumed || bytesReceived > 0 || outcome.kind === 'client_abort' || outcome.kind === 'rx_overflow') {
               break;
             }
 

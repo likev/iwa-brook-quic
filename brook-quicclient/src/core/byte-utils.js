@@ -142,18 +142,25 @@ export function parseHostPort(str, defaultPort = 80) {
 }
 
 export function encodeAddress(host, port) {
+  if (typeof port !== 'number' || isNaN(port) || port < 1 || port > 65535) {
+    throw new Error(`Invalid port number: ${port}`);
+  }
+
   const ipv4Regex = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
   const m4 = (host || '').match(ipv4Regex);
   if (m4) {
-    const out = new Uint8Array(1 + 4 + 2);
-    out[0] = 0x01;
-    out[1] = parseInt(m4[1], 10);
-    out[2] = parseInt(m4[2], 10);
-    out[3] = parseInt(m4[3], 10);
-    out[4] = parseInt(m4[4], 10);
-    out[5] = (port >>> 8) & 0xFF;
-    out[6] = port & 0xFF;
-    return out;
+    const octets = [parseInt(m4[1], 10), parseInt(m4[2], 10), parseInt(m4[3], 10), parseInt(m4[4], 10)];
+    if (octets.every(o => o >= 0 && o <= 255)) {
+      const out = new Uint8Array(1 + 4 + 2);
+      out[0] = 0x01;
+      out[1] = octets[0];
+      out[2] = octets[1];
+      out[3] = octets[2];
+      out[4] = octets[3];
+      out[5] = (port >>> 8) & 0xFF;
+      out[6] = port & 0xFF;
+      return out;
+    }
   }
 
   const v6Bytes = parseIpv6(host);
@@ -167,6 +174,9 @@ export function encodeAddress(host, port) {
   }
 
   const domainBytes = new TextEncoder().encode(host || '');
+  if (domainBytes.length === 0 || domainBytes.length > 255) {
+    throw new Error(`Invalid domain name length: ${domainBytes.length} (must be 1-255 bytes)`);
+  }
   const out = new Uint8Array(1 + 1 + domainBytes.length + 2);
   out[0] = 0x03;
   out[1] = domainBytes.length;

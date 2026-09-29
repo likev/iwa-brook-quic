@@ -39,7 +39,7 @@ export class TcpListener {
     if (this.localAddress) bindAddresses.push(this.localAddress);
     if (!bindAddresses.includes('127.0.0.1')) bindAddresses.push('127.0.0.1');
     if (!bindAddresses.includes('::1')) bindAddresses.push('::1');
-    if (!bindAddresses.includes('0.0.0.0')) bindAddresses.push('0.0.0.0');
+    if (this.localAddress === '0.0.0.0' && !bindAddresses.includes('0.0.0.0')) bindAddresses.push('0.0.0.0');
 
     let lastError = null;
 

@@ -163,7 +163,12 @@ export class WebTransportConnectionManager {
    */
   resetSession(reason = 'network_offline') {
     for (const slot of this.slots) {
-      if (slot.state === ConnectionState.CONNECTED && slot.transport) {
+      if (slot.connectAbortController) {
+        try { slot.connectAbortController.abort(); } catch (e) {}
+        slot.connectAbortController = null;
+      }
+      slot.connectPromise = null;
+      if (slot.transport) {
         try { slot.transport.close(); } catch (e) {}
         slot.transport = null;
       }
@@ -171,9 +176,7 @@ export class WebTransportConnectionManager {
         try { stream.close(); } catch (e) {}
       }
       slot.activeStreams.clear();
-      if (slot.state !== ConnectionState.CONNECTING) {
-        slot.state = ConnectionState.DISCONNECTED;
-      }
+      slot.state = ConnectionState.DISCONNECTED;
     }
     this._updateAggregateState();
   }
@@ -190,6 +193,8 @@ export class WebTransportConnectionManager {
     if (slot.connectPromise) return slot.connectPromise;
 
     slot.state = ConnectionState.CONNECTING;
+    const abortController = new AbortController();
+    slot.connectAbortController = abortController;
 
     slot.connectPromise = (async () => {
       const WTClass = await WebTransportConnectionManager.getWebTransportClass();
@@ -206,7 +211,23 @@ export class WebTransportConnectionManager {
 
       try {
         localTransport = new WTClass(url, wtOptions);
+
+        // Strict connect timeout (default 5s)
+        const connectTimeoutMs = options.connectTimeoutMs || 5000;
+        const timeoutPromise = new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error(`WebTransport pool #${slot.id + 1} timed out after ${connectTimeoutMs}ms`)), connectTimeoutMs);
+        });
+
+        await Promise.race([localTransport.ready, timeoutPromise]);
+        if (timer) clearTimeout(timer);
+
+        if (abortController.signal.aborted) {
+          try { localTransport.close(); } catch (e) {}
+          throw new Error('Connection aborted by resetSession');
+        }
+
         slot.transport = localTransport;
+        slot.state = ConnectionState.CONNECTED;
 
         // Handle close event
         localTransport.closed
@@ -231,17 +252,6 @@ export class WebTransportConnectionManager {
             }
           });
 
-        // Strict connect timeout (default 5s)
-        const connectTimeoutMs = options.connectTimeoutMs || 5000;
-        const timeoutPromise = new Promise((_, reject) => {
-          timer = setTimeout(() => reject(new Error(`WebTransport pool #${slot.id + 1} timed out after ${connectTimeoutMs}ms`)), connectTimeoutMs);
-        });
-
-        await Promise.race([localTransport.ready, timeoutPromise]);
-        if (timer) clearTimeout(timer);
-
-        slot.transport = localTransport;
-        slot.state = ConnectionState.CONNECTED;
         this._log('success', `✅ WebTransport pool session #${slot.id + 1}/${this.poolSize} established`);
         this._updateAggregateState();
         return slot;
@@ -258,6 +268,7 @@ export class WebTransportConnectionManager {
         throw err;
       } finally {
         slot.connectPromise = null;
+        slot.connectAbortController = null;
       }
     })();
 
@@ -350,7 +361,8 @@ export class WebTransportConnectionManager {
         timeoutPromise
       ]);
     } catch (err) {
-      if (chosenSlot.transport) {
+      const isFatal = err && (err.name === 'WebTransportError' || /closed|network|abort/i.test(err.message));
+      if (isFatal && chosenSlot.transport) {
         chosenSlot.state = ConnectionState.DISCONNECTED;
         try { chosenSlot.transport.close(); } catch (e) {}
         chosenSlot.transport = null;
@@ -387,7 +399,7 @@ export class WebTransportConnectionManager {
       const timer = setTimeout(() => controller.abort(), 2000);
       try {
         const start = Date.now();
-        const resp = await fetch(url, { cache: 'no-store', signal: controller.signal });
+        const resp = await fetch(url, { mode: 'cors', cache: 'no-store', signal: controller.signal });
         clearTimeout(timer);
         const rtt = Date.now() - start;
         const result = await parseFn(resp, rtt, start);

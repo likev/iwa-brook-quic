@@ -7,7 +7,6 @@ import { TcpListener } from '../server/tcp-listener.js';
 import { ProtocolDetector, ProtocolType } from '../protocols/protocol-detector.js';
 import { Socks5Parser } from '../protocols/socks5-parser.js';
 import { HttpProxyParser } from '../protocols/http-proxy-parser.js';
-import { DnsResolver } from '../core/dns-resolver.js';
 import { encodeAddress, parseHostPort } from '../core/byte-utils.js';
 
 const listeners = new Map(); // name -> TcpListener
@@ -132,6 +131,11 @@ async function handleClientConnection(socket, listenerType, onDone) {
 
   const cleanupSession = () => {
     activeSessions.delete(sessionId);
+    try { if (reader) reader.cancel().catch(() => {}); } catch (e) {}
+    try { if (reader) reader.releaseLock(); } catch (e) {}
+    try { if (writer) writer.close().catch(() => {}); } catch (e) {}
+    try { if (writer) writer.releaseLock(); } catch (e) {}
+    try { if (socket && socket.close) socket.close(); } catch (e) {}
     postStats();
     if (onDone) onDone();
   };
@@ -148,8 +152,6 @@ async function handleClientConnection(socket, listenerType, onDone) {
     // 1. Initial Protocol Detection & Parsing
     const { value: initialChunk, done: initialDone } = await reader.read();
     if (initialDone || !initialChunk || initialChunk.length === 0) {
-      reader.releaseLock();
-      writer.releaseLock();
       cleanupSession();
       return;
     }
@@ -166,6 +168,7 @@ async function handleClientConnection(socket, listenerType, onDone) {
       const s5Result = await Socks5Parser.handleHandshake(initialChunk, reader, writer, 8000);
       targetStr = s5Result.targetStr;
       dstBytes = s5Result.dstBytes;
+      leftover = s5Result.leftover || new Uint8Array(0);
       sendSuccess = s5Result.sendSuccess;
       sendFailure = s5Result.sendFailure;
     } else {

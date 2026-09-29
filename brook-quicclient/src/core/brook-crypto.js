@@ -53,16 +53,23 @@ const baseKeyPending = new Map(); // cacheKey -> Promise<CryptoKey>
 const MAX_BASE_KEY_CACHE = 8;
 
 function cacheKeyFor(password, withoutBrook) {
-  if (typeof password === 'string') return `s:${password}:${withoutBrook}`;
-  if (password instanceof Uint8Array) {
-    // Passwords are small (<128B); hex prefix + length is cheap and collision-safe
-    // for the cache key (cryptographic safety comes from the key itself, not the key string).
-    let hex = '';
-    const n = Math.min(password.length, 64);
-    for (let i = 0; i < n; i++) hex += password[i].toString(16).padStart(2, '0');
-    return `b:${password.length}:${hex}:${withoutBrook}`;
+  if (typeof password === 'string') {
+    let hash = 0;
+    for (let i = 0; i < password.length; i++) {
+      hash = ((hash << 5) - hash) + password.charCodeAt(i);
+      hash |= 0;
+    }
+    return `s:${password.length}:${hash}:${withoutBrook}`;
   }
-  return `o:${String(password)}:${withoutBrook}`;
+  if (password instanceof Uint8Array) {
+    let hash = 0;
+    for (let i = 0; i < password.length; i++) {
+      hash = ((hash << 5) - hash) + password[i];
+      hash |= 0;
+    }
+    return `b:${password.length}:${hash}:${withoutBrook}`;
+  }
+  return `o:${String(password).length}:${withoutBrook}`;
 }
 
 async function getBaseKey(password, withoutBrook) {
@@ -124,7 +131,7 @@ export async function deriveKey(password, nonce12, info = 'brook', withoutBrook 
     },
     baseKey,
     { name: 'AES-GCM', length: 256 },
-    true,
+    false,
     ['encrypt', 'decrypt']
   );
 }

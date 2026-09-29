@@ -27,8 +27,11 @@ export class LogStream {
       meta
     };
 
-    // 1. Record in complete historical log from app start
+    // 1. Record in bounded historical log (max 5000 entries to prevent memory leak / OOM)
     this.allHistoricalLogs.push(logItem);
+    if (this.allHistoricalLogs.length > 5000) {
+      this.allHistoricalLogs.shift();
+    }
 
     // 2. Keep bounded display log buffer for DOM rendering performance
     this.displayLogs.push(logItem);

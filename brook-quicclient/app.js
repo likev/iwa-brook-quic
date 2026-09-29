@@ -38,7 +38,7 @@ async function bootstrap() {
     modalContainer
   });
 
-  logStream.add('info', `🚀 Brook WebTransport Client IWA v2.0.0 initialized (Engine: Native WebTransport / HTTP/3 QUIC)`);
+  logStream.add('info', `🚀 Brook WebTransport Client IWA v1.38.0 initialized (Engine: Native WebTransport / HTTP/3 QUIC)`);
 
   // Initialize Session Tracker & Telemetry
   sessionTracker = new SessionTracker({
@@ -68,13 +68,7 @@ async function bootstrap() {
           timeoutMs: 3000,
           onStatusChange: async (isOnline) => {
             if (!isOnline) {
-              logStream.add('warning', '⚠️ Network offline (all 3 probe endpoints failed). Dropping proxy connections & resetting WebTransport pool...');
-              if (fallbackDispatcher) {
-                fallbackDispatcher.dropAllConnections('network_offline');
-              }
-              if (fallbackWtManager) {
-                fallbackWtManager.resetSession('network_offline');
-              }
+              logStream.add('warning', '⚠️ Network offline detected by probe endpoints. Waiting for network recovery...');
               if (uiController) {
                 uiController.updateConnectionState('reconnecting', 'Offline (Probes Failed)');
               }
