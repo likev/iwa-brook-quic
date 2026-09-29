@@ -31,14 +31,10 @@ func HandleRawQUICConn(conn quic.Connection, password []byte, withoutBrook bool,
 
 	// If a first stream was already accepted during protocol detection, process it immediately
 	if firstStream != nil {
-		if streamSem != nil {
-			select {
-			case streamSem <- struct{}{}:
-			default:
-				firstStream.CancelRead(0)
-				_ = firstStream.Close()
-				return
-			}
+		if !takeStreamSlot(streamSem, remoteAddr, "raw-quic-first") {
+			firstStream.CancelRead(0x100)
+			_ = firstStream.Close()
+			return
 		}
 
 		sConn := &RawQUICStreamConn{
@@ -66,14 +62,10 @@ func HandleRawQUICConn(conn quic.Connection, password []byte, withoutBrook bool,
 			return
 		}
 
-		if streamSem != nil {
-			select {
-			case streamSem <- struct{}{}:
-			default:
-				st.CancelRead(0)
-				_ = st.Close()
-				continue
-			}
+		if !takeStreamSlot(streamSem, remoteAddr, "raw-quic") {
+			st.CancelRead(0x100)
+			_ = st.Close()
+			continue
 		}
 
 		sConn := &RawQUICStreamConn{

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"sync"
 	"time"
@@ -56,9 +57,8 @@ func newBufferedStreamConn(conn StreamConn, initial []byte) *bufferedStreamConn 
 func HandleBrookStream(client StreamConn, password []byte, defaultWithoutBrook bool, tcpTimeout, udpTimeout int) error {
 	defer client.Close()
 
-	if tcpTimeout != 0 {
-		_ = client.SetDeadline(time.Now().Add(time.Duration(tcpTimeout) * time.Second))
-	}
+	// Dedicated 10s deadline for initial handshake phase to prevent hung unauthenticated streams
+	_ = client.SetDeadline(time.Now().Add(10 * time.Second))
 
 	var rawPass []byte = password
 	var passHash []byte
@@ -78,14 +78,15 @@ func HandleBrookStream(client StreamConn, password []byte, defaultWithoutBrook b
 	if bytes.Equal(first12, passHash[:12]) {
 		// Read remaining 22 bytes (20B of password hash + 2B payload length)
 		rem22 := make([]byte, 22)
-		if _, err := io.ReadFull(client, rem22); err == nil && bytes.Equal(rem22[:20], passHash[12:32]) {
+		n, err := io.ReadFull(client, rem22)
+		if err == nil && bytes.Equal(rem22[:20], passHash[12:32]) {
 			// Verified simple unencrypted Brook protocol
 			header34 := append(first12, rem22...)
 			bConn := newBufferedStreamConn(client, header34)
 			return handleSimpleBrookStream(bConn, passHash, tcpTimeout, udpTimeout)
 		} else {
 			// If remainder did not match, rewind stream and proceed as encrypted
-			rewind := append(first12, rem22...)
+			rewind := append(first12, rem22[:n]...)
 			bConn := newBufferedStreamConn(client, rewind)
 			return handleEncryptedBrookStream(bConn, nil, rawPass, passHash, defaultWithoutBrook, tcpTimeout, udpTimeout)
 		}
@@ -96,9 +97,8 @@ func HandleBrookStream(client StreamConn, password []byte, defaultWithoutBrook b
 }
 
 func handleEncryptedBrookStream(client StreamConn, cn []byte, rawPass, passHash []byte, defaultWithoutBrook bool, tcpTimeout, udpTimeout int) error {
-	if tcpTimeout != 0 {
-		_ = client.SetDeadline(time.Now().Add(time.Duration(tcpTimeout) * time.Second))
-	}
+	// Handshake deadline (10s)
+	_ = client.SetDeadline(time.Now().Add(10 * time.Second))
 
 	// 1. If cn was not pre-read, read it now
 	if len(cn) != 12 {
@@ -247,9 +247,11 @@ func handleEncryptedBrookStream(client StreamConn, cn []byte, rawPass, passHash 
 		}
 	}
 
+	teardownCh := make(chan struct{})
 	doneOnce := sync.Once{}
 	unblockOther := func() {
 		doneOnce.Do(func() {
+			close(teardownCh)
 			// Propagate close / unblock peer leg with a 5-second deadline
 			_ = remote.SetDeadline(time.Now().Add(5 * time.Second))
 			_ = client.SetDeadline(time.Now().Add(5 * time.Second))
@@ -286,9 +288,7 @@ func handleEncryptedBrookStream(client StreamConn, cn []byte, rawPass, passHash 
 		var lenPlain [2]byte
 
 		for {
-			if timeout != 0 {
-				_ = remote.SetReadDeadline(time.Now().Add(time.Duration(timeout) * time.Second))
-			}
+			_ = remote.SetReadDeadline(time.Now().Add(time.Duration(effectiveTimeout) * time.Second))
 			n, err := remote.Read(rawBuf)
 			if n > 0 {
 				batchLen := 0
@@ -312,9 +312,7 @@ func handleEncryptedBrookStream(client StreamConn, cn []byte, rawPass, passHash 
 					offset += chunk
 				}
 
-				if timeout != 0 {
-					_ = client.SetWriteDeadline(time.Now().Add(time.Duration(timeout) * time.Second))
-				}
+				_ = client.SetWriteDeadline(time.Now().Add(time.Duration(effectiveTimeout) * time.Second))
 				if _, werr := client.Write(batchBuf[:batchLen]); werr != nil {
 					recordErr(fmt.Errorf("client stream write failed: %w", werr))
 					return
@@ -349,9 +347,7 @@ func handleEncryptedBrookStream(client StreamConn, cn []byte, rawPass, passHash 
 		plainDataBuf := (*plainDataBufPtr)[:0]
 
 		for {
-			if timeout != 0 {
-				_ = client.SetReadDeadline(time.Now().Add(time.Duration(timeout) * time.Second))
-			}
+			_ = client.SetReadDeadline(time.Now().Add(time.Duration(effectiveTimeout) * time.Second))
 			if _, err := io.ReadFull(client, lenChunk); err != nil {
 				if !errors.Is(err, io.EOF) {
 					recordErr(fmt.Errorf("read client frame length failed: %w", err))
@@ -391,9 +387,7 @@ func handleEncryptedBrookStream(client StreamConn, cn []byte, rawPass, passHash 
 			}
 			NextNonce(cn)
 
-			if timeout != 0 {
-				_ = remote.SetWriteDeadline(time.Now().Add(time.Duration(timeout) * time.Second))
-			}
+			_ = remote.SetWriteDeadline(time.Now().Add(time.Duration(effectiveTimeout) * time.Second))
 			if _, err := remote.Write(plainData); err != nil {
 				recordErr(fmt.Errorf("remote write failed: %w", err))
 				return
@@ -409,21 +403,36 @@ func handleEncryptedBrookStream(client StreamConn, cn []byte, rawPass, passHash 
 
 	select {
 	case <-waitCh:
-	case <-time.After(10 * time.Second):
-		_ = remote.Close()
-		_ = client.Close()
-		<-waitCh
-		if relayErr == nil {
-			relayErr = errors.New("relay teardown timed out after 10s")
+	case <-teardownCh:
+		// First leg exited; allow up to 10s grace for peer leg to unblock and finish
+		select {
+		case <-waitCh:
+		case <-time.After(10 * time.Second):
+			_ = remote.Close()
+			_ = client.Close()
+			select {
+			case <-waitCh:
+			case <-time.After(5 * time.Second):
+				// Never block HandleBrookStream forever: abandon the relay
+				// (releasing its stream-semaphore slot) instead of leaking
+				// the goroutines + slot when a peer ignores Close.
+				log.Printf("[relay] teardown stuck, abandoning encrypted stream (client=%s remote=%s)", client.RemoteAddr(), remote.RemoteAddr())
+				if relayErr == nil {
+					relayErr = errors.New("relay teardown timed out after 10s (peer unresponsive to close)")
+				}
+				return relayErr
+			}
+			if relayErr == nil {
+				relayErr = errors.New("relay teardown timed out after 10s")
+			}
 		}
 	}
 	return relayErr
 }
 
 func handleSimpleBrookStream(client StreamConn, password []byte, tcpTimeout, udpTimeout int) error {
-	if tcpTimeout != 0 {
-		_ = client.SetDeadline(time.Now().Add(time.Duration(tcpTimeout) * time.Second))
-	}
+	// Handshake deadline (10s)
+	_ = client.SetDeadline(time.Now().Add(10 * time.Second))
 
 	headerBuf := make([]byte, 32+2)
 	if _, err := io.ReadFull(client, headerBuf); err != nil {
@@ -496,9 +505,11 @@ func handleSimpleBrookStream(client StreamConn, password []byte, tcpTimeout, udp
 		}
 	}
 
+	teardownCh := make(chan struct{})
 	doneOnce := sync.Once{}
 	unblockOther := func() {
 		doneOnce.Do(func() {
+			close(teardownCh)
 			_ = remote.SetDeadline(time.Now().Add(5 * time.Second))
 			_ = client.SetDeadline(time.Now().Add(5 * time.Second))
 		})
@@ -570,12 +581,27 @@ func handleSimpleBrookStream(client StreamConn, password []byte, tcpTimeout, udp
 
 	select {
 	case <-waitCh:
-	case <-time.After(10 * time.Second):
-		_ = remote.Close()
-		_ = client.Close()
-		<-waitCh
-		if relayErr == nil {
-			relayErr = errors.New("raw relay teardown timed out after 10s")
+	case <-teardownCh:
+		// First leg exited; allow up to 10s grace for peer leg to unblock and finish
+		select {
+		case <-waitCh:
+		case <-time.After(10 * time.Second):
+			_ = remote.Close()
+			_ = client.Close()
+			select {
+			case <-waitCh:
+			case <-time.After(5 * time.Second):
+				// Never block forever: abandon the relay (releasing its
+				// stream-semaphore slot) instead of leaking goroutines.
+				log.Printf("[relay] teardown stuck, abandoning simple stream (client=%s remote=%s)", client.RemoteAddr(), remote.RemoteAddr())
+				if relayErr == nil {
+					relayErr = errors.New("raw relay teardown timed out after 10s (peer unresponsive to close)")
+				}
+				return relayErr
+			}
+			if relayErr == nil {
+				relayErr = errors.New("raw relay teardown timed out after 10s")
+			}
 		}
 	}
 	return relayErr

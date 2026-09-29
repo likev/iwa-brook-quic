@@ -48,7 +48,6 @@ func (h *WebTransportHandler) HandleUpgrade(w http.ResponseWriter, r *http.Reque
 	session, err := h.server.Upgrade(w, r)
 	if err != nil {
 		log.Printf("[WebTransport] Upgrade failed from %s: %v", r.RemoteAddr, err)
-		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
@@ -64,14 +63,10 @@ func (h *WebTransportHandler) HandleUpgrade(w http.ResponseWriter, r *http.Reque
 				return
 			}
 
-			if h.streamSem != nil {
-				select {
-				case h.streamSem <- struct{}{}:
-				default:
-					str.CancelRead(0)
-					_ = str.Close()
-					continue
-				}
+			if !takeStreamSlot(h.streamSem, remoteAddr, "webtransport") {
+				str.CancelRead(0x100)
+				_ = str.Close()
+				continue
 			}
 
 			conn := &WTStreamConn{

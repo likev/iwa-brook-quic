@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/binary"
@@ -1314,7 +1315,7 @@ func TestBidiOpenNoDataTimeout(t *testing.T) {
 	}
 	defer stream.Close()
 
-	// Wait for server to timeout on bidi read (3s deadline) and close stream/conn
+	// Wait for server to timeout on probe (10s deadline) and close stream/conn
 	readBuf := make([]byte, 10)
 	done := make(chan struct{})
 	go func() {
@@ -1324,9 +1325,9 @@ func TestBidiOpenNoDataTimeout(t *testing.T) {
 
 	select {
 	case <-done:
-		t.Log("✅ dispatchConnection exited and closed stream on bidi read timeout within 5s")
-	case <-time.After(5 * time.Second):
-		t.Fatal("❌ dispatchConnection hung: did not exit within 5s on bidi-first with no data")
+		t.Log("✅ dispatchConnection exited and closed stream on probe timeout within 15s")
+	case <-time.After(15 * time.Second):
+		t.Fatal("❌ dispatchConnection hung: did not exit within 15s on bidi-first with no data")
 	}
 }
 
@@ -1733,4 +1734,221 @@ func BenchmarkRawQUICSimpleBrookProtocol(b *testing.B) {
 			}
 		}
 	}
+}
+
+func TestNextNonceAndDeriveKeyInterop(t *testing.T) {
+	// Test NextNonce progression
+	nonce := []byte{0xFE, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xAA, 0xBB, 0xCC, 0xDD}
+	NextNonce(nonce)
+	if nonce[0] != 0xFF {
+		t.Fatalf("expected 0xFF, got 0x%02X", nonce[0])
+	}
+	NextNonce(nonce)
+	if nonce[0] != 0x00 || nonce[1] != 0x01 {
+		t.Fatalf("expected carry to [0x00, 0x01], got [0x%02X, 0x%02X]", nonce[0], nonce[1])
+	}
+	// Verify last 4 bytes are untouched
+	if nonce[8] != 0xAA || nonce[9] != 0xBB || nonce[10] != 0xCC || nonce[11] != 0xDD {
+		t.Fatalf("trailing 4 bytes were modified: %v", nonce[8:])
+	}
+
+	// Test DeriveKey determinism
+	password := []byte("secret_password_123")
+	salt := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
+	key1, err := DeriveKey(password, salt, []byte("brook"))
+	if err != nil {
+		t.Fatalf("DeriveKey failed: %v", err)
+	}
+	key2, err := DeriveKey(password, salt, []byte("brook"))
+	if err != nil {
+		t.Fatalf("DeriveKey 2 failed: %v", err)
+	}
+	if len(key1) != 32 || !bytes.Equal(key1, key2) {
+		t.Fatalf("DeriveKey keys differ or invalid length: %d", len(key1))
+	}
+}
+
+func TestParseAddressValidation(t *testing.T) {
+	// Valid addresses
+	if atyp, addr, port, err := ParseAddress("1.2.3.4:8080"); err != nil || atyp != AtypIPv4 || len(addr) != 4 || binary.BigEndian.Uint16(port) != 8080 {
+		t.Fatalf("valid IPv4 failed: %v", err)
+	}
+	if atyp, addr, port, err := ParseAddress("google.com:443"); err != nil || atyp != AtypDomain || string(addr) != "google.com" || binary.BigEndian.Uint16(port) != 443 {
+		t.Fatalf("valid domain failed: %v", err)
+	}
+
+	// Invalid ports
+	if _, _, _, err := ParseAddress("1.2.3.4:70000"); err == nil {
+		t.Fatal("expected error on port 70000, got nil")
+	}
+	if _, _, _, err := ParseAddress("1.2.3.4:0"); err == nil {
+		t.Fatal("expected error on port 0, got nil")
+	}
+	if _, _, _, err := ParseAddress("1.2.3.4:-1"); err == nil {
+		t.Fatal("expected error on port -1, got nil")
+	}
+
+	// Invalid domain lengths
+	longDomain := make([]byte, 256)
+	for i := range longDomain {
+		longDomain[i] = 'a'
+	}
+	if _, _, _, err := ParseAddress(string(longDomain) + ":80"); err == nil {
+		t.Fatal("expected error on domain > 255 bytes, got nil")
+	}
+}
+
+func TestTunnelLongLivedOver10Seconds(t *testing.T) {
+	echoAddr, cleanupEcho := startEchoServer(t)
+	defer cleanupEcho()
+
+	password := "longlivedpass123"
+	// tcpTimeout=0 (fallback to effectiveTimeout=300s)
+	server, err := NewServer("127.0.0.1:0", password, "", 0, 10, false)
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+	defer server.Close()
+
+	go func() {
+		_ = server.ListenAndServe()
+	}()
+
+	select {
+	case <-server.Ready():
+	case <-time.After(5 * time.Second):
+		t.Fatal("server start timed out")
+	}
+	serverAddr := server.LocalAddr().String()
+
+	tlsConf := &tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"brook-quic"},
+	}
+
+	conn, err := quic.DialAddr(context.Background(), serverAddr, tlsConf, &quic.Config{EnableDatagrams: true})
+	if err != nil {
+		t.Fatalf("QUIC dial failed: %v", err)
+	}
+	defer conn.CloseWithError(0, "")
+
+	stream, err := conn.OpenStreamSync(context.Background())
+	if err != nil {
+		t.Fatalf("OpenStreamSync failed: %v", err)
+	}
+	defer stream.Close()
+
+	// Perform Brook handshake to echoAddr
+	rawPass := []byte(password)
+	cn := make([]byte, 12)
+	cn[0] = 0x55
+	cnCopy := make([]byte, 12)
+	copy(cnCopy, cn)
+
+	key, _ := DeriveKey(rawPass, cnCopy, []byte("brook"))
+	ca, _ := NewGCMCipher(key)
+
+	now := time.Now().Unix()
+	if now%2 != 0 {
+		now++
+	}
+	var tsBuf [4]byte
+	binary.BigEndian.PutUint32(tsBuf[:], uint32(now))
+
+	atyp, addrB, portB, _ := ParseAddress(echoAddr)
+	dst := append([]byte{atyp}, addrB...)
+	dst = append(dst, portB...)
+	headerBody := append(tsBuf[:], dst...)
+
+	var lenPlain [2]byte
+	binary.BigEndian.PutUint16(lenPlain[:], uint16(len(headerBody)))
+	sealedLen := ca.Seal(nil, cnCopy, lenPlain[:], nil)
+	NextNonce(cnCopy)
+	sealedHeader := ca.Seal(nil, cnCopy, headerBody, nil)
+	NextNonce(cnCopy)
+
+	_, _ = stream.Write(cn)
+	_, _ = stream.Write(sealedLen)
+	_, _ = stream.Write(sealedHeader)
+
+	// Read server nonce sn
+	sn := make([]byte, 12)
+	if _, err := io.ReadFull(stream, sn); err != nil {
+		t.Fatalf("failed to read sn: %v", err)
+	}
+	snCopy := make([]byte, 12)
+	copy(snCopy, sn)
+	sKey, _ := DeriveKey(rawPass, snCopy, []byte("brook"))
+	sa, _ := NewGCMCipher(sKey)
+
+	// Send initial test payload
+	testMsg1 := []byte("hello-chunk-1")
+	binary.BigEndian.PutUint16(lenPlain[:], uint16(len(testMsg1)))
+	_, _ = stream.Write(ca.Seal(nil, cnCopy, lenPlain[:], nil))
+	NextNonce(cnCopy)
+	_, _ = stream.Write(ca.Seal(nil, cnCopy, testMsg1, nil))
+	NextNonce(cnCopy)
+
+	// Read reply
+	lenChunk := make([]byte, 18)
+	if _, err := io.ReadFull(stream, lenChunk); err != nil {
+		t.Fatalf("failed to read reply len: %v", err)
+	}
+	pLen, err := sa.Open(nil, snCopy, lenChunk, nil)
+	if err != nil {
+		t.Fatalf("decrypt reply len failed: %v", err)
+	}
+	NextNonce(snCopy)
+	l := int(binary.BigEndian.Uint16(pLen))
+	payloadChunk := make([]byte, l+16)
+	if _, err := io.ReadFull(stream, payloadChunk); err != nil {
+		t.Fatalf("failed to read reply payload: %v", err)
+	}
+	pData, err := sa.Open(nil, snCopy, payloadChunk, nil)
+	if err != nil {
+		t.Fatalf("decrypt reply payload failed: %v", err)
+	}
+	NextNonce(snCopy)
+	if !bytes.Equal(pData, testMsg1) {
+		t.Fatalf("mismatch chunk 1: got %s, want %s", string(pData), string(testMsg1))
+	}
+
+	t.Log("✅ Initial data exchanged. Now sleeping for 11 seconds to verify 10s guillotine does NOT fire...")
+	time.Sleep(11 * time.Second)
+
+	// Send second test payload after 11 seconds
+	testMsg2 := []byte("hello-chunk-2-after-11s")
+	binary.BigEndian.PutUint16(lenPlain[:], uint16(len(testMsg2)))
+	if _, err := stream.Write(ca.Seal(nil, cnCopy, lenPlain[:], nil)); err != nil {
+		t.Fatalf("failed to write after 11s (connection was killed by 10s timer!): %v", err)
+	}
+	NextNonce(cnCopy)
+	if _, err := stream.Write(ca.Seal(nil, cnCopy, testMsg2, nil)); err != nil {
+		t.Fatalf("failed to write payload after 11s: %v", err)
+	}
+	NextNonce(cnCopy)
+
+	// Read reply 2
+	if _, err := io.ReadFull(stream, lenChunk); err != nil {
+		t.Fatalf("failed to read reply len after 11s (connection was killed by 10s timer!): %v", err)
+	}
+	pLen2, err := sa.Open(nil, snCopy, lenChunk, nil)
+	if err != nil {
+		t.Fatalf("decrypt reply len 2 failed: %v", err)
+	}
+	NextNonce(snCopy)
+	l2 := int(binary.BigEndian.Uint16(pLen2))
+	payloadChunk2 := make([]byte, l2+16)
+	if _, err := io.ReadFull(stream, payloadChunk2); err != nil {
+		t.Fatalf("failed to read reply payload 2: %v", err)
+	}
+	pData2, err := sa.Open(nil, snCopy, payloadChunk2, nil)
+	if err != nil {
+		t.Fatalf("decrypt reply payload 2 failed: %v", err)
+	}
+	NextNonce(snCopy)
+	if !bytes.Equal(pData2, testMsg2) {
+		t.Fatalf("mismatch chunk 2: got %s, want %s", string(pData2), string(testMsg2))
+	}
+	t.Log("✅ Successfully exchanged data after 11s! C0 10s guillotine is completely fixed.")
 }

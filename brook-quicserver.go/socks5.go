@@ -67,7 +67,13 @@ func ParseBrookDestination(dst []byte) (string, error) {
 		// If domain is length-prefixed:
 		domainLen := int(addrBytes[0])
 		if len(addrBytes) == domainLen+1 {
+			if domainLen == 0 || domainLen > 255 {
+				return "", fmt.Errorf("invalid domain name length: %d", domainLen)
+			}
 			return ToAddress(atyp, addrBytes[1:], portBytes), nil
+		}
+		if len(addrBytes) > 255 {
+			return "", fmt.Errorf("domain name too long: %d", len(addrBytes))
 		}
 		return ToAddress(atyp, addrBytes, portBytes), nil
 	case AtypIPv6:
@@ -87,8 +93,8 @@ func ParseAddress(address string) (byte, []byte, []byte, error) {
 		return 0, nil, nil, err
 	}
 	portNum, err := strconv.Atoi(portStr)
-	if err != nil {
-		return 0, nil, nil, err
+	if err != nil || portNum < 1 || portNum > 65535 {
+		return 0, nil, nil, fmt.Errorf("invalid port: %s", portStr)
 	}
 	portBytes := make([]byte, 2)
 	binary.BigEndian.PutUint16(portBytes, uint16(portNum))
@@ -97,6 +103,9 @@ func ParseAddress(address string) (byte, []byte, []byte, error) {
 	if ip == nil {
 		// Domain name
 		b := []byte(host)
+		if len(b) == 0 || len(b) > 255 {
+			return 0, nil, nil, fmt.Errorf("invalid domain name length: %d", len(b))
+		}
 		return AtypDomain, b, portBytes, nil
 	}
 	if ip4 := ip.To4(); ip4 != nil {

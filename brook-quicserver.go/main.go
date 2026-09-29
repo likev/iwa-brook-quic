@@ -11,6 +11,8 @@ import (
 )
 
 func main() {
+	RaiseLimits()
+
 	// Flags
 	flagAddr := flag.String("l", "", "Listen address (e.g. :4433 or 0.0.0.0:4433)")
 	flagPassword := flag.String("p", "", "Brook secret password")
@@ -20,6 +22,11 @@ func main() {
 	flagTCPTimeout := flag.Int("tcp-timeout", 300, "TCP connection idle timeout in seconds (default 300s)")
 	flagUDPTimeout := flag.Int("udp-timeout", 60, "UDP connection timeout in seconds")
 	flag.Parse()
+
+	flagsProvided := make(map[string]bool)
+	flag.Visit(func(f *flag.Flag) {
+		flagsProvided[f.Name] = true
+	})
 
 	// Environment variable fallback (matches fly.io and likev/brook-quic environment vars)
 	addr := *flagAddr
@@ -44,7 +51,7 @@ func main() {
 		} else if p := os.Getenv("BROOK_PASSWORD"); p != "" {
 			password = p
 		} else {
-			password = "271828brook"
+			log.Fatalf("❌ Brook password must be specified via -p flag or PASSWORD/BROOK_PASSWORD/SECRET_WS environment variable")
 		}
 	}
 
@@ -54,30 +61,34 @@ func main() {
 	}
 
 	withoutBrook := true
-	if flagWithoutBrookProtocol != nil && !*flagWithoutBrookProtocol {
-		withoutBrook = false
-	}
-	if flagWithoutBrook != nil && !*flagWithoutBrook {
-		withoutBrook = false
-	}
-	if wb := os.Getenv("WITHOUT_BROOK_PROTOCOL"); wb == "false" || wb == "0" {
-		withoutBrook = false
-	} else if wb := os.Getenv("WITHOUT_BROOK"); wb == "false" || wb == "0" {
-		withoutBrook = false
+	if flagsProvided["withoutBrookProtocol"] {
+		withoutBrook = *flagWithoutBrookProtocol
+	} else if flagsProvided["withoutbrook"] {
+		withoutBrook = *flagWithoutBrook
+	} else if wb := os.Getenv("WITHOUT_BROOK_PROTOCOL"); wb != "" {
+		withoutBrook = !(wb == "false" || wb == "0")
+	} else if wb := os.Getenv("WITHOUT_BROOK"); wb != "" {
+		withoutBrook = !(wb == "false" || wb == "0")
 	}
 
 	tcpTimeout := *flagTCPTimeout
-	if tcpTimeout == 0 && os.Getenv("TCP_TIMEOUT") != "" {
+	if !flagsProvided["tcp-timeout"] && os.Getenv("TCP_TIMEOUT") != "" {
 		if t, err := strconv.Atoi(os.Getenv("TCP_TIMEOUT")); err == nil {
 			tcpTimeout = t
 		}
 	}
+	if tcpTimeout < 0 {
+		tcpTimeout = 0
+	}
 
 	udpTimeout := *flagUDPTimeout
-	if udpTimeout == 60 && os.Getenv("UDP_TIMEOUT") != "" {
+	if !flagsProvided["udp-timeout"] && os.Getenv("UDP_TIMEOUT") != "" {
 		if t, err := strconv.Atoi(os.Getenv("UDP_TIMEOUT")); err == nil {
 			udpTimeout = t
 		}
+	}
+	if udpTimeout < 0 {
+		udpTimeout = 60
 	}
 
 	log.Println("==================================================================")
@@ -100,6 +111,7 @@ func main() {
 
 	go func() {
 		<-sigChan
+		signal.Stop(sigChan)
 		log.Println("Received termination signal, shutting down server...")
 		_ = server.Close()
 		os.Exit(0)
