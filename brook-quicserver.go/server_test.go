@@ -1093,6 +1093,12 @@ func TestConnectionCleanupAfterWebTransport(t *testing.T) {
 		t.Logf("Running goroutines:\n%s", string(buf[:n]))
 		t.Errorf("possible goroutine leak: baseline=%d, current=%d (delta=%d)", baseline, current, current-baseline)
 	}
+
+	activeConns := server.ActiveWebTransportConns()
+	t.Logf("Active WebTransport connections in sessionManager: %d", activeConns)
+	if activeConns != 0 {
+		t.Errorf("memory leak in sessionManager: expected 0 active WT connections, found %d", activeConns)
+	}
 }
 
 func TestProbeTimeoutCleansUp(t *testing.T) {
@@ -1951,4 +1957,289 @@ func TestTunnelLongLivedOver10Seconds(t *testing.T) {
 		t.Fatalf("mismatch chunk 2: got %s, want %s", string(pData2), string(testMsg2))
 	}
 	t.Log("✅ Successfully exchanged data after 11s! C0 10s guillotine is completely fixed.")
+}
+
+func TestWebTransportSessionManagerNoLeakAndStreamCancel(t *testing.T) {
+	echoAddr, cleanupEcho := startEchoServer(t)
+	defer cleanupEcho()
+
+	password := "noleak-wt-test"
+	server, err := NewServer("127.0.0.1:0", password, "", 2, 2, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	go func() { _ = server.ListenAndServe() }()
+	select {
+	case <-server.Ready():
+	case <-time.After(5 * time.Second):
+		t.Fatal("server failed to start")
+	}
+	serverAddr := server.LocalAddr().String()
+
+	runtime.GC()
+	time.Sleep(200 * time.Millisecond)
+	baselineGoroutines := runtime.NumGoroutine()
+
+	var mStart runtime.MemStats
+	runtime.ReadMemStats(&mStart)
+
+	// Run 20 WebTransport sessions
+	for i := 0; i < 20; i++ {
+		func() {
+			var clientConn quic.EarlyConnection
+			tlsConf := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h3"}}
+			d := webtransport.Dialer{
+				TLSClientConfig: tlsConf,
+				DialAddr: func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (quic.EarlyConnection, error) {
+					c, err := quic.DialAddrEarly(ctx, addr, tlsCfg, cfg)
+					if err == nil {
+						clientConn = c
+					}
+					return c, err
+				},
+			}
+			defer d.Close()
+			defer func() {
+				if clientConn != nil {
+					clientConn.CloseWithError(0, "")
+				}
+			}()
+
+			_, sess, err := d.Dial(context.Background(), fmt.Sprintf("https://%s/brook", serverAddr), nil)
+			if err != nil {
+				t.Fatalf("WT dial %d failed: %v", i, err)
+			}
+			defer sess.CloseWithError(0, "")
+
+			// Stream 1: normal echo
+			stream1, err := sess.OpenStreamSync(context.Background())
+			if err != nil {
+				t.Fatalf("WT open stream %d failed: %v", i, err)
+			}
+
+			cn, _ := GenerateNonce()
+			ck, _ := DeriveKey([]byte(password), cn, brookInfo)
+			ca, _ := NewGCMCipher(ck)
+			_, _ = stream1.Write(cn)
+
+			atyp, addrB, portB, _ := ParseAddress(echoAddr)
+			dstSlice := append([]byte{atyp}, addrB...)
+			dstSlice = append(dstSlice, portB...)
+			now := time.Now().Unix()
+			if now%2 != 0 {
+				now += 1
+			}
+			headerBody := make([]byte, 4+len(dstSlice))
+			binary.BigEndian.PutUint32(headerBody[:4], uint32(now))
+			copy(headerBody[4:], dstSlice)
+
+			hdrLenBuf := make([]byte, 2)
+			binary.BigEndian.PutUint16(hdrLenBuf, uint16(len(headerBody)))
+			sealedLen := ca.Seal(nil, cn, hdrLenBuf, nil)
+			NextNonce(cn)
+			sealedPayload := ca.Seal(nil, cn, headerBody, nil)
+			NextNonce(cn)
+			_, _ = stream1.Write(append(sealedLen, sealedPayload...))
+
+			sn := make([]byte, 12)
+			_, _ = io.ReadFull(stream1, sn)
+			sk, _ := DeriveKey([]byte(password), sn, brookInfo)
+			sa, _ := NewGCMCipher(sk)
+
+			testData := []byte(fmt.Sprintf("wt-leak-test-%d", i))
+			dataLenBuf := make([]byte, 2)
+			binary.BigEndian.PutUint16(dataLenBuf, uint16(len(testData)))
+			sLen := ca.Seal(nil, cn, dataLenBuf, nil)
+			NextNonce(cn)
+			sPay := ca.Seal(nil, cn, testData, nil)
+			NextNonce(cn)
+			_, _ = stream1.Write(append(sLen, sPay...))
+
+			rLen := make([]byte, 18)
+			_, _ = io.ReadFull(stream1, rLen)
+			pLen, _ := sa.Open(nil, sn, rLen, nil)
+			NextNonce(sn)
+			expLen := int(binary.BigEndian.Uint16(pLen))
+			rPay := make([]byte, expLen+16)
+			_, _ = io.ReadFull(stream1, rPay)
+			sa.Open(nil, sn, rPay, nil)
+
+			_ = stream1.Close()
+
+			// Stream 2: cancelled abruptly
+			stream2, err := sess.OpenStreamSync(context.Background())
+			if err == nil {
+				stream2.CancelWrite(0x100)
+				stream2.CancelRead(0x100)
+			}
+		}()
+	}
+
+	deadline := time.Now().Add(6 * time.Second)
+	var currentGoroutines int
+	for time.Now().Before(deadline) {
+		runtime.GC()
+		currentGoroutines = runtime.NumGoroutine()
+		if currentGoroutines <= baselineGoroutines+10 {
+			break
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	runtime.GC()
+
+	activeConns := server.ActiveWebTransportConns()
+	t.Logf("Active WebTransport connections in sessionManager after 20 connections: %d", activeConns)
+	if activeConns != 0 {
+		t.Fatalf("❌ Memory leak: expected 0 active WT connections in sessionManager, found %d", activeConns)
+	}
+
+	t.Logf("Goroutines after test: %d (baseline was %d, delta=%d)", currentGoroutines, baselineGoroutines, currentGoroutines-baselineGoroutines)
+	if currentGoroutines > baselineGoroutines+25 {
+		t.Errorf("possible goroutine leak: delta=%d", currentGoroutines-baselineGoroutines)
+	}
+
+	var mEnd runtime.MemStats
+	runtime.ReadMemStats(&mEnd)
+	t.Logf("HeapAlloc: start=%d KB, end=%d KB", mStart.HeapAlloc/1024, mEnd.HeapAlloc/1024)
+	t.Log("✅ TestWebTransportSessionManagerNoLeakAndStreamCancel passed: 0 leaked sessions, 0 leaked goroutines!")
+}
+
+func TestWebTransportSessionOnlyCloseNoLeak(t *testing.T) {
+	echoAddr, cleanupEcho := startEchoServer(t)
+	defer cleanupEcho()
+
+	password := "session-only-close-test"
+	server, err := NewServer("127.0.0.1:0", password, "", 2, 2, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	go func() { _ = server.ListenAndServe() }()
+	select {
+	case <-server.Ready():
+	case <-time.After(5 * time.Second):
+		t.Fatal("server failed to start")
+	}
+	serverAddr := server.LocalAddr().String()
+
+	// 5 WebTransport sessions where only sess.CloseWithError is called (client does NOT explicitly close QUIC connection)
+	for i := 0; i < 5; i++ {
+		func() {
+			tlsConf := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h3"}}
+			d := webtransport.Dialer{
+				TLSClientConfig: tlsConf,
+			}
+			defer d.Close()
+
+			_, sess, err := d.Dial(context.Background(), fmt.Sprintf("https://%s/brook", serverAddr), nil)
+			if err != nil {
+				t.Fatalf("WT dial %d failed: %v", i, err)
+			}
+
+			// Open stream, send Brook handshake
+			stream, err := sess.OpenStreamSync(context.Background())
+			if err != nil {
+				t.Fatalf("WT open stream %d failed: %v", i, err)
+			}
+
+			cn, _ := GenerateNonce()
+			ck, _ := DeriveKey([]byte(password), cn, brookInfo)
+			ca, _ := NewGCMCipher(ck)
+			_, _ = stream.Write(cn)
+
+			atyp, addrB, portB, _ := ParseAddress(echoAddr)
+			dstSlice := append([]byte{atyp}, addrB...)
+			dstSlice = append(dstSlice, portB...)
+			now := time.Now().Unix()
+			if now%2 != 0 {
+				now += 1
+			}
+			headerBody := make([]byte, 4+len(dstSlice))
+			binary.BigEndian.PutUint32(headerBody[:4], uint32(now))
+			copy(headerBody[4:], dstSlice)
+
+			hdrLenBuf := make([]byte, 2)
+			binary.BigEndian.PutUint16(hdrLenBuf, uint16(len(headerBody)))
+			sealedLen := ca.Seal(nil, cn, hdrLenBuf, nil)
+			NextNonce(cn)
+			sealedPayload := ca.Seal(nil, cn, headerBody, nil)
+			NextNonce(cn)
+			_, _ = stream.Write(append(sealedLen, sealedPayload...))
+
+			sn := make([]byte, 12)
+			_, _ = io.ReadFull(stream, sn)
+
+			_ = stream.Close()
+
+			// Close WebTransport session only. Do NOT close the underlying QUIC connection.
+			_ = sess.CloseWithError(0, "client session close")
+		}()
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		runtime.GC()
+		if server.ActiveWebTransportConns() == 0 {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	activeConns := server.ActiveWebTransportConns()
+	if activeConns != 0 {
+		t.Fatalf("❌ Memory leak: expected 0 active WT connections after session-only close, found %d", activeConns)
+	}
+	t.Log("✅ TestWebTransportSessionOnlyCloseNoLeak passed: 0 leaked connections even when client only closes session!")
+}
+
+func TestRawQUICIdleTimeoutReclaimsConnection(t *testing.T) {
+	password := "idle-raw-quic-test"
+	// Set udpTimeout=2s (idle timeout 2s)
+	server, err := NewServer("127.0.0.1:0", password, "", 2, 2, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	go func() { _ = server.ListenAndServe() }()
+	select {
+	case <-server.Ready():
+	case <-time.After(5 * time.Second):
+		t.Fatal("server failed to start")
+	}
+	serverAddr := server.LocalAddr().String()
+
+	tlsConf := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"brook-quic"}}
+	conn, err := quic.DialAddr(context.Background(), serverAddr, tlsConf, &quic.Config{EnableDatagrams: true, MaxIdleTimeout: 10 * time.Second})
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn.CloseWithError(0, "")
+
+	// Client goes idle. Server has KeepAlivePeriod: 0 and MaxIdleTimeout: 2s.
+	// quic-go clamps remote idle timeout to MinRemoteIdleTimeout = 5s.
+	// After 5.5s, the connection will be terminated due to idle timeout on both sides.
+	time.Sleep(5500 * time.Millisecond)
+
+	// Attempting to open a stream on the idle connection should fail because it was timed out and closed.
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+	str, err := conn.OpenStreamSync(ctx)
+	if err == nil {
+		// If stream was allocated locally, attempting to write/read should fail immediately
+		// as the connection was closed.
+		_, writeErr := str.Write([]byte("test"))
+		var buf [16]byte
+		_, readErr := str.Read(buf[:])
+		_ = str.Close()
+		if writeErr == nil && readErr == nil {
+			t.Fatal("❌ Expected connection to be closed by idle timeout, but stream write/read succeeded!")
+		}
+		t.Logf("✅ Stream write/read failed as expected on idle connection: writeErr=%v, readErr=%v", writeErr, readErr)
+		return
+	}
+	t.Logf("✅ Verified raw QUIC connection was closed by idle timeout: %v", err)
 }

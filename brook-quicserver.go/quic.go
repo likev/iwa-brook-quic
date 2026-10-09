@@ -22,6 +22,14 @@ func (c *RawQUICStreamConn) RemoteAddr() net.Addr {
 	return c.remoteAddr
 }
 
+func (c *RawQUICStreamConn) CancelRead(code uint64) {
+	c.Stream.CancelRead(quic.StreamErrorCode(code))
+}
+
+func (c *RawQUICStreamConn) CancelWrite(code uint64) {
+	c.Stream.CancelWrite(quic.StreamErrorCode(code))
+}
+
 // HandleRawQUICConn handles streams from a legacy / raw Brook QUIC connection.
 func HandleRawQUICConn(conn quic.Connection, password []byte, withoutBrook bool, tcpTimeout, udpTimeout int, firstStream quic.Stream, streamSem chan struct{}) {
 	remoteAddr := conn.RemoteAddr()

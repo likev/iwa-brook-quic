@@ -17,10 +17,12 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
@@ -116,15 +118,28 @@ type interceptedConn struct {
 	mu          sync.Mutex
 	uniStreams  []quic.ReceiveStream
 	bidiStreams []quic.Stream
+	uniChan     <-chan quic.ReceiveStream
+	bidiChan    <-chan quic.Stream
 }
 
 func (c *interceptedConn) AcceptUniStream(ctx context.Context) (quic.ReceiveStream, error) {
 	c.mu.Lock()
 	if len(c.uniStreams) > 0 {
 		s := c.uniStreams[0]
+		c.uniStreams[0] = nil
 		c.uniStreams = c.uniStreams[1:]
 		c.mu.Unlock()
 		return s, nil
+	}
+	if c.uniChan != nil {
+		select {
+		case s, ok := <-c.uniChan:
+			if ok && s != nil {
+				c.mu.Unlock()
+				return s, nil
+			}
+		default:
+		}
 	}
 	c.mu.Unlock()
 	return c.EarlyConnection.AcceptUniStream(ctx)
@@ -134,12 +149,71 @@ func (c *interceptedConn) AcceptStream(ctx context.Context) (quic.Stream, error)
 	c.mu.Lock()
 	if len(c.bidiStreams) > 0 {
 		s := c.bidiStreams[0]
+		c.bidiStreams[0] = nil
 		c.bidiStreams = c.bidiStreams[1:]
 		c.mu.Unlock()
 		return s, nil
 	}
+	if c.bidiChan != nil {
+		select {
+		case s, ok := <-c.bidiChan:
+			if ok && s != nil {
+				c.mu.Unlock()
+				return s, nil
+			}
+		default:
+		}
+	}
 	c.mu.Unlock()
 	return c.EarlyConnection.AcceptStream(ctx)
+}
+
+func (c *interceptedConn) CloseWithError(code quic.ApplicationErrorCode, desc string) error {
+	c.mu.Lock()
+	for i, s := range c.uniStreams {
+		if s != nil {
+			s.CancelRead(0)
+			c.uniStreams[i] = nil
+		}
+	}
+	c.uniStreams = nil
+	for i, s := range c.bidiStreams {
+		if s != nil {
+			s.CancelRead(0x100)
+			_ = s.Close()
+			c.bidiStreams[i] = nil
+		}
+	}
+	c.bidiStreams = nil
+	if c.uniChan != nil {
+		for {
+			select {
+			case s, ok := <-c.uniChan:
+				if ok && s != nil {
+					s.CancelRead(0)
+				}
+			default:
+				goto uniDrained
+			}
+		}
+	}
+uniDrained:
+	if c.bidiChan != nil {
+		for {
+			select {
+			case s, ok := <-c.bidiChan:
+				if ok && s != nil {
+					s.CancelRead(0x100)
+					_ = s.Close()
+				}
+			default:
+				goto bidiDrained
+			}
+		}
+	}
+bidiDrained:
+	c.mu.Unlock()
+	return c.EarlyConnection.CloseWithError(code, desc)
 }
 
 // acceptBidiWithContext accepts one bidirectional stream but gives up when ctx
@@ -159,6 +233,13 @@ func acceptBidiWithContext(conn quic.EarlyConnection, ctx context.Context) (quic
 	case r := <-ch:
 		return r.s, r.e
 	case <-ctx.Done():
+		go func() {
+			r := <-ch
+			if r.s != nil {
+				r.s.CancelRead(0x100)
+				_ = r.s.Close()
+			}
+		}()
 		return nil, ctx.Err()
 	}
 }
@@ -199,8 +280,7 @@ func classifyBidiFirst(conn quic.EarlyConnection, first quic.Stream, uniChan <-c
 		n, err := io.ReadAtLeast(bstr, buf, 1)
 		_ = bstr.SetReadDeadline(time.Time{})
 		if err != nil {
-			// Close only the offending stream; healthy multiplexed streams
-			// on the same connection must not be doomed by one bad stream.
+			bstr.CancelRead(0x100)
 			_ = bstr.Close()
 			drainUni()
 			select {
@@ -257,10 +337,10 @@ type Server struct {
 	Cert         []byte
 	CertKey      []byte
 
-	readyOnce  sync.Once
-	ready      chan struct{}
-	ctx        context.Context
-	cancel     context.CancelFunc
+	readyOnce sync.Once
+	ready     chan struct{}
+	ctx       context.Context
+	cancel    context.CancelFunc
 
 	mu         sync.RWMutex
 	closed     bool
@@ -270,7 +350,7 @@ type Server struct {
 	wtServer   *webtransport.Server
 	httpServer *http.Server
 
-	streamSem  chan struct{}
+	streamSem chan struct{}
 }
 
 // NewServer creates a new unified Brook QUIC + WebTransport server.
@@ -313,15 +393,19 @@ func (s *Server) ListenAndServe() error {
 		return fmt.Errorf("setup TLS failed: %w", err)
 	}
 
-	maxIdleTimeout := time.Duration(s.UDPTimeout) * time.Second
-	if maxIdleTimeout <= 0 {
-		maxIdleTimeout = 60 * time.Second
+	effectiveTimeout := s.TCPTimeout
+	if effectiveTimeout <= 0 {
+		effectiveTimeout = 300
 	}
+	if s.UDPTimeout > effectiveTimeout {
+		effectiveTimeout = s.UDPTimeout
+	}
+	maxIdleTimeout := time.Duration(effectiveTimeout) * time.Second
 
 	quicConfig := &quic.Config{
 		EnableDatagrams:                true,
 		MaxIdleTimeout:                 maxIdleTimeout,
-		KeepAlivePeriod:                15 * time.Second,
+		KeepAlivePeriod:                0,
 		HandshakeIdleTimeout:           10 * time.Second,
 		Allow0RTT:                      true,
 		MaxIncomingStreams:             1024,
@@ -457,24 +541,17 @@ func (s *Server) dispatchConnection(conn quic.EarlyConnection) {
 		// before ServeQUICConn tries to accept streams on the same connection.
 		cancel()
 		// Client opened a unidirectional stream (HTTP/3 Control Stream). This is WebTransport!
-		// Safely drain any orphaned bidi stream from the losing probe goroutine with a 200ms grace window.
-		go func() {
-			select {
-			case orphan, ok := <-bidiChan:
-				if ok && orphan != nil {
-					_ = orphan.Close()
-				}
-			case <-time.After(200 * time.Millisecond):
-			}
-		}()
 		iconn := &interceptedConn{
 			EarlyConnection: conn,
 			uniStreams:      []quic.ReceiveStream{ustr},
+			uniChan:         uniChan,
+			bidiChan:        bidiChan,
 		}
-		// ServeQUICConn manages the connection lifecycle; do not close conn here.
 		if err := s.wtServer.ServeQUICConn(iconn); err != nil && err != http.ErrServerClosed && !isNormalStreamClose(err) {
 			log.Printf("[WebTransport] Session ended: %v", err)
 		}
+		s.cleanupWebTransportConn(conn)
+		_ = iconn.CloseWithError(0, "done")
 
 	case bstr := <-bidiChan:
 		// NOTE: probeCtx stays alive during classification so the uni probe
@@ -486,6 +563,11 @@ func (s *Server) dispatchConnection(conn quic.EarlyConnection) {
 		// handlers try to accept streams on the same connection.
 		cancel()
 		if !ok {
+			for _, u := range harvestedUni {
+				if u != nil {
+					u.CancelRead(0)
+				}
+			}
 			log.Printf("[Server] bidi-first from %s yielded no usable stream before probe expiry: closing connection", conn.RemoteAddr())
 			conn.CloseWithError(0, "probe timeout")
 			return
@@ -498,13 +580,21 @@ func (s *Server) dispatchConnection(conn quic.EarlyConnection) {
 				EarlyConnection: conn,
 				bidiStreams:     []quic.Stream{sStream},
 				uniStreams:      harvestedUni,
+				uniChan:         uniChan,
+				bidiChan:        bidiChan,
 			}
-			// ServeQUICConn manages the connection lifecycle; do not close conn here.
 			if err := s.wtServer.ServeQUICConn(iconn); err != nil && err != http.ErrServerClosed && !isNormalStreamClose(err) {
 				log.Printf("[WebTransport] Session ended: %v", err)
 			}
+			s.cleanupWebTransportConn(conn)
+			_ = iconn.CloseWithError(0, "done")
 		} else {
 			// Raw Brook QUIC stream (starts with 12-byte random client nonce)
+			for _, u := range harvestedUni {
+				if u != nil {
+					u.CancelRead(0)
+				}
+			}
 			// Drain any orphaned uni stream with a 200ms grace window to prevent leaks.
 			go func() {
 				select {
@@ -523,6 +613,21 @@ func (s *Server) dispatchConnection(conn quic.EarlyConnection) {
 		// Timeout waiting for first stream (slowloris protection).
 		log.Printf("[Server] probe timeout, closing connection from %s (no streams in 10s)", conn.RemoteAddr())
 		conn.CloseWithError(0, "probe timeout")
+		select {
+		case s, ok := <-bidiChan:
+			if ok && s != nil {
+				s.CancelRead(0x100)
+				_ = s.Close()
+			}
+		default:
+		}
+		select {
+		case u, ok := <-uniChan:
+			if ok && u != nil {
+				u.CancelRead(0)
+			}
+		default:
+		}
 	}
 }
 
@@ -670,4 +775,81 @@ func (s *Server) Close() error {
 		_ = packetConn.Close()
 	}
 	return nil
+}
+
+// cleanupWebTransportConn removes the connection tracing entry from webtransport.Server's internal
+// sessionManager. Without this, webtransport-go leaks every closed connection and its sessions in
+// an internal map indefinitely.
+func (s *Server) cleanupWebTransportConn(conn quic.EarlyConnection) {
+	if s == nil || s.wtServer == nil || conn == nil {
+		return
+	}
+	tracingVal := conn.Context().Value(quic.ConnectionTracingKey)
+	if tracingVal == nil {
+		return
+	}
+	tracingID, ok := tracingVal.(quic.ConnectionTracingID)
+	if !ok {
+		return
+	}
+
+	wtVal := reflect.ValueOf(s.wtServer)
+	if wtVal.Kind() != reflect.Ptr || wtVal.IsNil() {
+		return
+	}
+	wtElem := wtVal.Elem()
+	connsField := wtElem.FieldByName("conns")
+	if !connsField.IsValid() || connsField.IsNil() {
+		return
+	}
+
+	smElem := connsField.Elem()
+	mxField := smElem.FieldByName("mx")
+	mapField := smElem.FieldByName("conns")
+	if !mxField.IsValid() || !mapField.IsValid() {
+		return
+	}
+
+	mx := (*sync.Mutex)(unsafe.Pointer(mxField.UnsafeAddr()))
+	mx.Lock()
+	defer mx.Unlock()
+
+	m := reflect.NewAt(mapField.Type(), unsafe.Pointer(mapField.UnsafeAddr())).Elem()
+	if !m.IsNil() {
+		m.SetMapIndex(reflect.ValueOf(tracingID), reflect.Value{})
+	}
+}
+
+// ActiveWebTransportConns returns the count of active connections currently tracked in
+// webtransport.Server's sessionManager.
+func (s *Server) ActiveWebTransportConns() int {
+	if s == nil || s.wtServer == nil {
+		return 0
+	}
+	wtVal := reflect.ValueOf(s.wtServer)
+	if wtVal.Kind() != reflect.Ptr || wtVal.IsNil() {
+		return 0
+	}
+	wtElem := wtVal.Elem()
+	connsField := wtElem.FieldByName("conns")
+	if !connsField.IsValid() || connsField.IsNil() {
+		return 0
+	}
+
+	smElem := connsField.Elem()
+	mxField := smElem.FieldByName("mx")
+	mapField := smElem.FieldByName("conns")
+	if !mxField.IsValid() || !mapField.IsValid() {
+		return 0
+	}
+
+	mx := (*sync.Mutex)(unsafe.Pointer(mxField.UnsafeAddr()))
+	mx.Lock()
+	defer mx.Unlock()
+
+	m := reflect.NewAt(mapField.Type(), unsafe.Pointer(mapField.UnsafeAddr())).Elem()
+	if m.IsNil() {
+		return 0
+	}
+	return m.Len()
 }

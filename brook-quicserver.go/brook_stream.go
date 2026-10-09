@@ -30,6 +30,8 @@ type StreamConn interface {
 	io.Reader
 	io.Writer
 	io.Closer
+	CancelRead(code uint64)
+	CancelWrite(code uint64)
 	SetDeadline(t time.Time) error
 	SetReadDeadline(t time.Time) error
 	SetWriteDeadline(t time.Time) error
@@ -46,6 +48,14 @@ func (b *bufferedStreamConn) Read(p []byte) (int, error) {
 	return b.reader.Read(p)
 }
 
+func (b *bufferedStreamConn) CancelRead(code uint64) {
+	b.StreamConn.CancelRead(code)
+}
+
+func (b *bufferedStreamConn) CancelWrite(code uint64) {
+	b.StreamConn.CancelWrite(code)
+}
+
 func newBufferedStreamConn(conn StreamConn, initial []byte) *bufferedStreamConn {
 	return &bufferedStreamConn{
 		StreamConn: conn,
@@ -55,7 +65,11 @@ func newBufferedStreamConn(conn StreamConn, initial []byte) *bufferedStreamConn 
 
 // HandleBrookStream processes an incoming Brook stream from either QUIC or WebTransport with auto-detection.
 func HandleBrookStream(client StreamConn, password []byte, defaultWithoutBrook bool, tcpTimeout, udpTimeout int) error {
-	defer client.Close()
+	defer func() {
+		client.CancelRead(0x100)
+		client.CancelWrite(0x100)
+		_ = client.Close()
+	}()
 
 	// Dedicated 10s deadline for initial handshake phase to prevent hung unauthenticated streams
 	_ = client.SetDeadline(time.Now().Add(10 * time.Second))
@@ -288,7 +302,11 @@ func handleEncryptedBrookStream(client StreamConn, cn []byte, rawPass, passHash 
 		var lenPlain [2]byte
 
 		for {
-			_ = remote.SetReadDeadline(time.Now().Add(time.Duration(effectiveTimeout) * time.Second))
+			select {
+			case <-teardownCh:
+			default:
+				_ = remote.SetReadDeadline(time.Now().Add(time.Duration(effectiveTimeout) * time.Second))
+			}
 			n, err := remote.Read(rawBuf)
 			if n > 0 {
 				batchLen := 0
@@ -347,7 +365,11 @@ func handleEncryptedBrookStream(client StreamConn, cn []byte, rawPass, passHash 
 		plainDataBuf := (*plainDataBufPtr)[:0]
 
 		for {
-			_ = client.SetReadDeadline(time.Now().Add(time.Duration(effectiveTimeout) * time.Second))
+			select {
+			case <-teardownCh:
+			default:
+				_ = client.SetReadDeadline(time.Now().Add(time.Duration(effectiveTimeout) * time.Second))
+			}
 			if _, err := io.ReadFull(client, lenChunk); err != nil {
 				if !errors.Is(err, io.EOF) {
 					recordErr(fmt.Errorf("read client frame length failed: %w", err))
@@ -409,10 +431,12 @@ func handleEncryptedBrookStream(client StreamConn, cn []byte, rawPass, passHash 
 		case <-waitCh:
 		case <-time.After(10 * time.Second):
 			_ = remote.Close()
+			client.CancelRead(0x100)
+			client.CancelWrite(0x100)
 			_ = client.Close()
 			select {
 			case <-waitCh:
-			case <-time.After(5 * time.Second):
+			case <-time.After(2 * time.Second):
 				// Never block HandleBrookStream forever: abandon the relay
 				// (releasing its stream-semaphore slot) instead of leaking
 				// the goroutines + slot when a peer ignores Close.
@@ -522,7 +546,11 @@ func handleSimpleBrookStream(client StreamConn, password []byte, tcpTimeout, udp
 		defer buf64kPool.Put(bufPtr)
 		buf := (*bufPtr)[:32768]
 		for {
-			_ = remote.SetReadDeadline(time.Now().Add(time.Duration(effectiveTimeout) * time.Second))
+			select {
+			case <-teardownCh:
+			default:
+				_ = remote.SetReadDeadline(time.Now().Add(time.Duration(effectiveTimeout) * time.Second))
+			}
 			n, err := remote.Read(buf)
 			if n > 0 {
 				_ = client.SetWriteDeadline(time.Now().Add(time.Duration(effectiveTimeout) * time.Second))
@@ -551,7 +579,11 @@ func handleSimpleBrookStream(client StreamConn, password []byte, tcpTimeout, udp
 		defer buf64kPool.Put(bufPtr)
 		buf := (*bufPtr)[:32768]
 		for {
-			_ = client.SetReadDeadline(time.Now().Add(time.Duration(effectiveTimeout) * time.Second))
+			select {
+			case <-teardownCh:
+			default:
+				_ = client.SetReadDeadline(time.Now().Add(time.Duration(effectiveTimeout) * time.Second))
+			}
 			n, err := client.Read(buf)
 			if n > 0 {
 				_ = remote.SetWriteDeadline(time.Now().Add(time.Duration(effectiveTimeout) * time.Second))
@@ -587,10 +619,12 @@ func handleSimpleBrookStream(client StreamConn, password []byte, tcpTimeout, udp
 		case <-waitCh:
 		case <-time.After(10 * time.Second):
 			_ = remote.Close()
+			client.CancelRead(0x100)
+			client.CancelWrite(0x100)
 			_ = client.Close()
 			select {
 			case <-waitCh:
-			case <-time.After(5 * time.Second):
+			case <-time.After(2 * time.Second):
 				// Never block forever: abandon the relay (releasing its
 				// stream-semaphore slot) instead of leaking goroutines.
 				log.Printf("[relay] teardown stuck, abandoning simple stream (client=%s remote=%s)", client.RemoteAddr(), remote.RemoteAddr())
