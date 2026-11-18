@@ -515,6 +515,96 @@ async function runUnitTests() {
   });
   await offlineDispatcher._handleClient(mockOfflineSocket, 'socks5');
   assert(mockSocketClosed, 'ProxyDispatcher immediately drops incoming client connections when network is offline');
+
+  // 1.20 BrookTunnel clean RESET_STREAM handling (stream_reset after clean frame vs stream_error before data)
+  const runMockResetTunnel = async ({ sendFrameBeforeReset, partialFrameBeforeReset }) => {
+    const pw = 'reset-test-pw';
+    const logs = [];
+    const clientWritten = [];
+    let registeredHandlers = null;
+    const mockQuic = {
+      allocateStreamId: () => 4,
+      registerStream: (id, handlers) => { registeredHandlers = handlers; },
+      releaseStream: () => {},
+      ensureConnected: async () => {},
+      sendStreamData: async (id, data) => {
+        if (data && data.length > 12 && registeredHandlers) {
+          // Simulate server sending sn (+ optional frame), then RESET_STREAM
+          const sn = new Uint8Array([10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120]);
+          const sk = await deriveKey(pw, sn, 'brook', true);
+          const serverCipher = new BrookCipher(sk);
+          const snCopy = new Uint8Array(sn);
+          let wire = sn;
+          if (sendFrameBeforeReset) {
+            const sealed = await sealFrame(serverCipher, snCopy, new TextEncoder().encode('OK'));
+            const payload = partialFrameBeforeReset ? sealed.subarray(0, 10) : sealed;
+            const combined = new Uint8Array(sn.length + payload.length);
+            combined.set(sn, 0);
+            combined.set(payload, sn.length);
+            wire = combined;
+          }
+          queueMicrotask(() => {
+            registeredHandlers.onData(wire, false);
+            registeredHandlers.onError(new Error('Received RESET_STREAM'));
+          });
+        }
+      }
+    };
+    let readerCancelled = false;
+    let resolveRead = null;
+    const mockReader = {
+      read: async () => {
+        if (readerCancelled) return { value: undefined, done: true };
+        return new Promise((r) => { resolveRead = r; });
+      },
+      cancel: async () => {
+        readerCancelled = true;
+        if (resolveRead) {
+          resolveRead({ value: undefined, done: true });
+          resolveRead = null;
+        }
+      }
+    };
+    const mockWriter = {
+      write: async (chunk) => { clientWritten.push(chunk); },
+      close: async () => {}
+    };
+    const dstBytes = new Uint8Array([1, 127, 0, 0, 1, 0, 80]);
+    const outcome = await BrookTunnel.run({
+      clientReader: mockReader,
+      clientWriter: mockWriter,
+      quicManager: mockQuic,
+      dstBytes,
+      password: pw,
+      withoutBrook: true,
+      targetStr: '127.0.0.1:80',
+      sessionId: 'reset-test',
+      onLog: (lvl, msg) => logs.push({ lvl, msg })
+    });
+    return { outcome, logs, clientWritten };
+  };
+
+  const cleanReset = await runMockResetTunnel({ sendFrameBeforeReset: true, partialFrameBeforeReset: false });
+  assert(
+    cleanReset.outcome.success === true && cleanReset.outcome.kind === 'stream_reset' && cleanReset.clientWritten.length === 1,
+    'BrookTunnel completes cleanly as stream_reset when RESET_STREAM arrives after full frame delivery'
+  );
+  assert(
+    !cleanReset.logs.some(l => l.lvl === 'error' || l.lvl === 'warning'),
+    'BrookTunnel emits no error/warning logs when RESET_STREAM arrives after clean data exchange'
+  );
+
+  const partialReset = await runMockResetTunnel({ sendFrameBeforeReset: true, partialFrameBeforeReset: true });
+  assert(
+    partialReset.outcome.success === false && partialReset.outcome.kind === 'stream_error',
+    'BrookTunnel reports stream_error failure when RESET_STREAM truncates an incomplete frame'
+  );
+
+  const zeroByteReset = await runMockResetTunnel({ sendFrameBeforeReset: false, partialFrameBeforeReset: false });
+  assert(
+    zeroByteReset.outcome.success === false && zeroByteReset.outcome.kind === 'stream_error',
+    'BrookTunnel reports stream_error failure when RESET_STREAM arrives with 0 received bytes'
+  );
 }
 
 // -------------------------------------------------------------

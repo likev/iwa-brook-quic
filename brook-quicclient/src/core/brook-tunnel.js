@@ -86,6 +86,7 @@ export class BrookTunnel {
     let clientWriteClosed = false;
     let serverFinReceived = false;
     let transportClosed = false;
+    let streamResetError = null;
     let hasExchangedData = false;
     let successSent = false;
     let activeWritePromise = null;
@@ -241,6 +242,22 @@ export class BrookTunnel {
       })();
 
       return cleanupPromise;
+    };
+
+    const finalizeStreamReset = (err) => {
+      const msg = err?.message || String(err || '');
+      const cleanBoundary = expectedPayloadLen === -1 && rxOffset >= rxBuffer.length;
+      if (serverHandshakeDone && totalBytesRecv > 0 && cleanBoundary) {
+        if (onLog) {
+          onLog('info', `${logTag} ℹ️ QUIC stream ${streamId} reset by peer after ${totalBytesRecv}B transferred`);
+        }
+        cleanup('stream_reset', err);
+      } else {
+        if (onLog) {
+          onLog('warning', `${logTag} ⚠️ QUIC stream ${streamId} reset by peer: ${msg}`);
+        }
+        cleanup('stream_error', err);
+      }
     };
 
     const checkFullClose = () => {
@@ -444,6 +461,8 @@ export class BrookTunnel {
         isProcessingRx = false;
         if (rxQueue.length > 0 && !isTerminated) {
           queueMicrotask(processRxQueue);
+        } else if (streamResetError && !isTerminated && !serverFinReceived) {
+          finalizeStreamReset(streamResetError);
         } else if (transportClosed && !isTerminated && !serverFinReceived) {
           cleanup('transport_closed', new Error('Underlying transport closed before server FIN'));
         }
@@ -490,7 +509,15 @@ export class BrookTunnel {
           }
         },
         onError: (err) => {
-          if (onLog) onLog('error', `${logTag} QUIC stream ${streamId} error: ${err.message}`);
+          const msg = err?.message || String(err || '');
+          if (/RESET_STREAM/i.test(msg)) {
+            streamResetError = err;
+            if (rxQueue.length === 0 && !isProcessingRx && !isTerminated) {
+              finalizeStreamReset(err);
+            }
+            return;
+          }
+          if (onLog) onLog('error', `${logTag} QUIC stream ${streamId} error: ${msg}`);
           cleanup('stream_error', err);
         }
       });
@@ -615,7 +642,12 @@ export class BrookTunnel {
     }
 
     const isSuccess = terminationReason === 'both_closed' ||
-      (serverHandshakeDone && totalBytesRecv > 0 && (terminationReason === 'idle_timeout' || terminationReason === 'client_closed' || terminationReason === 'transport_closed'));
+      (serverHandshakeDone && totalBytesRecv > 0 && (
+        terminationReason === 'idle_timeout' ||
+        terminationReason === 'client_closed' ||
+        terminationReason === 'transport_closed' ||
+        terminationReason === 'stream_reset'
+      ));
 
     return {
       success: isSuccess,

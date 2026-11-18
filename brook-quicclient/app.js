@@ -38,7 +38,7 @@ async function bootstrap() {
     modalContainer
   });
 
-  logStream.add('info', `🚀 Brook WebTransport Client IWA v1.38.0 initialized (Engine: Native WebTransport / HTTP/3 QUIC)`);
+  logStream.add('info', `🚀 Brook WebTransport Client IWA v1.39.0 initialized (Engine: Native WebTransport / HTTP/3 QUIC)`);
 
   // Initialize Session Tracker & Telemetry
   sessionTracker = new SessionTracker({

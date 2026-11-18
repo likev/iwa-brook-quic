@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -2242,4 +2243,159 @@ func TestRawQUICIdleTimeoutReclaimsConnection(t *testing.T) {
 		return
 	}
 	t.Logf("✅ Verified raw QUIC connection was closed by idle timeout: %v", err)
+}
+
+// TestCleanFINNoResetStream verifies that normal stream closes and target-side
+// dial failures send a clean QUIC FIN (io.EOF) instead of RESET_STREAM.
+func TestCleanFINNoResetStream(t *testing.T) {
+	// Target 1: sends a short response and immediately closes TCP (io.EOF)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				buf := make([]byte, 256)
+				n, _ := conn.Read(buf)
+				if n > 0 {
+					_, _ = conn.Write(buf[:n])
+				}
+			}(c)
+		}
+	}()
+	targetAddr := ln.Addr().String()
+
+	// Target 2: closed port for dial refusal
+	refuseLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	refusedAddr := refuseLn.Addr().String()
+	_ = refuseLn.Close()
+
+	password := "clean-fin-test"
+	server, err := NewServer("127.0.0.1:0", password, "", 10, 10, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	go func() { _ = server.ListenAndServe() }()
+	select {
+	case <-server.Ready():
+	case <-time.After(5 * time.Second):
+		t.Fatal("server failed to start")
+	}
+	serverAddr := server.LocalAddr().String()
+
+	dialer := &webtransport.Dialer{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+	_, sess, err := dialer.Dial(context.Background(), fmt.Sprintf("https://%s/brook", serverAddr), nil)
+	if err != nil {
+		t.Fatalf("WT dial failed: %v", err)
+	}
+	defer sess.CloseWithError(0, "")
+
+	openAndExpectCleanEOF := func(dstAddr string, expectPayload string) {
+		stream, err := sess.OpenStreamSync(context.Background())
+		if err != nil {
+			t.Fatalf("open stream failed: %v", err)
+		}
+		defer stream.Close()
+
+		cn, _ := GenerateNonce()
+		cnOrig := append([]byte{}, cn...)
+		ck, _ := DeriveKey([]byte(password), cn, brookInfo)
+		ca, _ := NewGCMCipher(ck)
+
+		atyp, addrB, portB, err := ParseAddress(dstAddr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		dstSlice := append([]byte{atyp}, addrB...)
+		dstSlice = append(dstSlice, portB...)
+		now := time.Now().Unix()
+		if now%2 != 0 {
+			now += 1
+		}
+		hPayload := make([]byte, 4+len(dstSlice))
+		binary.BigEndian.PutUint32(hPayload[:4], uint32(now))
+		copy(hPayload[4:], dstSlice)
+		sLen := make([]byte, 2)
+		binary.BigEndian.PutUint16(sLen, uint16(len(hPayload)))
+		encLen := ca.Seal(nil, cn, sLen, nil)
+		NextNonce(cn)
+		encPayload := ca.Seal(nil, cn, hPayload, nil)
+		NextNonce(cn)
+
+		wire := append(cnOrig, encLen...)
+		wire = append(wire, encPayload...)
+		if expectPayload != "" {
+			msg := []byte(expectPayload)
+			mLen := make([]byte, 2)
+			binary.BigEndian.PutUint16(mLen, uint16(len(msg)))
+			sML := ca.Seal(nil, cn, mLen, nil)
+			NextNonce(cn)
+			sMP := ca.Seal(nil, cn, msg, nil)
+			NextNonce(cn)
+			wire = append(wire, sML...)
+			wire = append(wire, sMP...)
+		}
+		if _, err := stream.Write(wire); err != nil {
+			t.Fatalf("stream write failed: %v", err)
+		}
+		// Half-close write side while reading server response to EOF
+		_ = stream.Close()
+
+		sn := make([]byte, 12)
+		if _, err := io.ReadFull(stream, sn); err != nil {
+			t.Fatalf("read sn failed (expected clean handshake, got %T: %v)", err, err)
+		}
+		sk, _ := DeriveKey([]byte(password), sn, brookInfo)
+		sa, _ := NewGCMCipher(sk)
+
+		if expectPayload != "" {
+			lenBuf := make([]byte, 18)
+			if _, err := io.ReadFull(stream, lenBuf); err != nil {
+				t.Fatalf("read len failed: %v", err)
+			}
+			pLen, err := sa.Open(nil, sn, lenBuf, nil)
+			if err != nil {
+				t.Fatalf("open len failed: %v", err)
+			}
+			NextNonce(sn)
+			n := int(binary.BigEndian.Uint16(pLen))
+			payBuf := make([]byte, n+16)
+			if _, err := io.ReadFull(stream, payBuf); err != nil {
+				t.Fatalf("read payload failed: %v", err)
+			}
+			plain, err := sa.Open(nil, sn, payBuf, nil)
+			if err != nil {
+				t.Fatalf("open payload failed: %v", err)
+			}
+			NextNonce(sn)
+			if string(plain) != expectPayload {
+				t.Fatalf("payload mismatch: got %q, want %q", string(plain), expectPayload)
+			}
+		}
+
+		// Trailing Read MUST return io.EOF, NOT *webtransport.StreamError (RESET_STREAM)
+		var tail [16]byte
+		_, err = stream.Read(tail[:])
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("❌ Expected clean io.EOF (FIN) from server for %s, got %T: %v", dstAddr, err, err)
+		}
+	}
+
+	openAndExpectCleanEOF(targetAddr, "hello-clean-fin")
+	openAndExpectCleanEOF(refusedAddr, "")
+	t.Log("✅ TestCleanFINNoResetStream passed: both normal close and dial refusal delivered clean FIN (io.EOF) without RESET_STREAM")
 }

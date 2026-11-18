@@ -67,7 +67,6 @@ func newBufferedStreamConn(conn StreamConn, initial []byte) *bufferedStreamConn 
 func HandleBrookStream(client StreamConn, password []byte, defaultWithoutBrook bool, tcpTimeout, udpTimeout int) error {
 	defer func() {
 		client.CancelRead(0x100)
-		client.CancelWrite(0x100)
 		_ = client.Close()
 	}()
 
@@ -231,6 +230,7 @@ func handleEncryptedBrookStream(client StreamConn, cn []byte, rawPass, passHash 
 	}
 
 	if _, err := client.Write(sn); err != nil {
+		client.CancelWrite(0x100)
 		return fmt.Errorf("write server nonce failed: %w", err)
 	}
 
@@ -332,6 +332,7 @@ func handleEncryptedBrookStream(client StreamConn, cn []byte, rawPass, passHash 
 
 				_ = client.SetWriteDeadline(time.Now().Add(time.Duration(effectiveTimeout) * time.Second))
 				if _, werr := client.Write(batchBuf[:batchLen]); werr != nil {
+					client.CancelWrite(0x100)
 					recordErr(fmt.Errorf("client stream write failed: %w", werr))
 					return
 				}
@@ -555,6 +556,7 @@ func handleSimpleBrookStream(client StreamConn, password []byte, tcpTimeout, udp
 			if n > 0 {
 				_ = client.SetWriteDeadline(time.Now().Add(time.Duration(effectiveTimeout) * time.Second))
 				if _, werr := client.Write(buf[:n]); werr != nil {
+					client.CancelWrite(0x100)
 					recordErr(fmt.Errorf("client write failed: %w", werr))
 					return
 				}

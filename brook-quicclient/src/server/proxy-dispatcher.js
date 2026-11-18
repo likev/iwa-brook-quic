@@ -370,8 +370,8 @@ export class ProxyDispatcher {
 
       if (tunnelError) {
         await sendFailureOnce(0x05);
-        // Normal keep-alive socket expiration or clean transport closure after data exchange is not a critical error
-        if ((finalOutcome?.kind === 'idle_timeout' || finalOutcome?.kind === 'transport_closed') && finalOutcome?.bytesReceived > 0) {
+        // Normal keep-alive socket expiration or clean transport/stream closure after data exchange is not a critical error
+        if ((finalOutcome?.kind === 'idle_timeout' || finalOutcome?.kind === 'transport_closed' || finalOutcome?.kind === 'stream_reset') && finalOutcome?.bytesReceived > 0) {
           this._log('info', `[#${session?.id}] Proxy session closed (${finalOutcome.kind}, ${finalOutcome.bytesReceived}B transferred)`);
         } else {
           this._log('warning', `Proxy session error: ${tunnelError.message || tunnelError}`);
