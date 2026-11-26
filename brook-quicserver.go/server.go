@@ -69,6 +69,7 @@ func isNormalStreamClose(err error) bool {
 		strings.Contains(s, "deadline exceeded") ||
 		strings.Contains(s, "i/o timeout") ||
 		strings.Contains(s, "stream canceled with error code") ||
+		strings.Contains(s, "stream canceled by remote") ||
 		strings.Contains(s, "canceled by remote with error code") ||
 		strings.Contains(s, "failed to convert stream error") ||
 		strings.Contains(s, "error code outside of expected range")
@@ -327,9 +328,11 @@ func (s *Server) ListenAndServe() error {
 	}
 }
 
-// dispatchConnection performs zero-copy ALPN routing between raw Brook QUIC and WebTransport/HTTP3.
+// dispatchConnection performs zero-copy ALPN + QUIC transport-parameter routing between
+// raw Brook QUIC (including original txthinking/brook/quicclient) and WebTransport/HTTP3.
 func (s *Server) dispatchConnection(conn *quic.Conn) {
-	alpn := conn.ConnectionState().TLS.NegotiatedProtocol
+	state := conn.ConnectionState()
+	alpn := state.TLS.NegotiatedProtocol
 
 	switch alpn {
 	case "brook-quic", "brook", "":
@@ -337,6 +340,13 @@ func (s *Server) dispatchConnection(conn *quic.Conn) {
 		_ = conn.CloseWithError(0, "done")
 
 	case "h3":
+		if !state.SupportsDatagrams.Remote {
+			// Original txthinking/brook/quicclient (QUICDialTCP) uses ALPN "h3" with EnableDatagrams=false,
+			// whereas every WebTransport client is required by RFC 9297 to advertise QUIC datagram support.
+			HandleRawQUICConn(conn, s.Password, s.WithoutBrook, s.TCPTimeout, s.UDPTimeout, nil, s.streamSem)
+			_ = conn.CloseWithError(0, "done")
+			return
+		}
 		if err := s.wtServer.ServeQUICConn(conn); err != nil && err != http.ErrServerClosed && !isNormalStreamClose(err) {
 			log.Printf("[WebTransport] Session ended: %v", err)
 		}

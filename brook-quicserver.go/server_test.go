@@ -2604,3 +2604,159 @@ func TestWebSocketFallbackBrookEchoAndMultiplex(t *testing.T) {
 	<-readDone
 	t.Log("✅ TestWebSocketFallbackBrookEchoAndMultiplex passed: PING/PONG + 10 concurrent multiplexed Brook streams with clean FIN half-close over wss://.../brook-ws!")
 }
+
+// TestOriginalTxThinkingBrookQUICClientH3 verifies compatibility with original txthinking/brook/quicclient
+// (ALPN "h3" with EnableDatagrams=false) for both withoutBrook=false (encrypted) and withoutBrook=true (simple).
+func TestOriginalTxThinkingBrookQUICClientH3(t *testing.T) {
+	echoAddr, cleanupEcho := startEchoServer(t)
+	defer cleanupEcho()
+
+	password := "txthinking-compat-pass"
+	server, err := NewServer("127.0.0.1:0", password, "", 15, 15, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	go func() { _ = server.ListenAndServe() }()
+	select {
+	case <-server.Ready():
+	case <-time.After(5 * time.Second):
+		t.Fatal("server failed to start")
+	}
+	serverAddr := server.LocalAddr().String()
+
+	// Exact txthinking/brook QUICDialTCP config: ALPN "h3" + EnableDatagrams=false
+	txTLS := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h3"}}
+	txQuicCfg := &quic.Config{MaxIdleTimeout: 15 * time.Second, EnableDatagrams: false}
+
+	atyp, addrB, portB, _ := ParseAddress(echoAddr)
+	dstSlice := append([]byte{atyp}, addrB...)
+	dstSlice = append(dstSlice, portB...)
+
+	// 1. Original Brook protocol (withoutBrook=false, AES-256-GCM with raw password)
+	t.Run("Encrypted_WithBrookProtocol", func(t *testing.T) {
+		conn, err := quic.DialAddr(context.Background(), serverAddr, txTLS, txQuicCfg)
+		if err != nil {
+			t.Fatalf("QUIC dial failed: %v", err)
+		}
+		defer conn.CloseWithError(0, "")
+
+		stream, err := conn.OpenStreamSync(context.Background())
+		if err != nil {
+			t.Fatalf("open stream failed: %v", err)
+		}
+		defer stream.Close()
+
+		cn, _ := GenerateNonce()
+		cnOrig := append([]byte(nil), cn...)
+		ck, _ := DeriveKey([]byte(password), cn, brookInfo)
+		ca, _ := NewGCMCipher(ck)
+
+		now := time.Now().Unix()
+		if now%2 != 0 {
+			now++
+		}
+		headerBody := make([]byte, 4+len(dstSlice))
+		binary.BigEndian.PutUint32(headerBody[:4], uint32(now))
+		copy(headerBody[4:], dstSlice)
+
+		lenBuf := make([]byte, 2)
+		binary.BigEndian.PutUint16(lenBuf, uint16(len(headerBody)))
+		sealedLen := ca.Seal(nil, cn, lenBuf, nil)
+		NextNonce(cn)
+		sealedHdr := ca.Seal(nil, cn, headerBody, nil)
+		NextNonce(cn)
+
+		msg := []byte("Hello from original txthinking/brook encrypted!")
+		msgLenBuf := make([]byte, 2)
+		binary.BigEndian.PutUint16(msgLenBuf, uint16(len(msg)))
+		sealedMsgLen := ca.Seal(nil, cn, msgLenBuf, nil)
+		NextNonce(cn)
+		sealedMsg := ca.Seal(nil, cn, msg, nil)
+		NextNonce(cn)
+
+		out := append(cnOrig, sealedLen...)
+		out = append(out, sealedHdr...)
+		out = append(out, sealedMsgLen...)
+		out = append(out, sealedMsg...)
+		if _, err := stream.Write(out); err != nil {
+			t.Fatal(err)
+		}
+
+		stream.SetReadDeadline(time.Now().Add(5 * time.Second))
+		sn := make([]byte, 12)
+		if _, err := io.ReadFull(stream, sn); err != nil {
+			t.Fatalf("read server nonce failed: %v", err)
+		}
+		sk, _ := DeriveKey([]byte(password), sn, brookInfo)
+		sa, _ := NewGCMCipher(sk)
+
+		respLenEnc := make([]byte, 18)
+		if _, err := io.ReadFull(stream, respLenEnc); err != nil {
+			t.Fatal(err)
+		}
+		respLenDec, err := sa.Open(nil, sn, respLenEnc, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		NextNonce(sn)
+		n := int(binary.BigEndian.Uint16(respLenDec))
+		respEnc := make([]byte, n+16)
+		if _, err := io.ReadFull(stream, respEnc); err != nil {
+			t.Fatal(err)
+		}
+		plain, err := sa.Open(nil, sn, respEnc, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(plain) != string(msg) {
+			t.Fatalf("mismatch: got %q want %q", string(plain), string(msg))
+		}
+	})
+
+	// 2. Simple mode (withoutBrook=true, NewSimpleStreamClient: 32B sha256(password) + 2B len + 4B ts + dst)
+	t.Run("Simple_WithoutBrookProtocol", func(t *testing.T) {
+		conn, err := quic.DialAddr(context.Background(), serverAddr, txTLS, txQuicCfg)
+		if err != nil {
+			t.Fatalf("QUIC dial failed: %v", err)
+		}
+		defer conn.CloseWithError(0, "")
+
+		stream, err := conn.OpenStreamSync(context.Background())
+		if err != nil {
+			t.Fatalf("open stream failed: %v", err)
+		}
+		defer stream.Close()
+
+		passHash := SHA256Bytes([]byte(password))
+		now := time.Now().Unix()
+		if now%2 != 0 {
+			now++
+		}
+		payload := make([]byte, 4+len(dstSlice))
+		binary.BigEndian.PutUint32(payload[:4], uint32(now))
+		copy(payload[4:], dstSlice)
+
+		header := make([]byte, 32+2+len(payload))
+		copy(header[:32], passHash)
+		binary.BigEndian.PutUint16(header[32:34], uint16(len(payload)))
+		copy(header[34:], payload)
+
+		msg := []byte("Hello from original txthinking/brook withoutBrook!")
+		if _, err := stream.Write(append(header, msg...)); err != nil {
+			t.Fatal(err)
+		}
+
+		stream.SetReadDeadline(time.Now().Add(5 * time.Second))
+		buf := make([]byte, len(msg))
+		if _, err := io.ReadFull(stream, buf); err != nil {
+			t.Fatalf("read echo failed: %v", err)
+		}
+		if string(buf) != string(msg) {
+			t.Fatalf("mismatch: got %q want %q", string(buf), string(msg))
+		}
+	})
+
+	t.Log("✅ TestOriginalTxThinkingBrookQUICClientH3 passed for both with and without Brook protocol!")
+}
