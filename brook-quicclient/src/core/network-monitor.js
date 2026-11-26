@@ -7,16 +7,16 @@
  *  - If ALL 3 endpoints fail -> OFFLINE.
  *  - If ANY 1 endpoint succeeds -> ONLINE.
  *
- * URLs selected from ../help/online-urls.md:
- *  1. ipify:        https://api.ipify.org?format=json
- *  2. Open-Meteo:   https://api.open-meteo.com/v1/forecast?latitude=52.52&longitude=13.41&current_weather=true
- *  3. Cat Facts:    https://catfact.ninja/fact
+ * URLs selected from ../help/online-urls.md (all verified HTTP/3 + CORS *):
+ *  1. Dog CEO:    https://dog.ceo/api/breeds/image/random
+ *  2. Cat Facts:  https://catfact.ninja/fact
+ *  3. cdnjs API:  https://api.cdnjs.com/libraries/lodash.js?fields=name,version,description
  */
 
 export const PROBE_URLS = [
-  'https://api.ipify.org?format=json',
-  'https://api.open-meteo.com/v1/forecast?latitude=52.52&longitude=13.41&current_weather=true',
-  'https://catfact.ninja/fact'
+  'https://dog.ceo/api/breeds/image/random',
+  'https://catfact.ninja/fact',
+  'https://api.cdnjs.com/libraries/lodash.js?fields=name,version,description'
 ];
 
 export class NetworkMonitor {

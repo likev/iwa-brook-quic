@@ -456,10 +456,10 @@ async function runUnitTests() {
   assert(testWtMgr.state === 'disconnected', 'WebTransport state is cleanly disconnected after resetSession');
 
   // 1.19 NetworkMonitor Active 3-URL 5s/3s Probing & Offline Guarding
-  assert(PROBE_URLS.length === 3, 'NetworkMonitor contains exactly 3 verified HTTPS probe URLs');
-  assert(PROBE_URLS[0].includes('api.ipify.org'), 'Probe URL 1 is ipify');
-  assert(PROBE_URLS[1].includes('open-meteo.com'), 'Probe URL 2 is Open-Meteo');
-  assert(PROBE_URLS[2].includes('catfact.ninja'), 'Probe URL 3 is Cat Facts');
+  assert(PROBE_URLS.length === 3, 'NetworkMonitor contains exactly 3 verified HTTP/3 HTTPS probe URLs');
+  assert(PROBE_URLS[0].includes('dog.ceo'), 'Probe URL 1 is Dog CEO (HTTP/3)');
+  assert(PROBE_URLS[1].includes('catfact.ninja'), 'Probe URL 2 is Cat Facts (HTTP/3)');
+  assert(PROBE_URLS[2].includes('api.cdnjs.com'), 'Probe URL 3 is cdnjs API (HTTP/3)');
 
   let statusTransitions = [];
   const testMonitor = new NetworkMonitor({

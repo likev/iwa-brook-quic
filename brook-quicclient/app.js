@@ -11,7 +11,7 @@ import { ProxyDispatcher } from './src/server/proxy-dispatcher.js';
 import { UiController } from './src/ui/ui-controller.js';
 import { WtWorkerManager } from './src/workers/wt-worker-manager.js';
 import { ListenerWorkerClient } from './src/workers/listener-worker-client.js';
-import { NetworkMonitor } from './src/core/network-monitor.js';
+import { NetworkMonitor, PROBE_URLS } from './src/core/network-monitor.js';
 
 // 1. Initialize Trusted Types Policy for Strict IWA CSP
 initTrustedTypesPolicy();
@@ -38,7 +38,7 @@ async function bootstrap() {
     modalContainer
   });
 
-  logStream.add('info', `🚀 Brook WebTransport Client IWA v1.40.0 initialized (Engine: Native WebTransport / HTTP/3 QUIC)`);
+  logStream.add('info', `🚀 Brook WebTransport Client IWA v1.40.1 initialized (Engine: Native WebTransport / HTTP/3 QUIC)`);
 
   // Initialize Session Tracker & Telemetry
   sessionTracker = new SessionTracker({
@@ -57,13 +57,9 @@ async function bootstrap() {
       logStream.add('info', `Starting WebTransport proxy connected to https://${config.serverHost}:${config.serverPort}${serverPath}...`);
 
       try {
-        // 1. Initialize Active Network Monitor (checks 3 URLs every 5s, timeout 3s)
+        // 1. Initialize Active Network Monitor (checks 3 HTTP/3 + CORS URLs every 5s, timeout 3s)
         networkMonitor = new NetworkMonitor({
-          probeUrls: [
-            'https://api.ipify.org?format=json',
-            'https://api.open-meteo.com/v1/forecast?latitude=52.52&longitude=13.41&current_weather=true',
-            'https://catfact.ninja/fact'
-          ],
+          probeUrls: PROBE_URLS,
           checkIntervalMs: 5000,
           timeoutMs: 3000,
           onStatusChange: async (isOnline) => {
