@@ -18,6 +18,7 @@ import { BrookTunnel } from '../brook-quicclient/src/core/brook-tunnel.js';
 import { DnsResolver } from '../brook-quicclient/src/core/dns-resolver.js';
 import { encodeAddress, parseIpv6, parseHostPort, formatIpv6 } from '../brook-quicclient/src/core/byte-utils.js';
 import { WebTransportConnectionManager } from '../brook-quicclient/src/webtransport/wt-connection-manager.js';
+import { WS_FRAME_OPEN, WS_FRAME_DATA, WS_FRAME_FIN, WS_FRAME_PING, WS_FRAME_PONG } from '../brook-quicclient/src/webtransport/ws-connection-manager.js';
 import { WtStreamSession } from '../brook-quicclient/src/webtransport/wt-stream-adapter.js';
 import { ProxyDispatcher } from '../brook-quicclient/src/server/proxy-dispatcher.js';
 import { TcpListener } from '../brook-quicclient/src/server/tcp-listener.js';
@@ -827,6 +828,103 @@ async function runUnitTests() {
     });
     assert(hedgedLostOutcome.kind === 'hedged_lost', `Losing hedged dial exits cleanly as hedged_lost (got ${hedgedLostOutcome.kind})`);
     assert(sendSuccessCalls === 0 && sendFailureCalls === 0 && clientWrites === 0 && clientReadCalls === 0, 'Losing hedged dial never touches clientReader, clientWriter, sendSuccess, or sendFailure');
+  }
+
+  // 1.19e Tier 3 Automatic WebSocket Fallback (/brook-ws) & Background QUIC Recovery
+  {
+    const sentFrames = [];
+    const mockSockets = [];
+    class MockWebSocket {
+      constructor(url) {
+        this.url = url;
+        this.readyState = 0;
+        this.binaryType = 'arraybuffer';
+        this.bufferedAmount = 0;
+        mockSockets.push(this);
+        queueMicrotask(() => {
+          this.readyState = 1;
+          if (this.onopen) this.onopen();
+        });
+      }
+      send(data) {
+        const u8 = data instanceof Uint8Array ? data : new Uint8Array(data);
+        sentFrames.push(new Uint8Array(u8));
+        const frameType = u8[0];
+        const sid = ((u8[1] << 24) | (u8[2] << 16) | (u8[3] << 8) | u8[4]) >>> 0;
+        // Echo DATA back as DATA + FIN on OPEN/DATA/FIN, or PONG on PING
+        if (frameType === WS_FRAME_PING) {
+          const pong = new Uint8Array([WS_FRAME_PONG, 0, 0, 0, 0]);
+          queueMicrotask(() => this.onmessage && this.onmessage({ data: pong.buffer }));
+        } else if (frameType === WS_FRAME_OPEN && u8.length > 5) {
+          const resp = new Uint8Array(u8.length);
+          resp[0] = WS_FRAME_DATA;
+          resp.set(u8.subarray(1), 1);
+          queueMicrotask(() => this.onmessage && this.onmessage({ data: resp.buffer }));
+        } else if (frameType === WS_FRAME_FIN) {
+          const fin = new Uint8Array([WS_FRAME_FIN, (sid >>> 24) & 0xff, (sid >>> 16) & 0xff, (sid >>> 8) & 0xff, sid & 0xff]);
+          queueMicrotask(() => this.onmessage && this.onmessage({ data: fin.buffer }));
+        }
+      }
+      close() {
+        if (this.readyState === 3) return;
+        this.readyState = 3;
+        if (this.onclose) this.onclose();
+      }
+    }
+
+    let quicBlocked = true;
+    const fbMgr = new WebTransportConnectionManager({
+      serverHost: '127.0.0.1',
+      serverPort: 4433,
+      wsPath: '/brook-ws',
+      poolSize: 5,
+      baseWarmSlots: 2,
+      enableWsFallback: true,
+      wsFallbackFailureThreshold: 2,
+      quicRecoveryProbeIntervalMs: 0,
+      keepaliveIntervalMs: 0,
+      WebSocketClass: MockWebSocket
+    });
+    fbMgr._connectSlot = async (slot) => {
+      if (quicBlocked) {
+        throw new Error(`WebTransport pool #${slot.id + 1} timed out after 10000ms`);
+      }
+      slot.state = 'connected';
+      slot.transport = {
+        close: () => {},
+        createBidirectionalStream: async () => ({
+          readable: new ReadableStream({ start() {} }),
+          writable: new WritableStream({ write() {}, close() {} })
+        })
+      };
+      return slot;
+    };
+
+    // Startup connect with UDP/QUIC blocked -> fails 2 QUIC slots and automatically activates /brook-ws TCP fallback
+    await fbMgr.connect({ staggerMs: 0 });
+    assert(fbMgr.transportMode === 'websocket' && fbMgr.isConnected(), 'WebTransportConnectionManager automatically falls back to /brook-ws when QUIC fails');
+    assert(mockSockets.length >= 1 && mockSockets[0].url === 'wss://127.0.0.1:4433/brook-ws', 'WebSocket fallback dials wss://<host>:<port>/brook-ws on same port');
+
+    // Stream over WS fallback (OPEN + DATA echo + FIN half-close)
+    const wsSess = await fbMgr.createSession();
+    assert(wsSess.transportType === 'websocket' && wsSess.slotId.startsWith('ws:'), 'createSession serves streams over WebSocket fallback while in websocket mode');
+    let rxEcho = '';
+    let rxFin = false;
+    wsSess.registerStream(wsSess.streamId, {
+      onData: (data, fin) => {
+        if (data && data.length > 0) rxEcho += new TextDecoder().decode(data);
+        if (fin) rxFin = true;
+      }
+    });
+    await wsSess.sendStreamData(wsSess.streamId, new TextEncoder().encode('hello-ws-mux'), true);
+    await new Promise(r => setTimeout(r, 20));
+    assert(rxEcho === 'hello-ws-mux' && rxFin === true, 'WsStreamSession multiplexes OPEN/DATA/FIN cleanly with independent half-close');
+
+    // Simulate UDP/QUIC recovering -> background probe restores webtransport mode & drains WS fallback
+    quicBlocked = false;
+    const recovered = await fbMgr._probeQuicRecovery();
+    assert(recovered === true && fbMgr.transportMode === 'webtransport', 'Background QUIC recovery probe automatically switches back from WebSocket to HTTP/3 QUIC');
+    await fbMgr.close();
   }
 
   // 1.20 BrookTunnel clean RESET_STREAM handling (stream_reset after clean frame vs stream_error before data)

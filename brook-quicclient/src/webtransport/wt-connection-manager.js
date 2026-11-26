@@ -5,6 +5,7 @@
  */
 
 import { WtStreamSession } from './wt-stream-adapter.js';
+import { WebSocketConnectionManager } from './ws-connection-manager.js';
 import { BrookTunnel } from '../core/brook-tunnel.js';
 
 export const ConnectionState = {
@@ -19,6 +20,7 @@ export class WebTransportConnectionManager {
     serverHost,
     serverPort,
     path = '/brook',
+    wsPath = '/brook-ws',
     serverCertificateHashes = [],
     poolSize = 5,
     baseWarmSlots = 2,
@@ -27,6 +29,11 @@ export class WebTransportConnectionManager {
     keepaliveIntervalMs = 20000,
     keepaliveIdleThresholdMs = 15000,
     zombieFailureThreshold = 2,
+    enableWsFallback = true,
+    wsFallbackFailureThreshold = 2,
+    quicRecoveryProbeIntervalMs = 60000,
+    wsPoolSize = 2,
+    WebSocketClass = null,
     networkMonitor = null,
     onStateChange = null,
     onLog = null
@@ -34,6 +41,7 @@ export class WebTransportConnectionManager {
     this.serverHost = serverHost;
     this.serverPort = serverPort;
     this.path = path.startsWith('/') ? path : `/${path}`;
+    this.wsPath = wsPath.startsWith('/') ? wsPath : `/${wsPath}`;
     this.serverCertificateHashes = serverCertificateHashes;
     this.poolSize = poolSize || 5;
     this.baseWarmSlots = Math.max(1, Math.min(this.poolSize, baseWarmSlots || 2));
@@ -42,6 +50,12 @@ export class WebTransportConnectionManager {
     this.keepaliveIntervalMs = Math.max(0, keepaliveIntervalMs ?? 20000);
     this.keepaliveIdleThresholdMs = Math.max(1000, keepaliveIdleThresholdMs ?? 15000);
     this.zombieFailureThreshold = Math.max(1, zombieFailureThreshold || 2);
+    // Browser WebSocket cannot use serverCertificateHashes pinning; disable fallback only when custom pinned hashes are set unless explicitly enabled
+    this.enableWsFallback = Boolean(enableWsFallback) && !(serverCertificateHashes && serverCertificateHashes.length > 0);
+    this.wsFallbackFailureThreshold = Math.max(1, wsFallbackFailureThreshold || 2);
+    this.quicRecoveryProbeIntervalMs = Math.max(0, quicRecoveryProbeIntervalMs ?? 60000);
+    this.wsPoolSize = Math.max(1, wsPoolSize || 2);
+    this.WebSocketClass = WebSocketClass;
     this.networkMonitor = networkMonitor;
     this.onStateChange = onStateChange;
     this.onLog = onLog;
@@ -54,6 +68,13 @@ export class WebTransportConnectionManager {
     this._nextConnectSlotIdx = 0;
     this._lastBackgroundWarmAt = 0;
     this._keepaliveTimer = null;
+
+    // Tier 3 automatic WebTransport <-> WebSocket fallback state
+    this.transportMode = 'webtransport'; // 'webtransport' | 'websocket'
+    this.consecutiveQuicConnectFailures = 0;
+    this.wsManager = null;
+    this._quicRecoveryTimer = null;
+    this._probingQuicRecovery = false;
 
     // Initialize pool of independent WebTransport session slots with per-slot health metrics
     this.slots = Array.from({ length: this.poolSize }, (_, index) => ({
@@ -95,6 +116,11 @@ export class WebTransportConnectionManager {
         combined.add(st);
       }
     }
+    if (this.wsManager) {
+      for (const st of this.wsManager.activeStreams) {
+        combined.add(st);
+      }
+    }
     return combined;
   }
 
@@ -125,6 +151,14 @@ export class WebTransportConnectionManager {
     const connectedCount = this.slots.filter(s => s.state === ConnectionState.CONNECTED && s.transport !== null).length;
     const connectingCount = this.slots.filter(s => s.state === ConnectionState.CONNECTING).length;
 
+    if (this.transportMode === 'websocket' && this.wsManager) {
+      const wsConnected = this.wsManager.getConnectedSlotCount();
+      if (wsConnected > 0) {
+        this._setState(ConnectionState.CONNECTED, `WS Fallback (TCP): ${wsConnected}/${this.wsManager.poolSize} active`);
+        return;
+      }
+    }
+
     if (connectedCount > 0) {
       this._setState(ConnectionState.CONNECTED, `Pool: ${connectedCount}/${this.poolSize} active`);
     } else if (connectingCount > 0) {
@@ -153,10 +187,12 @@ export class WebTransportConnectionManager {
     };
 
     const connectedCount = this.slots.filter(s => s.state === ConnectionState.CONNECTED && s.transport !== null).length;
+    const wsConnectedCount = this.wsManager ? this.wsManager.getConnectedSlotCount() : 0;
+    const effectiveConnected = this.transportMode === 'websocket' ? wsConnectedCount : connectedCount;
 
     return {
-      warmStandby: connectedCount,
-      activeSessions: connectedCount,
+      warmStandby: effectiveConnected,
+      activeSessions: effectiveConnected,
       handshakes: 0,
       handshakeQueue: 0,
       hostQueueTotal: dispStats.hostQueueTotal || 0,
@@ -168,34 +204,49 @@ export class WebTransportConnectionManager {
       rxQueuedBytes: tunnelStats.rxQueuedBytes,
       writerWaitMs: tunnelStats.writerWaitMs,
       activeTunnels: this.activeStreams.size,
-      totalStreamsServed: this.totalStreamsServed,
+      totalStreamsServed: this.totalStreamsServed + (this.wsManager ? this.wsManager.totalStreamsServed : 0),
       retries: dispStats.retries || 0,
       packetEvictions: 0,
       poolSize: this.poolSize,
-      connectedPoolSessions: connectedCount
+      connectedPoolSessions: connectedCount,
+      transportMode: this.transportMode,
+      wsFallbackSessions: wsConnectedCount
     };
   }
 
   isConnected() {
-    return this.slots.some(s => s.state === ConnectionState.CONNECTED && s.transport !== null);
+    if (this.slots.some(s => s.state === ConnectionState.CONNECTED && s.transport !== null)) {
+      return true;
+    }
+    return this.transportMode === 'websocket' && Boolean(this.wsManager && this.wsManager.isConnected());
   }
 
   getConnectedSlotCount() {
+    if (this.transportMode === 'websocket' && this.wsManager) {
+      return this.wsManager.getConnectedSlotCount();
+    }
     return this.slots.filter(s => s.state === ConnectionState.CONNECTED && s.transport !== null).length;
   }
 
   /**
-   * Returns true if active Brook traffic flowed on a live QUIC session within windowMs.
+   * Returns true if active Brook traffic flowed on a live QUIC or WebSocket fallback session within windowMs.
    * Used by NetworkMonitor to avoid false-offline transitions when public probe APIs hiccup.
    */
   hasRecentActivity(windowMs = 10000) {
-    return this.isConnected() && this.lastDataActivityAt > 0 && (Date.now() - this.lastDataActivityAt) < windowMs;
+    const quicActive = this.slots.some(s => s.state === ConnectionState.CONNECTED && s.transport !== null) &&
+      this.lastDataActivityAt > 0 && (Date.now() - this.lastDataActivityAt) < windowMs;
+    if (quicActive) return true;
+    return Boolean(this.wsManager && this.wsManager.hasRecentActivity(windowMs));
   }
 
   markActivity(slotId = null) {
     const now = Date.now();
     this.lastActivity = now;
     this.lastDataActivityAt = now;
+    if (typeof slotId === 'string' && slotId.startsWith('ws:')) {
+      if (this.wsManager) this.wsManager.markActivity(slotId);
+      return;
+    }
     if (slotId !== null && slotId !== undefined && this.slots[slotId]) {
       this.slots[slotId].lastActivityAt = now;
     }
@@ -205,10 +256,18 @@ export class WebTransportConnectionManager {
    * Report a successful Brook dial on a pool slot to improve its health score.
    */
   reportSlotSuccess(slotId, dialMs = 0) {
+    if (typeof slotId === 'string' && slotId.startsWith('ws:')) {
+      const now = Date.now();
+      this.lastActivity = now;
+      this.lastDataActivityAt = now;
+      if (this.wsManager) this.wsManager.reportSlotSuccess(slotId, dialMs);
+      return;
+    }
     const slot = (slotId !== null && slotId !== undefined) ? this.slots[slotId] : null;
     const now = Date.now();
     this.lastActivity = now;
     this.lastDataActivityAt = now;
+    this.consecutiveQuicConnectFailures = 0;
     if (!slot) return;
     slot.consecutiveFailures = 0;
     slot.lastSuccessAt = now;
@@ -223,6 +282,10 @@ export class WebTransportConnectionManager {
    * Deprioritizes the slot immediately and evicts zombie sessions after zombieFailureThreshold failures.
    */
   reportSlotFailure(slotId, reason = 'handshake_failed') {
+    if (typeof slotId === 'string' && slotId.startsWith('ws:')) {
+      if (this.wsManager) this.wsManager.reportSlotFailure(slotId, reason);
+      return;
+    }
     const slot = (slotId !== null && slotId !== undefined) ? this.slots[slotId] : null;
     if (!slot) return;
     slot.consecutiveFailures++;
@@ -328,11 +391,92 @@ export class WebTransportConnectionManager {
     }
   }
 
+  _getOrCreateWsManager() {
+    if (!this.wsManager) {
+      this.wsManager = new WebSocketConnectionManager({
+        serverHost: this.serverHost,
+        serverPort: this.serverPort,
+        path: this.wsPath,
+        poolSize: this.wsPoolSize,
+        keepaliveIntervalMs: this.keepaliveIntervalMs,
+        keepaliveIdleThresholdMs: this.keepaliveIdleThresholdMs,
+        zombieFailureThreshold: this.zombieFailureThreshold,
+        networkMonitor: this.networkMonitor,
+        WebSocketClass: this.WebSocketClass,
+        onStateChange: () => this._updateAggregateState(),
+        onLog: this.onLog
+      });
+    }
+    return this.wsManager;
+  }
+
+  _ensureQuicRecoveryLoop() {
+    if (this._quicRecoveryTimer || this.quicRecoveryProbeIntervalMs <= 0 || this.isClosed) return;
+    this._quicRecoveryTimer = setInterval(() => {
+      this._probeQuicRecovery().catch(() => {});
+    }, this.quicRecoveryProbeIntervalMs);
+    if (typeof this._quicRecoveryTimer.unref === 'function') {
+      this._quicRecoveryTimer.unref();
+    }
+  }
+
+  _stopQuicRecoveryLoop() {
+    if (this._quicRecoveryTimer) {
+      clearInterval(this._quicRecoveryTimer);
+      this._quicRecoveryTimer = null;
+    }
+  }
+
+  async _activateWsFallback(reason = 'quic_failed', options = {}) {
+    if (!this.enableWsFallback || this.isClosed) {
+      throw new Error(`WebSocket fallback disabled (${reason})`);
+    }
+    const wasWs = this.transportMode === 'websocket';
+    const wsMgr = this._getOrCreateWsManager();
+    if (!wasWs) {
+      this._log('warning', `🔄 WebTransport/UDP failed (${reason}). Falling back to WebSocket over TCP (${wsMgr.serverUrl})...`);
+    }
+    await wsMgr.connect(options);
+    this.transportMode = 'websocket';
+    this._ensureQuicRecoveryLoop();
+    this._updateAggregateState();
+    return wsMgr;
+  }
+
+  /**
+   * Background QUIC probe while running in WebSocket fallback mode.
+   * Switches new streams back to HTTP/3 QUIC as soon as UDP path recovers.
+   */
+  async _probeQuicRecovery() {
+    if (this.isClosed || this.transportMode !== 'websocket' || this._probingQuicRecovery) return false;
+    if (this.networkMonitor && !this.networkMonitor.isOnline) return false;
+
+    this._probingQuicRecovery = true;
+    try {
+      await this._connectSlot(this.slots[0], { connectTimeoutMs: 6000 });
+      if (this.isClosed) return false;
+      this.transportMode = 'webtransport';
+      this.consecutiveQuicConnectFailures = 0;
+      this._stopQuicRecoveryLoop();
+      this._log('success', '⚡ WebTransport/UDP recovered! Switching new streams back from WebSocket TCP fallback to HTTP/3 QUIC.');
+      this._updateAggregateState();
+      if (this.wsManager) {
+        this.wsManager.drainAndClose();
+      }
+      return true;
+    } catch (e) {
+      return false;
+    } finally {
+      this._probingQuicRecovery = false;
+    }
+  }
+
   /**
    * Reset all active WebTransport sessions and clear all hanging streams.
    */
   resetSession(reason = 'network_offline') {
     this._stopKeepaliveLoop();
+    this._stopQuicRecoveryLoop();
     for (const slot of this.slots) {
       if (slot.connectAbortController) {
         try { slot.connectAbortController.abort(); } catch (e) {}
@@ -349,6 +493,9 @@ export class WebTransportConnectionManager {
       slot.activeStreams.clear();
       slot.state = ConnectionState.DISCONNECTED;
       slot.consecutiveFailures = 0;
+    }
+    if (this.wsManager) {
+      this.wsManager.resetSession(reason);
     }
     this._updateAggregateState();
   }
@@ -406,6 +553,7 @@ export class WebTransportConnectionManager {
         slot.state = ConnectionState.CONNECTED;
         slot.consecutiveFailures = 0;
         slot.lastActivityAt = Date.now();
+        this.consecutiveQuicConnectFailures = 0;
         this._ensureKeepaliveLoop();
 
         // Handle close event
@@ -467,6 +615,16 @@ export class WebTransportConnectionManager {
       }
       throw new Error('Cannot connect WebTransport pool: Network is offline');
     }
+    if (this.transportMode === 'websocket' && this.enableWsFallback) {
+      const wsMgr = this._getOrCreateWsManager();
+      await wsMgr.connect(options);
+      this._ensureQuicRecoveryLoop();
+      this._updateAggregateState();
+      // Opportunistically probe QUIC recovery in background without delaying TCP fallback
+      this._probeQuicRecovery().catch(() => {});
+      return this;
+    }
+
     const targetCount = options.connectAll ? this.slots.length : Math.min(this.baseWarmSlots, this.slots.length);
     if (!this.isConnected()) {
       this._setState(ConnectionState.CONNECTING, `Connecting WebTransport pool (${targetCount}/${this.poolSize} warm sessions)...`);
@@ -485,11 +643,24 @@ export class WebTransportConnectionManager {
     const connectedCount = this.slots.filter(s => s.state === ConnectionState.CONNECTED && s.transport !== null).length;
 
     if (connectedCount === 0) {
+      const rejectedCount = results.filter(r => r.status === 'rejected').length;
+      this.consecutiveQuicConnectFailures += Math.max(1, rejectedCount);
       const firstError = results.find(r => r.status === 'rejected')?.reason;
+
+      if (this.enableWsFallback && this.consecutiveQuicConnectFailures >= this.wsFallbackFailureThreshold) {
+        try {
+          await this._activateWsFallback(firstError?.message || 'QUIC pool connect failed', options);
+          return this;
+        } catch (wsErr) {
+          this._log('warning', `WebSocket TCP fallback also failed: ${wsErr.message}`);
+        }
+      }
+
       this._setState(ConnectionState.DISCONNECTED, `All ${targetCount} pool connections failed`);
       throw firstError || new Error(`Failed to connect WebTransport pool (${targetCount} sessions)`);
     }
 
+    this.consecutiveQuicConnectFailures = 0;
     this._updateAggregateState();
     return this;
   }
@@ -560,6 +731,12 @@ export class WebTransportConnectionManager {
   async createSession(options = {}) {
     if (this.isClosed) throw new Error('WebTransportConnectionManager is closed');
 
+    // If running in WebSocket TCP fallback mode, serve directly via WS pool
+    if (this.transportMode === 'websocket' && this.enableWsFallback) {
+      const wsMgr = this._getOrCreateWsManager();
+      return wsMgr.createSession(options);
+    }
+
     // 1. Find all active connected slots (never disrupt or reject already-working QUIC sessions)
     let connectedSlots = this.slots.filter(s => s.state === ConnectionState.CONNECTED && s.transport !== null);
 
@@ -568,7 +745,21 @@ export class WebTransportConnectionManager {
       if (this.networkMonitor && !this.networkMonitor.isOnline) {
         throw new Error('Cannot create WebTransport stream: Network is offline');
       }
-      await this._connectAnySlot(options);
+      try {
+        await this._connectAnySlot(options);
+        this.consecutiveQuicConnectFailures = 0;
+      } catch (quicErr) {
+        this.consecutiveQuicConnectFailures++;
+        if (this.enableWsFallback && this.consecutiveQuicConnectFailures >= this.wsFallbackFailureThreshold) {
+          try {
+            const wsMgr = await this._activateWsFallback(quicErr?.message || 'QUIC connect failed', options);
+            return wsMgr.createSession(options);
+          } catch (wsErr) {
+            this._log('warning', `WebSocket TCP fallback also failed: ${wsErr.message}`);
+          }
+        }
+        throw quicErr;
+      }
       connectedSlots = this.slots.filter(s => s.state === ConnectionState.CONNECTED && s.transport !== null);
     }
 
@@ -588,7 +779,7 @@ export class WebTransportConnectionManager {
       }
       const desiredSlots = Math.min(
         this.poolSize,
-        Math.max(this.baseWarmSlots, Math.ceil((totalActiveStreams + 1) / this.scaleUpStreamsPerSlot) + 1)
+        Math.max(this.baseWarmSlots, Math.ceil((totalActiveStreams + 1) / this.scaleUpStreamsPerSlot))
       );
       const now = Date.now();
       if (aliveOrConnecting < desiredSlots && (now - this._lastBackgroundWarmAt) >= this.warmStaggerMs) {
@@ -725,6 +916,7 @@ export class WebTransportConnectionManager {
   async close() {
     this.isClosed = true;
     this._stopKeepaliveLoop();
+    this._stopQuicRecoveryLoop();
     this._setState(ConnectionState.DISCONNECTED, 'Stopped by user');
 
     for (const slot of this.slots) {
@@ -740,6 +932,11 @@ export class WebTransportConnectionManager {
         slot.transport = null;
       }
       slot.state = ConnectionState.DISCONNECTED;
+    }
+
+    if (this.wsManager) {
+      try { await this.wsManager.close(); } catch (e) {}
+      this.wsManager = null;
     }
   }
 }

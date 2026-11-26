@@ -110,13 +110,15 @@ type Server struct {
 	ctx       context.Context
 	cancel    context.CancelFunc
 
-	mu         sync.RWMutex
-	closed     bool
-	packetConn net.PacketConn
-	listener   *quic.EarlyListener
-	transport  *quic.Transport
-	wtServer   *webtransport.Server
-	httpServer *http.Server
+	mu           sync.RWMutex
+	closed       bool
+	packetConn   net.PacketConn
+	tcpListener  net.Listener
+	listener     *quic.EarlyListener
+	transport    *quic.Transport
+	wtServer     *webtransport.Server
+	wsHTTPServer *http.Server
+	httpServer   *http.Server
 
 	streamSem chan struct{}
 }
@@ -225,7 +227,50 @@ func (s *Server) ListenAndServe() error {
 	s.transport = tr
 	s.mu.Unlock()
 
-	// Signal that server is bound and ready
+	// Start HTTPS + WebSocket fallback server (/brook-ws) on the exact same TCP port as UDP
+	wsHandler := NewWebSocketHandler(s.Password, s.WithoutBrook, s.TCPTimeout, s.UDPTimeout, maxIdleTimeout, s.streamSem)
+	wsMux := http.NewServeMux()
+	wsMux.HandleFunc("/brook-ws", wsHandler.HandleUpgrade)
+	wsMux.HandleFunc("/ws", wsHandler.HandleUpgrade)
+	wsPort := 4433
+	if uaddr, ok := conn.LocalAddr().(*net.UDPAddr); ok && uaddr.Port > 0 {
+		wsPort = uaddr.Port
+	}
+	altSvcVal := fmt.Sprintf(`h3=":%d"; ma=86400`, wsPort)
+	wsMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Alt-Svc", altSvcVal)
+		http.NotFound(w, r)
+	})
+
+	wsTLSConfig := tlsConfig.Clone()
+	wsTLSConfig.NextProtos = []string{"http/1.1"}
+	tcpLn, tcpErr := net.Listen("tcp", conn.LocalAddr().String())
+	if tcpErr != nil {
+		log.Printf("[Server] Warning: failed to bind TCP WebSocket fallback on %s: %v", conn.LocalAddr().String(), tcpErr)
+	} else {
+		tlsTCPListener := tls.NewListener(tcpLn, wsTLSConfig)
+		wsSrv := &http.Server{
+			Handler:           wsMux,
+			ReadHeaderTimeout: 10 * time.Second,
+		}
+		s.mu.Lock()
+		if s.closed {
+			s.mu.Unlock()
+			_ = tlsTCPListener.Close()
+			return net.ErrClosed
+		}
+		s.tcpListener = tlsTCPListener
+		s.wsHTTPServer = wsSrv
+		s.mu.Unlock()
+
+		go func() {
+			if err := wsSrv.Serve(tlsTCPListener); err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
+				log.Printf("[WebSocket] HTTPS server exited: %v", err)
+			}
+		}()
+	}
+
+	// Signal that server is bound and ready (both UDP QUIC and TCP WebSocket listeners active)
 	s.readyOnce.Do(func() {
 		close(s.ready)
 	})
@@ -260,8 +305,8 @@ func (s *Server) ListenAndServe() error {
 	mux.HandleFunc("/ws", wtHandler.HandleUpgrade)
 	mux.HandleFunc("/webtransport", wtHandler.HandleUpgrade)
 
-	log.Printf("[Server] Unified Brook Server listening on %s (QUIC + WebTransport)", conn.LocalAddr())
-	log.Printf("[Server] Endpoints: quic://%s and https://%s/brook", conn.LocalAddr(), conn.LocalAddr())
+	log.Printf("[Server] Unified Brook Server listening on %s (QUIC + WebTransport + WebSocket TCP)", conn.LocalAddr())
+	log.Printf("[Server] Endpoints: quic://%s, https://%s/brook, wss://%s/brook-ws", conn.LocalAddr(), conn.LocalAddr(), conn.LocalAddr())
 
 	// Connection Accept & Demultiplex Loop
 	for {
@@ -420,6 +465,8 @@ func (s *Server) Close() error {
 	}
 	s.closed = true
 	httpServer := s.httpServer
+	wsHTTPServer := s.wsHTTPServer
+	tcpListener := s.tcpListener
 	listener := s.listener
 	transport := s.transport
 	wtServer := s.wtServer
@@ -433,6 +480,12 @@ func (s *Server) Close() error {
 
 	if httpServer != nil {
 		_ = httpServer.Close()
+	}
+	if wsHTTPServer != nil {
+		_ = wsHTTPServer.Close()
+	}
+	if tcpListener != nil {
+		_ = tcpListener.Close()
 	}
 	if wtServer != nil {
 		_ = wtServer.Close()

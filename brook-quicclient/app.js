@@ -38,7 +38,7 @@ async function bootstrap() {
     modalContainer
   });
 
-  logStream.add('info', `🚀 Brook WebTransport Client IWA v1.41.0 initialized (Engine: Native WebTransport / HTTP/3 QUIC)`);
+  logStream.add('info', `🚀 Brook WebTransport Client IWA v1.42.0 initialized (Engine: Native WebTransport / HTTP/3 QUIC)`);
 
   // Initialize Session Tracker & Telemetry
   sessionTracker = new SessionTracker({
@@ -121,14 +121,16 @@ async function bootstrap() {
           logStream.add('info', `⏱️ Network time sync: local clock drift is ${clockDriftSec > 0 ? '+' : ''}${clockDriftSec}s (auto-compensated)`);
         }
 
-        // 3. Setup Unified WebTransport Manager (adaptive 2->5 session QUIC pool with keepalive & health scoring)
+        // 3. Setup Unified WebTransport Manager (adaptive 2->5 QUIC pool + automatic /brook-ws TCP fallback)
         fallbackWtManager = new WebTransportConnectionManager({
           serverHost: config.serverHost,
           serverPort: config.serverPort,
           path: serverPath,
+          wsPath: '/brook-ws',
           serverCertificateHashes: config.serverCertificateHashes || [],
           poolSize: 5,
           baseWarmSlots: 2,
+          enableWsFallback: true,
           networkMonitor,
           onStateChange: (state, details) => {
             if (uiController) uiController.updateConnectionState(state, details);

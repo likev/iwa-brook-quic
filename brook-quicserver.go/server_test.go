@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/webtransport-go"
 )
@@ -2402,4 +2403,204 @@ func TestCleanFINNoResetStream(t *testing.T) {
 	openAndExpectCleanEOF(targetAddr, "hello-clean-fin")
 	openAndExpectCleanEOF(refusedAddr, "")
 	t.Log("✅ TestCleanFINNoResetStream passed: both normal close and dial refusal delivered clean FIN (io.EOF) without RESET_STREAM")
+}
+
+func TestWebSocketFallbackBrookEchoAndMultiplex(t *testing.T) {
+	echoAddr, cleanupEcho := startEchoServer(t)
+	defer cleanupEcho()
+
+	password := "ws-fallback-test-pass"
+	server, err := NewServer("127.0.0.1:0", password, "", 15, 15, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	go func() { _ = server.ListenAndServe() }()
+	select {
+	case <-server.Ready():
+	case <-time.After(5 * time.Second):
+		t.Fatal("server failed to start")
+	}
+
+	serverAddr := server.LocalAddr().String()
+	dialer := websocket.Dialer{
+		TLSClientConfig:  &tls.Config{InsecureSkipVerify: true},
+		HandshakeTimeout: 5 * time.Second,
+	}
+
+	wsURL := fmt.Sprintf("wss://%s/brook-ws", serverAddr)
+	wsConn, resp, err := dialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("WebSocket dial to %s failed: %v", wsURL, err)
+	}
+	defer wsConn.Close()
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("expected 101 Switching Protocols, got %d", resp.StatusCode)
+	}
+
+	var writeMu sync.Mutex
+	sendFrame := func(frameType uint8, streamID uint32, payload []byte) error {
+		frame := make([]byte, 5+len(payload))
+		frame[0] = frameType
+		binary.BigEndian.PutUint32(frame[1:5], streamID)
+		copy(frame[5:], payload)
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		return wsConn.WriteMessage(websocket.BinaryMessage, frame)
+	}
+
+	// 1. Verify keepalive PING -> PONG
+	if err := sendFrame(wsFramePing, 0, nil); err != nil {
+		t.Fatalf("send ping failed: %v", err)
+	}
+	wsConn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	_, pongMsg, err := wsConn.ReadMessage()
+	if err != nil || len(pongMsg) < 5 || pongMsg[0] != wsFramePong {
+		t.Fatalf("expected wsFramePong, got err=%v msg=%x", err, pongMsg)
+	}
+
+	// 2. Multiplex 10 concurrent Brook encrypted echo streams over single /brook-ws TCP connection
+	const numStreams = 10
+	type streamState struct {
+		ch chan []byte
+	}
+	streams := make(map[uint32]*streamState, numStreams)
+	for i := uint32(1); i <= numStreams; i++ {
+		streams[i] = &streamState{ch: make(chan []byte, 32)}
+	}
+
+	// Reader demux goroutine
+	readDone := make(chan struct{})
+	go func() {
+		defer close(readDone)
+		for {
+			wsConn.SetReadDeadline(time.Now().Add(10 * time.Second))
+			msgType, msg, err := wsConn.ReadMessage()
+			if err != nil {
+				return
+			}
+			if msgType != websocket.BinaryMessage || len(msg) < 5 {
+				continue
+			}
+			ft := msg[0]
+			sid := binary.BigEndian.Uint32(msg[1:5])
+			st := streams[sid]
+			if st == nil {
+				continue
+			}
+			if ft == wsFrameData && len(msg) > 5 {
+				cp := append([]byte(nil), msg[5:]...)
+				st.ch <- cp
+			} else if ft == wsFrameFin || ft == wsFrameRst {
+				close(st.ch)
+			}
+		}
+	}()
+
+	passHash := SHA256Bytes([]byte(password))
+	atyp, addrB, portB, _ := ParseAddress(echoAddr)
+	dstSlice := append([]byte{atyp}, addrB...)
+	dstSlice = append(dstSlice, portB...)
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, numStreams)
+
+	for i := uint32(1); i <= numStreams; i++ {
+		wg.Add(1)
+		go func(sid uint32) {
+			defer wg.Done()
+			cn, _ := GenerateNonce()
+			cnOrig := append([]byte(nil), cn...)
+			ck, _ := DeriveKey(passHash, cn, brookInfo)
+			ca, _ := NewGCMCipher(ck)
+
+			now := time.Now().Unix()
+			if now%2 != 0 {
+				now++
+			}
+			headerBody := make([]byte, 4+len(dstSlice))
+			binary.BigEndian.PutUint32(headerBody[:4], uint32(now))
+			copy(headerBody[4:], dstSlice)
+
+			lenBuf := make([]byte, 2)
+			binary.BigEndian.PutUint16(lenBuf, uint16(len(headerBody)))
+			sealedLen := ca.Seal(nil, cn, lenBuf, nil)
+			NextNonce(cn)
+			sealedHdr := ca.Seal(nil, cn, headerBody, nil)
+			NextNonce(cn)
+
+			msgText := fmt.Sprintf("Hello over /brook-ws stream #%d!", sid)
+			msgLenBuf := make([]byte, 2)
+			binary.BigEndian.PutUint16(msgLenBuf, uint16(len(msgText)))
+			sealedMsgLen := ca.Seal(nil, cn, msgLenBuf, nil)
+			NextNonce(cn)
+			sealedMsg := ca.Seal(nil, cn, []byte(msgText), nil)
+			NextNonce(cn)
+
+			initial := append(cnOrig, sealedLen...)
+			initial = append(initial, sealedHdr...)
+			if err := sendFrame(wsFrameOpen, sid, initial); err != nil {
+				errCh <- fmt.Errorf("stream %d open: %w", sid, err)
+				return
+			}
+			if err := sendFrame(wsFrameData, sid, append(sealedMsgLen, sealedMsg...)); err != nil {
+				errCh <- fmt.Errorf("stream %d data: %w", sid, err)
+				return
+			}
+			// Half-close write side cleanly while still reading response!
+			if err := sendFrame(wsFrameFin, sid, nil); err != nil {
+				errCh <- fmt.Errorf("stream %d fin: %w", sid, err)
+				return
+			}
+
+			// Collect response bytes
+			var respBuf bytes.Buffer
+			deadline := time.After(5 * time.Second)
+			for respBuf.Len() < 12+18+len(msgText)+16 {
+				select {
+				case chunk, ok := <-streams[sid].ch:
+					if !ok {
+						errCh <- fmt.Errorf("stream %d closed early with %d bytes", sid, respBuf.Len())
+						return
+					}
+					respBuf.Write(chunk)
+				case <-deadline:
+					errCh <- fmt.Errorf("stream %d timed out waiting for echo", sid)
+					return
+				}
+			}
+
+			raw := respBuf.Bytes()
+			sn := append([]byte(nil), raw[:12]...)
+			sk, _ := DeriveKey(passHash, sn, brookInfo)
+			sa, _ := NewGCMCipher(sk)
+
+			plainLen, err := sa.Open(nil, sn, raw[12:30], nil)
+			if err != nil {
+				errCh <- fmt.Errorf("stream %d decrypt len: %w", sid, err)
+				return
+			}
+			NextNonce(sn)
+			n := int(binary.BigEndian.Uint16(plainLen))
+			plain, err := sa.Open(nil, sn, raw[30:30+n+16], nil)
+			if err != nil {
+				errCh <- fmt.Errorf("stream %d decrypt payload: %w", sid, err)
+				return
+			}
+			if string(plain) != msgText {
+				errCh <- fmt.Errorf("stream %d mismatch: got %q want %q", sid, string(plain), msgText)
+				return
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatal(err)
+	}
+	_ = wsConn.Close()
+	<-readDone
+	t.Log("✅ TestWebSocketFallbackBrookEchoAndMultiplex passed: PING/PONG + 10 concurrent multiplexed Brook streams with clean FIN half-close over wss://.../brook-ws!")
 }
