@@ -38,7 +38,7 @@ async function bootstrap() {
     modalContainer
   });
 
-  logStream.add('info', `🚀 Brook WebTransport Client IWA v1.39.0 initialized (Engine: Native WebTransport / HTTP/3 QUIC)`);
+  logStream.add('info', `🚀 Brook WebTransport Client IWA v1.40.0 initialized (Engine: Native WebTransport / HTTP/3 QUIC)`);
 
   // Initialize Session Tracker & Telemetry
   sessionTracker = new SessionTracker({
@@ -68,12 +68,31 @@ async function bootstrap() {
           timeoutMs: 3000,
           onStatusChange: async (isOnline) => {
             if (!isOnline) {
-              logStream.add('warning', '⚠️ Network offline detected by probe endpoints. Waiting for network recovery...');
+              logStream.add('warning', '⚠️ Network offline detected by probe endpoints. Pausing TCP listening & QUIC retries (existing QUIC sessions preserved)...');
+              if (fallbackDispatcher) {
+                try {
+                  await fallbackDispatcher.pauseListening('network_offline');
+                } catch (e) {}
+              }
               if (uiController) {
-                uiController.updateConnectionState('reconnecting', 'Offline (Probes Failed)');
+                const quicActive = fallbackWtManager && fallbackWtManager.isConnected();
+                uiController.updateConnectionState(
+                  'reconnecting',
+                  quicActive ? 'Offline (TCP Paused, QUIC Active)' : 'Offline (TCP Paused)'
+                );
               }
             } else {
-              logStream.add('success', '🌐 Network online (probe verified). Resyncing clock & reconnecting WebTransport pool...');
+              logStream.add('success', '🌐 Network online (probe verified). Resuming TCP listening, resyncing clock & reconnecting disconnected WebTransport slots...');
+              if (fallbackDispatcher) {
+                try {
+                  const boundPorts = await fallbackDispatcher.resumeListening('network_online');
+                  if (boundPorts && uiController) {
+                    uiController.updateBoundPorts(boundPorts);
+                  }
+                } catch (e) {
+                  logStream.add('error', `❌ Failed to resume TCP listening: ${e.message}`);
+                }
+              }
               try {
                 const drift = await WebTransportConnectionManager.measureClockDrift();
                 if (fallbackDispatcher) {
@@ -84,12 +103,12 @@ async function bootstrap() {
                 }
               } catch (e) {}
 
-              if (fallbackWtManager) {
+              if (fallbackWtManager && (!networkMonitor || networkMonitor.isOnline)) {
                 try {
                   await fallbackWtManager.connect();
                 } catch (e) {}
               }
-              if (uiController) {
+              if (uiController && (!networkMonitor || networkMonitor.isOnline)) {
                 uiController.updateConnectionState('connected', 'Online');
               }
             }

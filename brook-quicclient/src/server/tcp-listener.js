@@ -131,12 +131,22 @@ export class TcpListener {
         this.onError(err);
       }
     } finally {
-      this.stop();
+      if (this.isListening) {
+        this.stop();
+      }
     }
   }
 
-  async stop() {
-    if (!this.isListening && this.activeSockets.size === 0) return;
+  /**
+   * Stop accepting new TCP connections without closing already-accepted sockets.
+   */
+  async stopListening() {
+    return this.stop({ closeActiveSockets: false });
+  }
+
+  async stop({ closeActiveSockets = true } = {}) {
+    if (!this.isListening && (!closeActiveSockets || this.activeSockets.size === 0)) return;
+    const wasListening = this.isListening;
     this.isListening = false;
 
     // 1. Stop accepting new connections
@@ -156,12 +166,14 @@ export class TcpListener {
     this.serverReader = null;
     this.serverSocket = null;
 
-    // 2. Force close all active client sockets
-    const sockets = Array.from(this.activeSockets);
-    this.activeSockets.clear();
-    await Promise.allSettled(sockets.map(s => s.close().catch(() => {})));
+    // 2. Optionally force close all active client sockets (skipped when pausing listening)
+    if (closeActiveSockets) {
+      const sockets = Array.from(this.activeSockets);
+      this.activeSockets.clear();
+      await Promise.allSettled(sockets.map(s => s.close().catch(() => {})));
+    }
 
-    if (this.onClose) {
+    if (wasListening && this.onClose) {
       this.onClose();
     }
   }

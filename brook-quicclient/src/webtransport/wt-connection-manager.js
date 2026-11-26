@@ -38,6 +38,7 @@ export class WebTransportConnectionManager {
     this.totalStreamsServed = 0;
     this.lastActivity = Date.now();
     this.state = ConnectionState.DISCONNECTED;
+    this._nextConnectSlotIdx = 0;
 
     // Initialize pool of independent WebTransport session slots
     this.slots = Array.from({ length: this.poolSize }, (_, index) => ({
@@ -186,10 +187,10 @@ export class WebTransportConnectionManager {
    */
   async _connectSlot(slot, options = {}) {
     if (this.isClosed) throw new Error('WebTransportConnectionManager is closed');
+    if (slot.state === ConnectionState.CONNECTED && slot.transport) return slot;
     if (this.networkMonitor && !this.networkMonitor.isOnline) {
       throw new Error('Cannot connect WebTransport slot: Network is offline');
     }
-    if (slot.state === ConnectionState.CONNECTED && slot.transport) return slot;
     if (slot.connectPromise) return slot.connectPromise;
 
     slot.state = ConnectionState.CONNECTING;
@@ -211,9 +212,13 @@ export class WebTransportConnectionManager {
 
       try {
         localTransport = new WTClass(url, wtOptions);
+        // Prevent unhandled rejection if timeout/close settles before ready
+        if (localTransport.ready && typeof localTransport.ready.catch === 'function') {
+          localTransport.ready.catch(() => {});
+        }
 
-        // Strict connect timeout (default 5s)
-        const connectTimeoutMs = options.connectTimeoutMs || 5000;
+        // Strict connect timeout (default 10s to tolerate high-RTT / lossy UDP handshakes)
+        const connectTimeoutMs = options.connectTimeoutMs || 10000;
         const timeoutPromise = new Promise((_, reject) => {
           timer = setTimeout(() => reject(new Error(`WebTransport pool #${slot.id + 1} timed out after ${connectTimeoutMs}ms`)), connectTimeoutMs);
         });
@@ -281,10 +286,16 @@ export class WebTransportConnectionManager {
   async connect(options = {}) {
     if (this.isClosed) throw new Error('WebTransportConnectionManager is closed');
     if (this.networkMonitor && !this.networkMonitor.isOnline) {
-      this._setState(ConnectionState.DISCONNECTED, 'Network is offline');
+      if (!this.isConnected()) {
+        this._setState(ConnectionState.DISCONNECTED, 'Network is offline');
+      } else {
+        this._updateAggregateState();
+      }
       throw new Error('Cannot connect WebTransport pool: Network is offline');
     }
-    this._setState(ConnectionState.CONNECTING, `Connecting WebTransport pool (${this.poolSize} sessions)...`);
+    if (!this.isConnected()) {
+      this._setState(ConnectionState.CONNECTING, `Connecting WebTransport pool (${this.poolSize} sessions)...`);
+    }
 
     const results = await Promise.allSettled(this.slots.map(s => this._connectSlot(s, options)));
     const connectedCount = this.slots.filter(s => s.state === ConnectionState.CONNECTED && s.transport !== null).length;
@@ -300,33 +311,80 @@ export class WebTransportConnectionManager {
   }
 
   /**
+   * Race / fallback across up to 2 pool slots (rotating round-robin) so a single
+   * stalled slot never blocks all waiting proxy requests on pool #1.
+   */
+  async _connectAnySlot(options = {}) {
+    if (this.slots.length <= 1) {
+      await this.connect(options);
+      return;
+    }
+
+    const raceWidth = Math.min(options.raceWidth || 2, this.slots.length);
+    const candidates = [];
+
+    // 1. Reuse any slots that are already connecting in flight
+    for (const slot of this.slots) {
+      if (slot.connectPromise) {
+        candidates.push(slot);
+      }
+    }
+
+    // 2. Fill remaining race slots round-robin across disconnected slots
+    if (candidates.length < raceWidth) {
+      const startIdx = this._nextConnectSlotIdx % this.slots.length;
+      let started = 0;
+      for (let offset = 0; offset < this.slots.length && candidates.length < raceWidth; offset++) {
+        const idx = (startIdx + offset) % this.slots.length;
+        const slot = this.slots[idx];
+        if (slot.state === ConnectionState.DISCONNECTED && !slot.connectPromise) {
+          candidates.push(slot);
+          started++;
+        }
+      }
+      if (started > 0) {
+        this._nextConnectSlotIdx = (startIdx + started) % this.slots.length;
+      }
+    }
+
+    if (candidates.length === 0) {
+      return;
+    }
+
+    const racePromises = candidates.map((slot) => {
+      const p = this._connectSlot(slot, options);
+      // Losing/background slot failures must not surface as unhandled rejections
+      p.catch(() => {});
+      return p;
+    });
+
+    try {
+      await Promise.any(racePromises);
+    } catch (aggErr) {
+      const errors = (aggErr && Array.isArray(aggErr.errors)) ? aggErr.errors : [aggErr];
+      const firstErr = errors.find(Boolean) || new Error('Failed to connect any WebTransport pool slot');
+      throw firstErr;
+    }
+
+    this._updateAggregateState();
+  }
+
+  /**
    * Create an on-demand bidirectional stream session.
    * Dispatches request to the least-loaded active WebTransport connection in the pool.
    */
   async createSession(options = {}) {
     if (this.isClosed) throw new Error('WebTransportConnectionManager is closed');
-    if (this.networkMonitor && !this.networkMonitor.isOnline) {
-      throw new Error('Cannot create WebTransport stream: Network is offline');
-    }
 
-    // 1. Find all active connected slots
+    // 1. Find all active connected slots (never disrupt or reject already-working QUIC sessions)
     let connectedSlots = this.slots.filter(s => s.state === ConnectionState.CONNECTED && s.transport !== null);
 
-    // 2. If no slots are connected, connect pool now (lazy connect 1 slot, warm rest in background)
+    // 2. If no slots are connected, only attempt new QUIC connect/retry when network is online
     if (connectedSlots.length === 0) {
-      if (this.slots.length <= 1) {
-        await this.connect(options);
-      } else {
-        // Connect the first slot immediately so the request is served without storm delay,
-        // and warm up the remaining slots in the background.
-        await this._connectSlot(this.slots[0], options);
-        this._updateAggregateState();
-        for (let i = 1; i < this.slots.length; i++) {
-          if (this.slots[i].state === ConnectionState.DISCONNECTED && !this.slots[i].connectPromise) {
-            this._connectSlot(this.slots[i], options).catch(() => {});
-          }
-        }
+      if (this.networkMonitor && !this.networkMonitor.isOnline) {
+        throw new Error('Cannot create WebTransport stream: Network is offline');
       }
+      await this._connectAnySlot(options);
       connectedSlots = this.slots.filter(s => s.state === ConnectionState.CONNECTED && s.transport !== null);
     }
 
@@ -334,10 +392,12 @@ export class WebTransportConnectionManager {
       throw new Error('No active WebTransport connections available in pool');
     }
 
-    // 3. Proactively background-reconnect any disconnected slots to keep pool full
-    for (const slot of this.slots) {
-      if (slot.state === ConnectionState.DISCONNECTED && !slot.connectPromise) {
-        this._connectSlot(slot, options).catch(() => {});
+    // 3. Proactively background-reconnect disconnected slots only when online (pause QUIC retries while offline)
+    if (!this.networkMonitor || this.networkMonitor.isOnline) {
+      for (const slot of this.slots) {
+        if (slot.state === ConnectionState.DISCONNECTED && !slot.connectPromise) {
+          this._connectSlot(slot, options).catch(() => {});
+        }
       }
     }
 

@@ -516,6 +516,173 @@ async function runUnitTests() {
   await offlineDispatcher._handleClient(mockOfflineSocket, 'socks5');
   assert(mockSocketClosed, 'ProxyDispatcher immediately drops incoming client connections when network is offline');
 
+  // 1.19b Offline Probe Preserves Active QUIC & Active TCP Sockets while Stopping TCP Listening & QUIC Retries
+  {
+    // 1) WebTransportConnectionManager keeps already-connected QUIC slot working while blocking QUIC retries
+    let connectSlotCalls = 0;
+    let closeCalls = 0;
+    const partialOnlineWtMgr = new WebTransportConnectionManager({
+      serverHost: '127.0.0.1',
+      serverPort: 4433,
+      poolSize: 3,
+      networkMonitor: failingMonitor
+    });
+    const origConnectSlot = partialOnlineWtMgr._connectSlot.bind(partialOnlineWtMgr);
+    partialOnlineWtMgr._connectSlot = async (slot, opts) => {
+      connectSlotCalls++;
+      return origConnectSlot(slot, opts);
+    };
+    partialOnlineWtMgr.slots[0].state = 'connected';
+    partialOnlineWtMgr.slots[0].transport = {
+      close: () => { closeCalls++; },
+      createBidirectionalStream: async () => ({
+        readable: new ReadableStream({ start() {} }),
+        writable: new WritableStream({ write() {}, close() {} })
+      })
+    };
+
+    const liveStream = await partialOnlineWtMgr.createSession();
+    assert(liveStream !== null, 'createSession continues using already-connected QUIC session even when probe is offline');
+    assert(connectSlotCalls === 0, 'createSession does not fire background QUIC reconnect retries while probe is offline');
+    assert(closeCalls === 0 && partialOnlineWtMgr.slots[0].state === 'connected', 'offline probe does not close working QUIC transport');
+    liveStream.close();
+
+    // connect() should still refuse new QUIC retries while preserving CONNECTED state
+    let connectRejected = false;
+    try {
+      await partialOnlineWtMgr.connect();
+    } catch (e) {
+      connectRejected = e.message.includes('Network is offline');
+    }
+    assert(connectRejected && partialOnlineWtMgr.state === 'connected', 'connect() blocks QUIC retries while offline without marking working pool disconnected');
+
+    // 2) TcpListener.stopListening() stops listening socket without closing active client sockets
+    let serverSocketClosed = false;
+    let readerCancelled = false;
+    let activeClientClosed = false;
+    const pauseListener = new TcpListener({ localPort: 10808 });
+    pauseListener.isListening = true;
+    pauseListener.serverReader = {
+      cancel: async () => { readerCancelled = true; },
+      releaseLock: () => {}
+    };
+    pauseListener.serverSocket = {
+      close: async () => { serverSocketClosed = true; }
+    };
+    pauseListener.activeSockets.add({
+      close: async () => { activeClientClosed = true; }
+    });
+    await pauseListener.stopListening();
+    assert(readerCancelled && serverSocketClosed && !pauseListener.isListening, 'TcpListener.stopListening stops accepting new TCP connections');
+    assert(!activeClientClosed && pauseListener.activeSockets.size === 1, 'TcpListener.stopListening preserves already-accepted TCP sockets');
+    await pauseListener.stop();
+    assert(activeClientClosed && pauseListener.activeSockets.size === 0, 'TcpListener.stop still closes preserved active sockets on full shutdown');
+
+    // 3) ProxyDispatcher.pauseListening() pauses listeners without canceling active handlers
+    let handlerCancelled = false;
+    let listenerStoppedWithoutActiveClose = false;
+    const pauseDispatcher = new ProxyDispatcher({
+      quicManager: partialOnlineWtMgr,
+      sessionTracker: new SessionTracker({}),
+      networkMonitor: failingMonitor
+    });
+    pauseDispatcher.listeners.set('socks5', {
+      localPort: 10808,
+      stopListening: async () => { listenerStoppedWithoutActiveClose = true; },
+      stop: async () => { throw new Error('pauseListening must not call full stop()'); }
+    });
+    pauseDispatcher.activeHandlers.add({
+      cancel: () => { handlerCancelled = true; }
+    });
+    await pauseDispatcher.pauseListening('network_offline');
+    assert(listenerStoppedWithoutActiveClose && pauseDispatcher.listeners.size === 0 && pauseDispatcher.isListeningPaused, 'ProxyDispatcher.pauseListening stops TCP listeners cleanly');
+    assert(!handlerCancelled && pauseDispatcher.activeHandlers.size === 1, 'ProxyDispatcher.pauseListening does not cancel active proxy handlers or QUIC tunnels');
+  }
+
+  // 1.19c WebTransport Pool Racing/Fallback, 10s Connect Timeout & Deduplicated Pool-Down Logging
+  {
+    const wtMgrSrc = fs.readFileSync(new URL('../brook-quicclient/src/webtransport/wt-connection-manager.js', import.meta.url), 'utf8');
+    assert(wtMgrSrc.includes('options.connectTimeoutMs || 10000'), 'WebTransportConnectionManager defaults connectTimeoutMs to 10000ms');
+
+    // Race test: slot 0 stalls/fails, slot 1 succeeds quickly -> createSession succeeds via slot 1 without waiting on slot 0
+    const raceWtMgr = new WebTransportConnectionManager({
+      serverHost: '127.0.0.1',
+      serverPort: 4433,
+      poolSize: 5
+    });
+    const attemptedSlots = [];
+    raceWtMgr._connectSlot = (slot) => {
+      attemptedSlots.push(slot.id);
+      if (slot.id === 0) {
+        slot.state = 'connecting';
+        slot.connectPromise = new Promise((_, reject) => setTimeout(() => {
+          slot.state = 'disconnected';
+          slot.connectPromise = null;
+          reject(new Error('WebTransport pool #1 timed out after 10000ms'));
+        }, 120));
+        return slot.connectPromise;
+      }
+      if (slot.id === 1) {
+        slot.state = 'connecting';
+        slot.connectPromise = new Promise((resolve) => setTimeout(() => {
+          slot.transport = {
+            close: () => {},
+            createBidirectionalStream: async () => ({
+              readable: new ReadableStream({ start() {} }),
+              writable: new WritableStream({ write() {}, close() {} })
+            })
+          };
+          slot.state = 'connected';
+          slot.connectPromise = null;
+          resolve(slot);
+        }, 15));
+        return slot.connectPromise;
+      }
+      return Promise.reject(new Error('background skip'));
+    };
+
+    const tStart = Date.now();
+    const racedStream = await raceWtMgr.createSession();
+    const elapsedMs = Date.now() - tStart;
+    assert(racedStream !== null && elapsedMs < 100, `createSession raced slot #2 to bypass stalled slot #1 (${elapsedMs}ms)`);
+    assert(attemptedSlots.includes(0) && attemptedSlots.includes(1), 'createSession raced multiple pool slots instead of blocking solely on pool #1');
+    racedStream.close();
+    await new Promise(r => setTimeout(r, 140)); // let slot 0 rejection settle cleanly
+
+    // Rotation test: when first raced pair (#1, #2) fails, next attempt rotates to (#3, #4)
+    const rotateWtMgr = new WebTransportConnectionManager({
+      serverHost: '127.0.0.1',
+      serverPort: 4433,
+      poolSize: 5
+    });
+    const round1 = [];
+    const round2 = [];
+    let currentRound = round1;
+    rotateWtMgr._connectSlot = async (slot) => {
+      currentRound.push(slot.id);
+      throw new Error(`WebTransport pool #${slot.id + 1} timed out after 10000ms`);
+    };
+    try { await rotateWtMgr.createSession(); } catch (e) {}
+    currentRound = round2;
+    try { await rotateWtMgr.createSession(); } catch (e) {}
+    assert(round1[0] === 0 && round1[1] === 1 && round2[0] === 2 && round2[1] === 3, `createSession rotates fallback pool slots round-robin (${round1.join(',')} -> ${round2.join(',')})`);
+
+    // Deduplicated logging test
+    const dedupEmitted = [];
+    const dedupDispatcher = new ProxyDispatcher({
+      quicManager: rotateWtMgr,
+      sessionTracker: new SessionTracker({}),
+      onLog: (lvl, msg) => dedupEmitted.push({ lvl, msg })
+    });
+    for (let i = 0; i < 10; i++) {
+      dedupDispatcher._logDeduplicated('warning', 'wt_acquire:timeout', 'WebTransport pool timed out after 10000ms', 50);
+    }
+    assert(dedupEmitted.length === 1, `Deduplicated logger collapsed 10 burst warnings into 1 (got ${dedupEmitted.length})`);
+    await new Promise(r => setTimeout(r, 60));
+    dedupDispatcher._logDeduplicated('warning', 'wt_acquire:timeout', 'WebTransport pool timed out after 10000ms', 50);
+    assert(dedupEmitted.length === 2 && dedupEmitted[1].msg.includes('+9 similar suppressed'), 'Deduplicated logger reports suppressed count after window expires');
+  }
+
   // 1.20 BrookTunnel clean RESET_STREAM handling (stream_reset after clean frame vs stream_error before data)
   const runMockResetTunnel = async ({ sendFrameBeforeReset, partialFrameBeforeReset }) => {
     const pw = 'reset-test-pw';

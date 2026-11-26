@@ -33,6 +33,10 @@ export class ProxyDispatcher {
     this.activeHandlers = new Set();
     this.totalRetries = 0;
     this.isRunning = true;
+    this._listenConfig = null;
+    this.isListeningPaused = false;
+    this._listenerOpSeq = 0;
+    this._dedupLogs = new Map(); // key -> { lastLoggedAt, suppressedCount }
   }
 
   getHostQueueTotal() {
@@ -54,20 +58,46 @@ export class ProxyDispatcher {
   }
 
   /**
-   * Start proxy listener(s) with atomic rollback on failure.
+   * Deduplicate bursty warnings/errors (e.g., pool-down stalls hitting many
+   * concurrent proxy requests at once) within a sliding window.
    */
-  async start({
+  _logDeduplicated(level, key, message, windowMs = 5000) {
+    const now = Date.now();
+    const entry = this._dedupLogs.get(key);
+    if (entry && (now - entry.lastLoggedAt) < windowMs) {
+      entry.suppressedCount++;
+      return false;
+    }
+
+    const suppressed = entry ? entry.suppressedCount : 0;
+    this._dedupLogs.set(key, { lastLoggedAt: now, suppressedCount: 0 });
+
+    if (this._dedupLogs.size > 64) {
+      for (const [k, v] of this._dedupLogs.entries()) {
+        if (now - v.lastLoggedAt >= windowMs * 2) {
+          this._dedupLogs.delete(k);
+        }
+      }
+    }
+
+    const suffix = suppressed > 0 ? ` (+${suppressed} similar suppressed)` : '';
+    this._log(level, `${message}${suffix}`);
+    return true;
+  }
+
+  /**
+   * Bind configured TCP listener(s) with rollback of newly bound listeners on failure.
+   */
+  async _bindListeners({
     socks5Port = 10808,
     httpPort = 8080,
     enableSocks5 = true,
     enableHttp = true,
     autoDetectMode = false
   }) {
-    await this.stop();
-    this.isRunning = true;
-
     let boundS5Port = socks5Port;
     let boundHttpPort = httpPort;
+    const newlyBound = [];
 
     try {
       if (autoDetectMode) {
@@ -84,6 +114,7 @@ export class ProxyDispatcher {
         await listener.start();
         boundS5Port = listener.localPort;
         boundHttpPort = listener.localPort;
+        newlyBound.push(['unified', listener]);
         this.listeners.set('unified', listener);
         this._log('success', `⚡ Unified Auto-Detect Proxy listening on 127.0.0.1:${listener.localPort}`);
       } else {
@@ -100,6 +131,7 @@ export class ProxyDispatcher {
           });
           await s5Listener.start();
           boundS5Port = s5Listener.localPort;
+          newlyBound.push(['socks5', s5Listener]);
           this.listeners.set('socks5', s5Listener);
           this._log('success', `🧦 SOCKS5 Proxy listening on 127.0.0.1:${s5Listener.localPort}`);
         }
@@ -117,6 +149,7 @@ export class ProxyDispatcher {
           });
           await httpListener.start();
           boundHttpPort = httpListener.localPort;
+          newlyBound.push(['http', httpListener]);
           this.listeners.set('http', httpListener);
           this._log('success', `🌐 HTTP/HTTPS Proxy listening on 127.0.0.1:${httpListener.localPort}`);
         }
@@ -127,10 +160,103 @@ export class ProxyDispatcher {
         httpPort: boundHttpPort
       };
     } catch (err) {
+      for (const [name, listener] of newlyBound) {
+        this.listeners.delete(name);
+        try { await listener.stopListening(); } catch (e) {}
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Start proxy listener(s) with atomic rollback on failure.
+   */
+  async start({
+    socks5Port = 10808,
+    httpPort = 8080,
+    enableSocks5 = true,
+    enableHttp = true,
+    autoDetectMode = false
+  }) {
+    await this.stop();
+    this.isRunning = true;
+    this.isListeningPaused = false;
+    this._listenConfig = { socks5Port, httpPort, enableSocks5, enableHttp, autoDetectMode };
+
+    if (this.networkMonitor && !this.networkMonitor.isOnline) {
+      this.isListeningPaused = true;
+      this._log('warning', '⏸️ Network probe offline at startup: TCP listening deferred until online.');
+      return { socks5Port, httpPort };
+    }
+
+    const opSeq = ++this._listenerOpSeq;
+    try {
+      const bound = await this._bindListeners(this._listenConfig);
+      if (opSeq !== this._listenerOpSeq || !this.isRunning || this.isListeningPaused) {
+        const staleListeners = Array.from(this.listeners.values());
+        this.listeners.clear();
+        for (const listener of staleListeners) {
+          try { await listener.stopListening(); } catch (e) {}
+        }
+      }
+      return bound;
+    } catch (err) {
       // Rollback any successfully bound listeners on failure
       await this.stop();
       throw err;
     }
+  }
+
+  /**
+   * Pause TCP listening without closing already-accepted client sockets or active QUIC tunnels.
+   */
+  async pauseListening(reason = 'network_offline') {
+    this._listenerOpSeq++;
+    if (!this.isRunning || (this.isListeningPaused && this.listeners.size === 0)) return;
+    this.isListeningPaused = true;
+
+    const activeListeners = Array.from(this.listeners.values());
+    this.listeners.clear();
+    for (const listener of activeListeners) {
+      try {
+        await listener.stopListening();
+      } catch (e) {}
+    }
+    this._log('warning', `⏸️ Paused TCP proxy listening (${reason}); existing connections & QUIC sessions remain active.`);
+  }
+
+  /**
+   * Resume TCP listening after a previous pauseListening() call.
+   */
+  async resumeListening(reason = 'network_online') {
+    if (!this.isRunning || !this._listenConfig) return null;
+    if (!this.isListeningPaused && this.listeners.size > 0) {
+      const unified = this.listeners.get('unified');
+      if (unified) {
+        return { socks5Port: unified.localPort, httpPort: unified.localPort };
+      }
+      return {
+        socks5Port: this.listeners.get('socks5')?.localPort ?? this._listenConfig.socks5Port,
+        httpPort: this.listeners.get('http')?.localPort ?? this._listenConfig.httpPort
+      };
+    }
+    if (this.networkMonitor && !this.networkMonitor.isOnline) return null;
+
+    const opSeq = ++this._listenerOpSeq;
+    this.isListeningPaused = false;
+    const bound = await this._bindListeners(this._listenConfig);
+
+    if (opSeq !== this._listenerOpSeq || !this.isRunning || this.isListeningPaused) {
+      const staleListeners = Array.from(this.listeners.values());
+      this.listeners.clear();
+      for (const listener of staleListeners) {
+        try { await listener.stopListening(); } catch (e) {}
+      }
+      return null;
+    }
+
+    this._log('success', `▶️ Resumed TCP proxy listening (${reason}).`);
+    return bound;
   }
 
   /**
@@ -278,13 +404,14 @@ export class ProxyDispatcher {
       let tunnelError = null;
       let finalOutcome = null;
       let clientDataConsumed = false;
+      let sessionAcquireErrorLogged = false;
       const MAX_ATTEMPTS = 3;
 
       for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
         if (!this.isRunning) {
           throw new Error('ProxyDispatcher was stopped during dial attempt');
         }
-        if (this.networkMonitor && !this.networkMonitor.isOnline) {
+        if (attempt > 1 && this.networkMonitor && !this.networkMonitor.isOnline) {
           throw new Error('Network is offline');
         }
 
@@ -296,11 +423,21 @@ export class ProxyDispatcher {
           quicSession = await this.quicManager.createSession();
         } catch (sessErr) {
           tunnelError = sessErr;
-          if (attempt === MAX_ATTEMPTS) {
-            this._log('error', `[#${session.id}] ❌ Failed to acquire WebTransport session for ${targetStr}: ${sessErr.message}`);
+          if (attempt === MAX_ATTEMPTS || (this.networkMonitor && !this.networkMonitor.isOnline)) {
+            const errMsg = sessErr?.message || String(sessErr);
+            const dedupKey = `wt_acquire:${errMsg.replace(/#\d+/g, '#N')}`;
+            this._logDeduplicated(
+              'warning',
+              dedupKey,
+              `[#${session.id}] ❌ Failed to acquire WebTransport session for ${targetStr}: ${errMsg}`
+            );
+            sessionAcquireErrorLogged = true;
             break;
           }
-          await new Promise(r => setTimeout(r, 300));
+          // Short exponential backoff with jitter (500ms, 1000ms) when pool is down
+          const baseBackoffMs = Math.min(2000, 500 * Math.pow(2, attempt - 1));
+          const jitterMs = Math.floor(Math.random() * 150);
+          await new Promise(r => setTimeout(r, baseBackoffMs + jitterMs));
           continue;
         }
 
@@ -354,6 +491,9 @@ export class ProxyDispatcher {
             }
 
             if (attempt < MAX_ATTEMPTS) {
+              if (this.networkMonitor && !this.networkMonitor.isOnline) {
+                break;
+              }
               this.totalRetries++;
               this._log('warning', `[#${session?.id}] ⚠️ [Brook] Dial attempt ${attempt} for ${targetStr} failed (${outcome.kind}). Retrying with fresh session (${attempt + 1}/${MAX_ATTEMPTS})...`);
               await new Promise(r => setTimeout(r, 300));
@@ -373,8 +513,10 @@ export class ProxyDispatcher {
         // Normal keep-alive socket expiration or clean transport/stream closure after data exchange is not a critical error
         if ((finalOutcome?.kind === 'idle_timeout' || finalOutcome?.kind === 'transport_closed' || finalOutcome?.kind === 'stream_reset') && finalOutcome?.bytesReceived > 0) {
           this._log('info', `[#${session?.id}] Proxy session closed (${finalOutcome.kind}, ${finalOutcome.bytesReceived}B transferred)`);
-        } else {
-          this._log('warning', `Proxy session error: ${tunnelError.message || tunnelError}`);
+        } else if (!sessionAcquireErrorLogged) {
+          const errMsg = tunnelError.message || String(tunnelError);
+          const dedupKey = `proxy_err:${errMsg.replace(/#\d+/g, '#N')}`;
+          this._logDeduplicated('warning', dedupKey, `Proxy session error: ${errMsg}`);
         }
       }
     } catch (err) {
@@ -394,7 +536,10 @@ export class ProxyDispatcher {
   }
 
   async stop() {
+    this._listenerOpSeq++;
     this.isRunning = false;
+    this.isListeningPaused = false;
+    this._dedupLogs.clear();
 
     // 1. Stop all listeners
     for (const [name, listener] of this.listeners.entries()) {
