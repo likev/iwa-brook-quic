@@ -4,9 +4,10 @@
  */
 
 export class WtStreamSession {
-  constructor({ bidiStream, streamId = 0, onClose = null, onLog = null }) {
+  constructor({ bidiStream, streamId = 0, slotId = null, onClose = null, onLog = null }) {
     this.bidiStream = bidiStream;
     this.streamId = streamId;
+    this.slotId = slotId;
     this.onCloseCallback = onClose;
     this.onLog = onLog;
 

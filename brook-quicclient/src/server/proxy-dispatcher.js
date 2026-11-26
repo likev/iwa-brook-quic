@@ -19,6 +19,7 @@ export class ProxyDispatcher {
     withoutBrook = true,
     clockOffsetSec = 0,
     networkMonitor = null,
+    hedgeDelayMs = 2500,
     onLog
   }) {
     this.quicManager = quicManager;
@@ -27,6 +28,7 @@ export class ProxyDispatcher {
     this.withoutBrook = withoutBrook;
     this.clockOffsetSec = clockOffsetSec;
     this.networkMonitor = networkMonitor;
+    this.hedgeDelayMs = Math.max(0, hedgeDelayMs ?? 2500);
     this.onLog = onLog;
 
     this.listeners = new Map(); // name -> TcpListener
@@ -306,6 +308,7 @@ export class ProxyDispatcher {
     let reader = null;
     let writer = null;
     let quicSession = null;
+    let hedgedQuicSession = null;
     let session = null;
 
     if (handlerEntry) {
@@ -314,6 +317,7 @@ export class ProxyDispatcher {
         try { if (reader) reader.cancel().catch(() => {}); } catch (e) {}
         try { if (writer) writer.close().catch(() => {}); } catch (e) {}
         try { if (quicSession) quicSession.close(); } catch (e) {}
+        try { if (hedgedQuicSession) hedgedQuicSession.close(); } catch (e) {}
       };
     }
 
@@ -405,7 +409,14 @@ export class ProxyDispatcher {
       let finalOutcome = null;
       let clientDataConsumed = false;
       let sessionAcquireErrorLogged = false;
+      const triedSlotIds = new Set();
       const MAX_ATTEMPTS = 3;
+      const SLOT_FAILURE_KINDS = new Set([
+        'handshake_timeout',
+        'stream_error',
+        'transport_closed',
+        'upstream_write_failed'
+      ]);
 
       for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
         if (!this.isRunning) {
@@ -419,8 +430,9 @@ export class ProxyDispatcher {
         // Assign to outer `quicSession` (no shadowing) so handlerEntry.cancel()
         // closes the live session on dropAllConnections/stop().
         quicSession = null;
+        hedgedQuicSession = null;
         try {
-          quicSession = await this.quicManager.createSession();
+          quicSession = await this.quicManager.createSession({ excludeSlotIds: triedSlotIds });
         } catch (sessErr) {
           tunnelError = sessErr;
           if (attempt === MAX_ATTEMPTS || (this.networkMonitor && !this.networkMonitor.isOnline)) {
@@ -441,48 +453,224 @@ export class ProxyDispatcher {
           continue;
         }
 
+        const primarySession = quicSession;
+        const primarySlotId = primarySession?.slotId ?? null;
+        if (primarySlotId !== null) {
+          triedSlotIds.add(primarySlotId);
+        }
+
         const dialTimeoutMs = attempt === 1 ? 6000 : (attempt === 2 ? 8000 : 10000);
+        const canHedge = attempt === 1 &&
+          (!leftover || leftover.length === 0) &&
+          this.hedgeDelayMs > 0 &&
+          typeof this.quicManager.getConnectedSlotCount === 'function' &&
+          this.quicManager.getConnectedSlotCount() >= 2;
+
         let outcome = null;
+        let activeSlotId = primarySlotId;
 
         try {
-          outcome = await BrookTunnel.run({
-            clientReader: reader,
-            clientWriter: writer,
-            quicManager: quicSession,
-            dstBytes: dstBytes,
-            leftover,
-            password: this.password,
-            withoutBrook: this.withoutBrook,
-            clockOffsetSec: this.clockOffsetSec,
-            targetStr,
-            sessionId: session.id,
-            sendSuccess: sendSuccessOnce,
-            sendFailure: attempt === MAX_ATTEMPTS ? sendFailureOnce : null,
-            dialTimeoutMs,
-            closeClientStreams: attempt === MAX_ATTEMPTS,
-            onClientDataRead: () => {
-              clientDataConsumed = true;
-            },
-            onBytes: (sent, recv) => {
-              this.sessionTracker.recordBytes(session.id, sent, recv);
-            },
-            onClose: () => {
-              if (quicSession) {
-                quicSession.close();
+          if (canHedge) {
+            let clientClaimed = false;
+            let winningRole = null;
+            let primarySettled = false;
+            let hedgeTimer = null;
+            let hedgePromise = null;
+            let hedgeSlotId = null;
+
+            const clearHedgeTimer = () => {
+              if (hedgeTimer) {
+                clearTimeout(hedgeTimer);
+                hedgeTimer = null;
               }
-            },
-            onLog: (lvl, msg) => this._log(lvl, msg)
-          });
+            };
+
+            const primaryPromise = BrookTunnel.run({
+              clientReader: reader,
+              clientWriter: writer,
+              quicManager: primarySession,
+              dstBytes,
+              leftover,
+              password: this.password,
+              withoutBrook: this.withoutBrook,
+              clockOffsetSec: this.clockOffsetSec,
+              targetStr,
+              sessionId: session.id,
+              sendSuccess: sendSuccessOnce,
+              sendFailure: null,
+              dialTimeoutMs,
+              closeClientStreams: false,
+              claimClient: () => {
+                if (clientClaimed) return false;
+                clientClaimed = true;
+                winningRole = 'primary';
+                clearHedgeTimer();
+                if (hedgedQuicSession) {
+                  try { hedgedQuicSession.close(); } catch (e) {}
+                }
+                return true;
+              },
+              onClientDataRead: () => {
+                clientDataConsumed = true;
+              },
+              onBytes: (sent, recv) => {
+                this.sessionTracker.recordBytes(session.id, sent, recv);
+                if (this.quicManager.markActivity) {
+                  this.quicManager.markActivity(primarySlotId);
+                }
+              },
+              onClose: () => {
+                try { primarySession.close(); } catch (e) {}
+              },
+              onLog: (lvl, msg) => this._log(lvl, msg)
+            });
+
+            hedgeTimer = setTimeout(() => {
+              hedgeTimer = null;
+              if (clientClaimed || primarySettled || !this.isRunning) return;
+              if (this.networkMonitor && !this.networkMonitor.isOnline) return;
+
+              hedgePromise = (async () => {
+                let hSess = null;
+                try {
+                  hSess = await this.quicManager.createSession({ excludeSlotIds: triedSlotIds });
+                } catch (e) {
+                  return null;
+                }
+                if (clientClaimed || primarySettled || !this.isRunning) {
+                  try { hSess.close(); } catch (e) {}
+                  return null;
+                }
+                hedgeSlotId = hSess?.slotId ?? null;
+                if (hedgeSlotId !== null && triedSlotIds.has(hedgeSlotId)) {
+                  try { hSess.close(); } catch (e) {}
+                  return null;
+                }
+                if (hedgeSlotId !== null) {
+                  triedSlotIds.add(hedgeSlotId);
+                }
+                hedgedQuicSession = hSess;
+                this._log('info', `[#${session.id}] ⚡ Hedging slow dial for ${targetStr} onto pool #${(hedgeSlotId ?? 0) + 1}...`);
+
+                return BrookTunnel.run({
+                  clientReader: reader,
+                  clientWriter: writer,
+                  quicManager: hSess,
+                  dstBytes,
+                  leftover,
+                  password: this.password,
+                  withoutBrook: this.withoutBrook,
+                  clockOffsetSec: this.clockOffsetSec,
+                  targetStr,
+                  sessionId: session.id,
+                  sendSuccess: sendSuccessOnce,
+                  sendFailure: null,
+                  dialTimeoutMs,
+                  closeClientStreams: false,
+                  claimClient: () => {
+                    if (clientClaimed) return false;
+                    clientClaimed = true;
+                    winningRole = 'hedge';
+                    try { primarySession.close(); } catch (e) {}
+                    return true;
+                  },
+                  onClientDataRead: () => {
+                    clientDataConsumed = true;
+                  },
+                  onBytes: (sent, recv) => {
+                    this.sessionTracker.recordBytes(session.id, sent, recv);
+                    if (this.quicManager.markActivity) {
+                      this.quicManager.markActivity(hedgeSlotId);
+                    }
+                  },
+                  onClose: () => {
+                    try { hSess.close(); } catch (e) {}
+                  },
+                  onLog: (lvl, msg) => this._log(lvl, msg)
+                });
+              })();
+            }, this.hedgeDelayMs);
+
+            const primaryOutcome = await primaryPromise;
+            primarySettled = true;
+            clearHedgeTimer();
+
+            let hedgeOutcome = null;
+            if (hedgePromise) {
+              hedgeOutcome = await hedgePromise;
+            }
+
+            if (winningRole === 'hedge' && hedgeOutcome) {
+              outcome = hedgeOutcome;
+              activeSlotId = hedgeSlotId;
+              // Report primary failure only if it actually timed out/errored before losing
+              if (!primaryOutcome.serverHandshakeDone && SLOT_FAILURE_KINDS.has(primaryOutcome.kind) && this.quicManager.reportSlotFailure) {
+                this.quicManager.reportSlotFailure(primarySlotId, primaryOutcome.kind);
+              }
+            } else {
+              outcome = primaryOutcome;
+              activeSlotId = primarySlotId;
+              if (hedgeOutcome && !hedgeOutcome.serverHandshakeDone && SLOT_FAILURE_KINDS.has(hedgeOutcome.kind) && this.quicManager.reportSlotFailure) {
+                this.quicManager.reportSlotFailure(hedgeSlotId, hedgeOutcome.kind);
+              }
+            }
+          } else {
+            outcome = await BrookTunnel.run({
+              clientReader: reader,
+              clientWriter: writer,
+              quicManager: primarySession,
+              dstBytes: dstBytes,
+              leftover,
+              password: this.password,
+              withoutBrook: this.withoutBrook,
+              clockOffsetSec: this.clockOffsetSec,
+              targetStr,
+              sessionId: session.id,
+              sendSuccess: sendSuccessOnce,
+              sendFailure: attempt === MAX_ATTEMPTS ? sendFailureOnce : null,
+              dialTimeoutMs,
+              closeClientStreams: attempt === MAX_ATTEMPTS,
+              onClientDataRead: () => {
+                clientDataConsumed = true;
+              },
+              onBytes: (sent, recv) => {
+                this.sessionTracker.recordBytes(session.id, sent, recv);
+                if (this.quicManager.markActivity) {
+                  this.quicManager.markActivity(primarySlotId);
+                }
+              },
+              onClose: () => {
+                if (primarySession) {
+                  primarySession.close();
+                }
+              },
+              onLog: (lvl, msg) => this._log(lvl, msg)
+            });
+          }
 
           finalOutcome = outcome;
+
+          // Update per-slot health metrics based on handshake outcome
+          if (outcome.serverHandshakeDone) {
+            if (this.quicManager.reportSlotSuccess) {
+              this.quicManager.reportSlotSuccess(activeSlotId, outcome.dialDurationMs || 0);
+            }
+          } else if (SLOT_FAILURE_KINDS.has(outcome.kind)) {
+            if (this.quicManager.reportSlotFailure) {
+              this.quicManager.reportSlotFailure(activeSlotId, outcome.kind);
+            }
+          }
 
           if (outcome.success) {
             tunnelError = null;
             break;
           } else {
             tunnelError = outcome.error || new Error(`Brook tunnel failed (${outcome.kind})`);
-            if (quicSession) {
-              quicSession.close();
+            if (primarySession) {
+              try { primarySession.close(); } catch (e) {}
+            }
+            if (hedgedQuicSession) {
+              try { hedgedQuicSession.close(); } catch (e) {}
             }
 
             const bytesReceived = outcome ? outcome.bytesReceived : 0;
@@ -501,8 +689,11 @@ export class ProxyDispatcher {
           }
         } catch (runErr) {
           tunnelError = runErr;
-          if (quicSession) {
-            quicSession.close();
+          if (primarySession) {
+            try { primarySession.close(); } catch (e) {}
+          }
+          if (hedgedQuicSession) {
+            try { hedgedQuicSession.close(); } catch (e) {}
           }
           break;
         }

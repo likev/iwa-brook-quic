@@ -5,13 +5,16 @@ import (
 	"net"
 	"net/http"
 
-	"github.com/quic-go/quic-go/http3"
+	"github.com/quic-go/quic-go"
 	"github.com/quic-go/webtransport-go"
 )
 
-// WTStreamConn wraps a webtransport.Stream as a net.Conn / StreamConn.
+// quicConnContextKey stores the underlying *quic.Conn in HTTP/3 request contexts via ConnContext.
+type quicConnContextKey struct{}
+
+// WTStreamConn wraps a *webtransport.Stream as a net.Conn / StreamConn.
 type WTStreamConn struct {
-	webtransport.Stream
+	*webtransport.Stream
 	localAddr  net.Addr
 	remoteAddr net.Addr
 }
@@ -54,16 +57,13 @@ func NewWebTransportHandler(wtServer *webtransport.Server, password []byte, with
 }
 
 func (h *WebTransportHandler) HandleUpgrade(w http.ResponseWriter, r *http.Request) {
-	var h3Conn http3.Connection
-	if hijacker, ok := w.(http3.Hijacker); ok {
-		h3Conn = hijacker.Connection()
-	}
+	qconn, _ := r.Context().Value(quicConnContextKey{}).(*quic.Conn)
 
 	session, err := h.server.Upgrade(w, r)
 	if err != nil {
 		log.Printf("[WebTransport] Upgrade failed from %s: %v", r.RemoteAddr, err)
-		if h3Conn != nil {
-			_ = h3Conn.CloseWithError(0, "upgrade failed")
+		if qconn != nil {
+			_ = qconn.CloseWithError(0, "upgrade failed")
 		}
 		return
 	}
@@ -72,11 +72,21 @@ func (h *WebTransportHandler) HandleUpgrade(w http.ResponseWriter, r *http.Reque
 	localAddr := session.LocalAddr()
 	log.Printf("[WebTransport] Session established from %s (Path: %s)", remoteAddr, r.URL.Path)
 
+	// Drain client-side NAT keepalive datagrams so the receive queue stays clear
+	go func() {
+		ctx := session.Context()
+		for {
+			if _, err := session.ReceiveDatagram(ctx); err != nil {
+				return
+			}
+		}
+	}()
+
 	go func() {
 		defer func() {
 			_ = session.CloseWithError(0, "done")
-			if h3Conn != nil {
-				_ = h3Conn.CloseWithError(0, "done")
+			if qconn != nil {
+				_ = qconn.CloseWithError(0, "done")
 			}
 		}()
 		ctx := session.Context()

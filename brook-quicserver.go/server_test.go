@@ -201,8 +201,12 @@ func TestUnifiedServerRawQUICAndWebTransport(t *testing.T) {
 
 	// 2. Test WebTransport Client
 	t.Run("WebTransport Client", func(t *testing.T) {
-		d := webtransport.Dialer{
-			TLSClientConfig: tlsConf,
+		wtTLSConf := &tls.Config{
+			InsecureSkipVerify: true,
+			NextProtos:         []string{"h3"},
+		}
+		d := webtransport.Transport{
+			TLSClientConfig: wtTLSConf,
 		}
 		url := fmt.Sprintf("https://%s/brook", serverAddr)
 		resp, sess, err := d.Dial(context.Background(), url, nil)
@@ -345,7 +349,7 @@ func TestWithoutBrookMode(t *testing.T) {
 	serverAddr := server.LocalAddr().String()
 	tlsConf := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h3"}}
 
-	d := webtransport.Dialer{TLSClientConfig: tlsConf}
+	d := webtransport.Transport{TLSClientConfig: tlsConf}
 	_, sess, err := d.Dial(context.Background(), fmt.Sprintf("https://%s/brook", serverAddr), nil)
 	if err != nil {
 		t.Fatal(err)
@@ -424,7 +428,7 @@ func TestConcurrentMultiplexStreams(t *testing.T) {
 	serverAddr := server.LocalAddr().String()
 	tlsConf := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h3"}}
 
-	d := webtransport.Dialer{TLSClientConfig: tlsConf}
+	d := webtransport.Transport{TLSClientConfig: tlsConf}
 	_, sess, err := d.Dial(context.Background(), fmt.Sprintf("https://%s/brook", serverAddr), nil)
 	if err != nil {
 		t.Fatal(err)
@@ -637,7 +641,7 @@ func TestSimultaneousDualClients(t *testing.T) {
 		go func(idx int) {
 			defer wg.Done()
 			tlsConf := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h3"}}
-			d := webtransport.Dialer{TLSClientConfig: tlsConf}
+			d := webtransport.Transport{TLSClientConfig: tlsConf}
 			_, sess, err := d.Dial(context.Background(), fmt.Sprintf("https://%s/brook", serverAddr), nil)
 			if err != nil {
 				errChan <- fmt.Errorf("WT dial %d: %w", idx, err)
@@ -1001,11 +1005,11 @@ func TestConnectionCleanupAfterWebTransport(t *testing.T) {
 
 	for i := 0; i < 10; i++ {
 		func() {
-			var clientConn quic.EarlyConnection
+			var clientConn *quic.Conn
 			tlsConf := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h3"}}
-			d := webtransport.Dialer{
+			d := webtransport.Transport{
 				TLSClientConfig: tlsConf,
-				DialAddr: func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (quic.EarlyConnection, error) {
+				DialAddr: func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
 					c, err := quic.DialAddrEarly(ctx, addr, tlsCfg, cfg)
 					if err == nil {
 						clientConn = c
@@ -1989,11 +1993,11 @@ func TestWebTransportSessionManagerNoLeakAndStreamCancel(t *testing.T) {
 	// Run 20 WebTransport sessions
 	for i := 0; i < 20; i++ {
 		func() {
-			var clientConn quic.EarlyConnection
+			var clientConn *quic.Conn
 			tlsConf := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h3"}}
-			d := webtransport.Dialer{
+			d := webtransport.Transport{
 				TLSClientConfig: tlsConf,
-				DialAddr: func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (quic.EarlyConnection, error) {
+				DialAddr: func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
 					c, err := quic.DialAddrEarly(ctx, addr, tlsCfg, cfg)
 					if err == nil {
 						clientConn = c
@@ -2130,7 +2134,7 @@ func TestWebTransportSessionOnlyCloseNoLeak(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		func() {
 			tlsConf := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h3"}}
-			d := webtransport.Dialer{
+			d := webtransport.Transport{
 				TLSClientConfig: tlsConf,
 			}
 			defer d.Close()
@@ -2295,7 +2299,7 @@ func TestCleanFINNoResetStream(t *testing.T) {
 	}
 	serverAddr := server.LocalAddr().String()
 
-	dialer := &webtransport.Dialer{
+	dialer := &webtransport.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
 	_, sess, err := dialer.Dial(context.Background(), fmt.Sprintf("https://%s/brook", serverAddr), nil)

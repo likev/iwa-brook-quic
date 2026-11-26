@@ -71,6 +71,7 @@ export class BrookTunnel {
     sendFailure = null,
     dialTimeoutMs = 8000,
     closeClientStreams = true,
+    claimClient = null,
     onHandshakeDone = null,
     onClientDataRead = null,
     onBytes,
@@ -201,7 +202,7 @@ export class BrookTunnel {
         }
 
         // If dial never succeeded and client was not notified, signal error
-        if (!serverHandshakeDone && !successSent && sendFailure && closeClientStreams) {
+        if (reason !== 'hedged_lost' && !serverHandshakeDone && !successSent && sendFailure && closeClientStreams) {
           try {
             await sendFailure(0x05);
             sendFailure = null;
@@ -210,7 +211,7 @@ export class BrookTunnel {
 
         // Bounded client stream cleanup: only cancel/close client reader/writer if closeClientStreams is true
         // or if serverHandshakeDone is true (stream was active). Lock release is owned by dispatcher.
-        if (closeClientStreams || serverHandshakeDone) {
+        if (reason !== 'hedged_lost' && (closeClientStreams || serverHandshakeDone)) {
           try {
             await Promise.race([
               clientReader.cancel().catch(() => {}),
@@ -313,6 +314,13 @@ export class BrookTunnel {
               rxOffset += 12;
               sk = await deriveKey(password, sn, 'brook', withoutBrook);
               serverCipher = new BrookCipher(sk);
+
+              // Atomic ownership gate for hedged pre-handshake dials: only one racer may claim client streams
+              if (claimClient && !claimClient()) {
+                cleanup('hedged_lost', new Error('Hedged dial superseded by faster slot'));
+                return;
+              }
+
               serverHandshakeDone = true;
               dialDurationMs = Date.now() - tunnelStartTime;
 
@@ -655,6 +663,7 @@ export class BrookTunnel {
       bytesSent: totalBytesSent,
       bytesReceived: totalBytesRecv,
       serverHandshakeDone,
+      dialDurationMs,
       error: terminationError
     };
   }

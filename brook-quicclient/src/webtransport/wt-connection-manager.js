@@ -21,6 +21,12 @@ export class WebTransportConnectionManager {
     path = '/brook',
     serverCertificateHashes = [],
     poolSize = 5,
+    baseWarmSlots = 2,
+    scaleUpStreamsPerSlot = 16,
+    warmStaggerMs = 600,
+    keepaliveIntervalMs = 20000,
+    keepaliveIdleThresholdMs = 15000,
+    zombieFailureThreshold = 2,
     networkMonitor = null,
     onStateChange = null,
     onLog = null
@@ -30,6 +36,12 @@ export class WebTransportConnectionManager {
     this.path = path.startsWith('/') ? path : `/${path}`;
     this.serverCertificateHashes = serverCertificateHashes;
     this.poolSize = poolSize || 5;
+    this.baseWarmSlots = Math.max(1, Math.min(this.poolSize, baseWarmSlots || 2));
+    this.scaleUpStreamsPerSlot = Math.max(1, scaleUpStreamsPerSlot || 16);
+    this.warmStaggerMs = Math.max(0, warmStaggerMs ?? 600);
+    this.keepaliveIntervalMs = Math.max(0, keepaliveIntervalMs ?? 20000);
+    this.keepaliveIdleThresholdMs = Math.max(1000, keepaliveIdleThresholdMs ?? 15000);
+    this.zombieFailureThreshold = Math.max(1, zombieFailureThreshold || 2);
     this.networkMonitor = networkMonitor;
     this.onStateChange = onStateChange;
     this.onLog = onLog;
@@ -37,10 +49,13 @@ export class WebTransportConnectionManager {
     this.isClosed = false;
     this.totalStreamsServed = 0;
     this.lastActivity = Date.now();
+    this.lastDataActivityAt = 0;
     this.state = ConnectionState.DISCONNECTED;
     this._nextConnectSlotIdx = 0;
+    this._lastBackgroundWarmAt = 0;
+    this._keepaliveTimer = null;
 
-    // Initialize pool of independent WebTransport session slots
+    // Initialize pool of independent WebTransport session slots with per-slot health metrics
     this.slots = Array.from({ length: this.poolSize }, (_, index) => ({
       id: index,
       transport: null,
@@ -48,7 +63,13 @@ export class WebTransportConnectionManager {
       connectPromise: null,
       activeStreams: new Set(),
       totalStreamsServed: 0,
-      nextStreamSeq: index * 2
+      nextStreamSeq: index * 2,
+      consecutiveFailures: 0,
+      ewmaDialMs: 0,
+      lastSuccessAt: 0,
+      lastFailedAt: 0,
+      lastActivityAt: 0,
+      lastKeepaliveAt: 0
     }));
   }
 
@@ -159,10 +180,159 @@ export class WebTransportConnectionManager {
     return this.slots.some(s => s.state === ConnectionState.CONNECTED && s.transport !== null);
   }
 
+  getConnectedSlotCount() {
+    return this.slots.filter(s => s.state === ConnectionState.CONNECTED && s.transport !== null).length;
+  }
+
+  /**
+   * Returns true if active Brook traffic flowed on a live QUIC session within windowMs.
+   * Used by NetworkMonitor to avoid false-offline transitions when public probe APIs hiccup.
+   */
+  hasRecentActivity(windowMs = 10000) {
+    return this.isConnected() && this.lastDataActivityAt > 0 && (Date.now() - this.lastDataActivityAt) < windowMs;
+  }
+
+  markActivity(slotId = null) {
+    const now = Date.now();
+    this.lastActivity = now;
+    this.lastDataActivityAt = now;
+    if (slotId !== null && slotId !== undefined && this.slots[slotId]) {
+      this.slots[slotId].lastActivityAt = now;
+    }
+  }
+
+  /**
+   * Report a successful Brook dial on a pool slot to improve its health score.
+   */
+  reportSlotSuccess(slotId, dialMs = 0) {
+    const slot = (slotId !== null && slotId !== undefined) ? this.slots[slotId] : null;
+    const now = Date.now();
+    this.lastActivity = now;
+    this.lastDataActivityAt = now;
+    if (!slot) return;
+    slot.consecutiveFailures = 0;
+    slot.lastSuccessAt = now;
+    slot.lastActivityAt = now;
+    if (dialMs > 0) {
+      slot.ewmaDialMs = slot.ewmaDialMs > 0 ? Math.round(slot.ewmaDialMs * 0.7 + dialMs * 0.3) : Math.round(dialMs);
+    }
+  }
+
+  /**
+   * Report a pre-handshake / transport failure on a pool slot.
+   * Deprioritizes the slot immediately and evicts zombie sessions after zombieFailureThreshold failures.
+   */
+  reportSlotFailure(slotId, reason = 'handshake_failed') {
+    const slot = (slotId !== null && slotId !== undefined) ? this.slots[slotId] : null;
+    if (!slot) return;
+    slot.consecutiveFailures++;
+    slot.lastFailedAt = Date.now();
+
+    if (slot.consecutiveFailures >= this.zombieFailureThreshold && slot.transport) {
+      const deadTransport = slot.transport;
+      slot.transport = null;
+      slot.state = ConnectionState.DISCONNECTED;
+      slot.consecutiveFailures = 0;
+      try { deadTransport.close(); } catch (e) {}
+      for (const st of Array.from(slot.activeStreams)) {
+        try { st.close(); } catch (e) {}
+      }
+      slot.activeStreams.clear();
+      this._log('warning', `🧹 Evicted zombie WebTransport pool session #${slot.id + 1} (${reason})`);
+      this._updateAggregateState();
+
+      // Proactively replace evicted slot if online and below baseWarmSlots
+      if (!this.isClosed && (!this.networkMonitor || this.networkMonitor.isOnline)) {
+        const aliveOrConnecting = this.slots.filter(
+          s => (s.state === ConnectionState.CONNECTED && s.transport !== null) || s.connectPromise
+        ).length;
+        if (aliveOrConnecting < this.baseWarmSlots) {
+          this._connectSlot(slot).catch(() => {});
+        }
+      }
+    }
+  }
+
+  _ensureKeepaliveLoop() {
+    if (this._keepaliveTimer || this.keepaliveIntervalMs <= 0 || this.isClosed) return;
+    this._keepaliveTimer = setInterval(() => {
+      this._runKeepaliveTick().catch(() => {});
+    }, this.keepaliveIntervalMs);
+    if (typeof this._keepaliveTimer.unref === 'function') {
+      this._keepaliveTimer.unref();
+    }
+  }
+
+  _stopKeepaliveLoop() {
+    if (this._keepaliveTimer) {
+      clearInterval(this._keepaliveTimer);
+      this._keepaliveTimer = null;
+    }
+  }
+
+  async _sendSlotKeepalive(slot) {
+    const transport = slot.transport;
+    if (!transport || slot.state !== ConnectionState.CONNECTED) return false;
+    const writable = transport.datagrams?.writable;
+    if (!writable || typeof writable.getWriter !== 'function') return false;
+
+    let writer = null;
+    let timer = null;
+    try {
+      writer = writable.getWriter();
+      const writePromise = writer.write(new Uint8Array([0x00]));
+      writePromise.catch(() => {});
+      const timeoutPromise = new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error('keepalive datagram timeout')), 1500);
+      });
+      await Promise.race([writePromise, timeoutPromise]);
+      const now = Date.now();
+      slot.lastKeepaliveAt = now;
+      slot.lastActivityAt = now;
+      return true;
+    } catch (err) {
+      if (slot.transport === transport) {
+        this.reportSlotFailure(slot.id, `keepalive_failed: ${err.message || err}`);
+      }
+      return false;
+    } finally {
+      if (timer) clearTimeout(timer);
+      if (writer) {
+        try { writer.releaseLock(); } catch (e) {}
+      }
+    }
+  }
+
+  /**
+   * Lightweight client-side NAT keepalive on up to baseWarmSlots idle connected sessions.
+   */
+  async _runKeepaliveTick() {
+    if (this.isClosed) {
+      this._stopKeepaliveLoop();
+      return;
+    }
+    if (this.networkMonitor && !this.networkMonitor.isOnline) return;
+
+    const connectedSlots = this.slots
+      .filter(s => s.state === ConnectionState.CONNECTED && s.transport !== null)
+      .sort((a, b) => a.consecutiveFailures - b.consecutiveFailures || b.lastSuccessAt - a.lastSuccessAt);
+
+    if (connectedSlots.length === 0) return;
+
+    const now = Date.now();
+    const targets = connectedSlots.slice(0, this.baseWarmSlots);
+    for (const slot of targets) {
+      if (now - slot.lastActivityAt >= this.keepaliveIdleThresholdMs) {
+        await this._sendSlotKeepalive(slot);
+      }
+    }
+  }
+
   /**
    * Reset all active WebTransport sessions and clear all hanging streams.
    */
   resetSession(reason = 'network_offline') {
+    this._stopKeepaliveLoop();
     for (const slot of this.slots) {
       if (slot.connectAbortController) {
         try { slot.connectAbortController.abort(); } catch (e) {}
@@ -178,6 +348,7 @@ export class WebTransportConnectionManager {
       }
       slot.activeStreams.clear();
       slot.state = ConnectionState.DISCONNECTED;
+      slot.consecutiveFailures = 0;
     }
     this._updateAggregateState();
   }
@@ -233,6 +404,9 @@ export class WebTransportConnectionManager {
 
         slot.transport = localTransport;
         slot.state = ConnectionState.CONNECTED;
+        slot.consecutiveFailures = 0;
+        slot.lastActivityAt = Date.now();
+        this._ensureKeepaliveLoop();
 
         // Handle close event
         localTransport.closed
@@ -281,7 +455,7 @@ export class WebTransportConnectionManager {
   }
 
   /**
-   * Establish WebTransport connection pool across all slots in parallel.
+   * Establish WebTransport connection pool adaptively (baseWarmSlots by default, staggered to avoid UDP bursts).
    */
   async connect(options = {}) {
     if (this.isClosed) throw new Error('WebTransportConnectionManager is closed');
@@ -293,17 +467,27 @@ export class WebTransportConnectionManager {
       }
       throw new Error('Cannot connect WebTransport pool: Network is offline');
     }
+    const targetCount = options.connectAll ? this.slots.length : Math.min(this.baseWarmSlots, this.slots.length);
     if (!this.isConnected()) {
-      this._setState(ConnectionState.CONNECTING, `Connecting WebTransport pool (${this.poolSize} sessions)...`);
+      this._setState(ConnectionState.CONNECTING, `Connecting WebTransport pool (${targetCount}/${this.poolSize} warm sessions)...`);
     }
 
-    const results = await Promise.allSettled(this.slots.map(s => this._connectSlot(s, options)));
+    const slotsToConnect = this.slots.slice(0, targetCount);
+    const staggerMs = options.staggerMs !== undefined ? options.staggerMs : 200;
+    const connectPromises = slotsToConnect.map((slot, idx) => (async () => {
+      if (idx > 0 && staggerMs > 0 && slot.state === ConnectionState.DISCONNECTED && !slot.connectPromise) {
+        await new Promise(r => setTimeout(r, idx * staggerMs));
+      }
+      return this._connectSlot(slot, options);
+    })());
+
+    const results = await Promise.allSettled(connectPromises);
     const connectedCount = this.slots.filter(s => s.state === ConnectionState.CONNECTED && s.transport !== null).length;
 
     if (connectedCount === 0) {
       const firstError = results.find(r => r.status === 'rejected')?.reason;
-      this._setState(ConnectionState.DISCONNECTED, `All ${this.poolSize} pool connections failed`);
-      throw firstError || new Error(`Failed to connect WebTransport pool (${this.poolSize} sessions)`);
+      this._setState(ConnectionState.DISCONNECTED, `All ${targetCount} pool connections failed`);
+      throw firstError || new Error(`Failed to connect WebTransport pool (${targetCount} sessions)`);
     }
 
     this._updateAggregateState();
@@ -392,17 +576,53 @@ export class WebTransportConnectionManager {
       throw new Error('No active WebTransport connections available in pool');
     }
 
-    // 3. Proactively background-reconnect disconnected slots only when online (pause QUIC retries while offline)
+    // 3. Adaptive, staggered background warming only when online (pause QUIC retries while offline)
     if (!this.networkMonitor || this.networkMonitor.isOnline) {
-      for (const slot of this.slots) {
-        if (slot.state === ConnectionState.DISCONNECTED && !slot.connectPromise) {
-          this._connectSlot(slot, options).catch(() => {});
+      let totalActiveStreams = 0;
+      let aliveOrConnecting = 0;
+      for (const s of this.slots) {
+        totalActiveStreams += s.activeStreams.size;
+        if ((s.state === ConnectionState.CONNECTED && s.transport !== null) || s.connectPromise) {
+          aliveOrConnecting++;
+        }
+      }
+      const desiredSlots = Math.min(
+        this.poolSize,
+        Math.max(this.baseWarmSlots, Math.ceil((totalActiveStreams + 1) / this.scaleUpStreamsPerSlot) + 1)
+      );
+      const now = Date.now();
+      if (aliveOrConnecting < desiredSlots && (now - this._lastBackgroundWarmAt) >= this.warmStaggerMs) {
+        const startIdx = this._nextConnectSlotIdx % this.slots.length;
+        for (let offset = 0; offset < this.slots.length; offset++) {
+          const idx = (startIdx + offset) % this.slots.length;
+          const slot = this.slots[idx];
+          if (slot.state === ConnectionState.DISCONNECTED && !slot.connectPromise) {
+            this._lastBackgroundWarmAt = now;
+            this._nextConnectSlotIdx = (idx + 1) % this.slots.length;
+            this._connectSlot(slot, options).catch(() => {});
+            break;
+          }
         }
       }
     }
 
-    // 4. Select least-loaded slot (fewest active streams)
-    connectedSlots.sort((a, b) => a.activeStreams.size - b.activeStreams.size);
+    // 4. Health-scored slot selection (deprioritize excluded & failing slots, then least-loaded & lowest RTT)
+    const excludeSlotIds = options.excludeSlotIds instanceof Set ? options.excludeSlotIds : null;
+    connectedSlots.sort((a, b) => {
+      const aExcl = excludeSlotIds && excludeSlotIds.has(a.id) ? 1 : 0;
+      const bExcl = excludeSlotIds && excludeSlotIds.has(b.id) ? 1 : 0;
+      if (aExcl !== bExcl) return aExcl - bExcl;
+      if (a.consecutiveFailures !== b.consecutiveFailures) {
+        return a.consecutiveFailures - b.consecutiveFailures;
+      }
+      if (a.activeStreams.size !== b.activeStreams.size) {
+        return a.activeStreams.size - b.activeStreams.size;
+      }
+      if (a.ewmaDialMs > 0 && b.ewmaDialMs > 0 && a.ewmaDialMs !== b.ewmaDialMs) {
+        return a.ewmaDialMs - b.ewmaDialMs;
+      }
+      return a.id - b.id;
+    });
     const chosenSlot = connectedSlots[0];
 
     const streamId = (chosenSlot.nextStreamSeq += 4);
@@ -426,7 +646,10 @@ export class WebTransportConnectionManager {
         chosenSlot.state = ConnectionState.DISCONNECTED;
         try { chosenSlot.transport.close(); } catch (e) {}
         chosenSlot.transport = null;
+        chosenSlot.consecutiveFailures = 0;
         this._updateAggregateState();
+      } else {
+        this.reportSlotFailure(chosenSlot.id, 'stream_alloc_timeout');
       }
       throw err;
     } finally {
@@ -436,6 +659,7 @@ export class WebTransportConnectionManager {
     const streamSession = new WtStreamSession({
       bidiStream,
       streamId,
+      slotId: chosenSlot.id,
       onClose: () => {
         chosenSlot.activeStreams.delete(streamSession);
       },
@@ -444,8 +668,10 @@ export class WebTransportConnectionManager {
 
     chosenSlot.activeStreams.add(streamSession);
     chosenSlot.totalStreamsServed++;
+    const now = Date.now();
+    chosenSlot.lastActivityAt = now;
     this.totalStreamsServed++;
-    this.lastActivity = Date.now();
+    this.lastActivity = now;
 
     return streamSession;
   }
@@ -498,6 +724,7 @@ export class WebTransportConnectionManager {
 
   async close() {
     this.isClosed = true;
+    this._stopKeepaliveLoop();
     this._setState(ConnectionState.DISCONNECTED, 'Stopped by user');
 
     for (const slot of this.slots) {

@@ -24,15 +24,17 @@ export class NetworkMonitor {
     probeUrls = PROBE_URLS,
     checkIntervalMs = 5000,
     timeoutMs = 3000,
-    maxConsecutiveFailures = 3,
+    maxConsecutiveFailures = 2,
+    recentTrafficCheck = null,
     onStatusChange = null,
     onLog = null
   } = {}) {
     this.probeUrls = [...probeUrls];
     this.checkIntervalMs = checkIntervalMs;
     this.timeoutMs = timeoutMs;
-    this.maxConsecutiveFailures = maxConsecutiveFailures;
+    this.maxConsecutiveFailures = Math.max(1, maxConsecutiveFailures);
     this.consecutiveFailures = 0;
+    this.recentTrafficCheck = recentTrafficCheck;
     this.onStatusChange = onStatusChange;
     this.onLog = onLog;
 
@@ -78,20 +80,31 @@ export class NetworkMonitor {
 
       const results = await Promise.allSettled(probePromises);
       const anySuccess = results.some((r) => r.status === 'fulfilled' && r.value === true);
+      let hasRecentTraffic = false;
+      if (!anySuccess && typeof this.recentTrafficCheck === 'function') {
+        try {
+          hasRecentTraffic = Boolean(this.recentTrafficCheck());
+        } catch (e) {}
+      }
 
       this.lastCheckTime = Date.now();
       const wasOnline = this.isOnline;
-      this.isOnline = anySuccess;
 
-      if (anySuccess) {
+      // Asymmetric hysteresis: recover immediately on 1 success (or active Brook QUIC traffic),
+      // require maxConsecutiveFailures consecutive probe failures before transitioning offline.
+      if (anySuccess || hasRecentTraffic) {
         this.consecutiveFailures = 0;
+        this.isOnline = true;
       } else {
         this.consecutiveFailures++;
+        if (this.consecutiveFailures >= this.maxConsecutiveFailures) {
+          this.isOnline = false;
+        }
       }
 
       if (wasOnline !== this.isOnline) {
         if (!this.isOnline) {
-          this._log('warning', `⚠️ Network offline: All ${this.probeUrls.length} probe endpoints failed (timeout: ${this.timeoutMs}ms).`);
+          this._log('warning', `⚠️ Network offline: All ${this.probeUrls.length} probe endpoints failed ${this.consecutiveFailures}x consecutively (timeout: ${this.timeoutMs}ms).`);
         } else {
           this._log('success', `🌐 Network online: Connectivity verified across probe endpoints.`);
         }
@@ -102,7 +115,7 @@ export class NetworkMonitor {
         }
       }
 
-      return anySuccess;
+      return anySuccess || hasRecentTraffic;
     } finally {
       this.isChecking = false;
     }

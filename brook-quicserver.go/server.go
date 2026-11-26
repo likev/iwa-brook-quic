@@ -94,238 +94,6 @@ func takeStreamSlot(sem chan struct{}, remote net.Addr, kind string) bool {
 	}
 }
 
-type bufferedStream struct {
-	quic.Stream
-	r io.Reader
-}
-
-func (b *bufferedStream) Read(p []byte) (int, error) {
-	return b.r.Read(p)
-}
-
-func newBufferedStream(s quic.Stream, prefix []byte) quic.Stream {
-	if len(prefix) == 0 {
-		return s
-	}
-	return &bufferedStream{
-		Stream: s,
-		r:      io.MultiReader(bytes.NewReader(prefix), s),
-	}
-}
-
-type interceptedConn struct {
-	quic.EarlyConnection
-	mu          sync.Mutex
-	uniStreams  []quic.ReceiveStream
-	bidiStreams []quic.Stream
-	uniChan     <-chan quic.ReceiveStream
-	bidiChan    <-chan quic.Stream
-}
-
-func (c *interceptedConn) AcceptUniStream(ctx context.Context) (quic.ReceiveStream, error) {
-	c.mu.Lock()
-	if len(c.uniStreams) > 0 {
-		s := c.uniStreams[0]
-		c.uniStreams[0] = nil
-		c.uniStreams = c.uniStreams[1:]
-		c.mu.Unlock()
-		return s, nil
-	}
-	if c.uniChan != nil {
-		select {
-		case s, ok := <-c.uniChan:
-			if ok && s != nil {
-				c.mu.Unlock()
-				return s, nil
-			}
-		default:
-		}
-	}
-	c.mu.Unlock()
-	return c.EarlyConnection.AcceptUniStream(ctx)
-}
-
-func (c *interceptedConn) AcceptStream(ctx context.Context) (quic.Stream, error) {
-	c.mu.Lock()
-	if len(c.bidiStreams) > 0 {
-		s := c.bidiStreams[0]
-		c.bidiStreams[0] = nil
-		c.bidiStreams = c.bidiStreams[1:]
-		c.mu.Unlock()
-		return s, nil
-	}
-	if c.bidiChan != nil {
-		select {
-		case s, ok := <-c.bidiChan:
-			if ok && s != nil {
-				c.mu.Unlock()
-				return s, nil
-			}
-		default:
-		}
-	}
-	c.mu.Unlock()
-	return c.EarlyConnection.AcceptStream(ctx)
-}
-
-func (c *interceptedConn) CloseWithError(code quic.ApplicationErrorCode, desc string) error {
-	c.mu.Lock()
-	for i, s := range c.uniStreams {
-		if s != nil {
-			s.CancelRead(0)
-			c.uniStreams[i] = nil
-		}
-	}
-	c.uniStreams = nil
-	for i, s := range c.bidiStreams {
-		if s != nil {
-			s.CancelRead(0x100)
-			_ = s.Close()
-			c.bidiStreams[i] = nil
-		}
-	}
-	c.bidiStreams = nil
-	if c.uniChan != nil {
-		for {
-			select {
-			case s, ok := <-c.uniChan:
-				if ok && s != nil {
-					s.CancelRead(0)
-				}
-			default:
-				goto uniDrained
-			}
-		}
-	}
-uniDrained:
-	if c.bidiChan != nil {
-		for {
-			select {
-			case s, ok := <-c.bidiChan:
-				if ok && s != nil {
-					s.CancelRead(0x100)
-					_ = s.Close()
-				}
-			default:
-				goto bidiDrained
-			}
-		}
-	}
-bidiDrained:
-	c.mu.Unlock()
-	return c.EarlyConnection.CloseWithError(code, desc)
-}
-
-// acceptBidiWithContext accepts one bidirectional stream but gives up when ctx
-// expires. The helper goroutine always terminates (AcceptStream unblocks on ctx
-// cancel) and reports through a buffered channel, so no goroutine is leaked.
-func acceptBidiWithContext(conn quic.EarlyConnection, ctx context.Context) (quic.Stream, error) {
-	type res struct {
-		s quic.Stream
-		e error
-	}
-	ch := make(chan res, 1)
-	go func() {
-		s, e := conn.AcceptStream(ctx)
-		ch <- res{s, e}
-	}()
-	select {
-	case r := <-ch:
-		return r.s, r.e
-	case <-ctx.Done():
-		go func() {
-			r := <-ch
-			if r.s != nil {
-				r.s.CancelRead(0x100)
-				_ = r.s.Close()
-			}
-		}()
-		return nil, ctx.Err()
-	}
-}
-
-// controlStreamWait is how long a bidi-first connection with an H3-magic prefix
-// waits for the mandatory HTTP/3 control (uni) stream before concluding it is a
-// raw Brook client whose random nonce collided with H3 framing (~0.78%).
-// 800ms covers CN->US RTTs while keeping misclassified raw streams fast.
-const controlStreamWait = 800 * time.Millisecond
-
-// classifyBidiFirst distinguishes WebTransport/H3 from raw Brook on connections
-// whose first stream is bidirectional. The uni probe must stay alive (probeCtx
-// not canceled) while this runs so a late control stream can still be observed.
-// It returns the buffered first stream, harvested control streams, whether the
-// connection is WebTransport, and whether classification succeeded.
-// A single idle/corrupt stream never fails the connection: it is closed and the
-// next bidi stream is tried within the remaining probe budget.
-func classifyBidiFirst(conn quic.EarlyConnection, first quic.Stream, uniChan <-chan quic.ReceiveStream, probeCtx context.Context) (quic.Stream, []quic.ReceiveStream, bool, bool) {
-	var harvested []quic.ReceiveStream
-	drainUni := func() {
-		for {
-			select {
-			case u, ok := <-uniChan:
-				if ok && u != nil {
-					harvested = append(harvested, u)
-				}
-			default:
-				return
-			}
-		}
-	}
-	bstr := first
-	for {
-		// Bound each peek with a 3-second read deadline to prevent
-		// DoS/goroutine leak from idle clients.
-		_ = bstr.SetReadDeadline(time.Now().Add(3 * time.Second))
-		buf := make([]byte, 2)
-		n, err := io.ReadAtLeast(bstr, buf, 1)
-		_ = bstr.SetReadDeadline(time.Time{})
-		if err != nil {
-			bstr.CancelRead(0x100)
-			_ = bstr.Close()
-			drainUni()
-			select {
-			case <-probeCtx.Done():
-				return nil, harvested, false, false
-			default:
-			}
-			next, aerr := acceptBidiWithContext(conn, probeCtx)
-			if aerr != nil {
-				return nil, harvested, false, false
-			}
-			bstr = next
-			continue
-		}
-		drainUni()
-		if len(harvested) > 0 {
-			// A unidirectional stream (HTTP/3 control stream) is present.
-			// Raw Brook never opens uni streams: this is WebTransport.
-			return newBufferedStream(bstr, buf[:n]), harvested, true, true
-		}
-		if buf[0] == 0x01 || buf[0] == 0x41 || (buf[0] == 0x40 && n >= 2 && buf[1] == 0x41) {
-			// Possible H3 framing: wait for the mandatory control stream.
-			waitCtx, waitCancel := context.WithTimeout(probeCtx, controlStreamWait)
-			select {
-			case u, ok := <-uniChan:
-				if ok && u != nil {
-					harvested = append(harvested, u)
-				}
-			case <-waitCtx.Done():
-			}
-			waitCancel()
-			drainUni()
-			if len(harvested) > 0 {
-				return newBufferedStream(bstr, buf[:n]), harvested, true, true
-			}
-			// No control stream arrived: raw Brook nonce collided with H3
-			// magic. Classify as raw (no magic fallback — the fallback
-			// misclassified ~0.4% of raw connections as WT, stalling them).
-			log.Printf("[Server] bidi-first from %s has H3-magic prefix 0x%02x but no control stream after %v: treating as raw Brook", conn.RemoteAddr(), buf[0], controlStreamWait)
-			return newBufferedStream(bstr, buf[:n]), harvested, false, true
-		}
-		return newBufferedStream(bstr, buf[:n]), harvested, false, true
-	}
-}
-
 // Server is the unified Brook QUIC and WebTransport Server.
 type Server struct {
 	Addr         string
@@ -403,17 +171,19 @@ func (s *Server) ListenAndServe() error {
 	maxIdleTimeout := time.Duration(effectiveTimeout) * time.Second
 
 	quicConfig := &quic.Config{
-		EnableDatagrams:                true,
-		MaxIdleTimeout:                 maxIdleTimeout,
-		KeepAlivePeriod:                0,
-		HandshakeIdleTimeout:           10 * time.Second,
-		Allow0RTT:                      true,
-		MaxIncomingStreams:             1024,
-		MaxIncomingUniStreams:          1024,
-		InitialStreamReceiveWindow:     4 * 1024 * 1024,
-		MaxStreamReceiveWindow:         16 * 1024 * 1024,
-		InitialConnectionReceiveWindow: 8 * 1024 * 1024,
-		MaxConnectionReceiveWindow:     32 * 1024 * 1024,
+		EnableDatagrams:                  true,
+		EnableStreamResetPartialDelivery: true, // Required by webtransport-go v0.13
+		InitialPacketSize:                1200, // Safe MTU avoiding PPPoE/cellular handshake fragmentation
+		MaxIdleTimeout:                   maxIdleTimeout,
+		KeepAlivePeriod:                  0,
+		HandshakeIdleTimeout:             10 * time.Second,
+		Allow0RTT:                        true,
+		MaxIncomingStreams:               1024,
+		MaxIncomingUniStreams:            1024,
+		InitialStreamReceiveWindow:       4 * 1024 * 1024,
+		MaxStreamReceiveWindow:           16 * 1024 * 1024,
+		InitialConnectionReceiveWindow:   8 * 1024 * 1024,
+		MaxConnectionReceiveWindow:       32 * 1024 * 1024,
 	}
 
 	// Resolve UDP address
@@ -462,12 +232,20 @@ func (s *Server) ListenAndServe() error {
 
 	// Setup WebTransport / HTTP/3 server
 	mux := http.NewServeMux()
-	s.wtServer = &webtransport.Server{
-		H3: http3.Server{
-			TLSConfig:  tlsConfig,
-			QUICConfig: quicConfig,
-			Handler:    mux,
+	h3Server := &http3.Server{
+		TLSConfig:       tlsConfig,
+		QUICConfig:      quicConfig,
+		Handler:         mux,
+		EnableDatagrams: true,
+		ConnContext: func(ctx context.Context, c *quic.Conn) context.Context {
+			return context.WithValue(ctx, quicConnContextKey{}, c)
 		},
+	}
+	webtransport.ConfigureHTTP3Server(h3Server)
+
+	s.wtServer = &webtransport.Server{
+		H3:                h3Server,
+		ReorderingTimeout: 5 * time.Second,
 		CheckOrigin: func(r *http.Request) bool {
 			// Allow all origins for proxy tunneling
 			return true
@@ -504,130 +282,24 @@ func (s *Server) ListenAndServe() error {
 	}
 }
 
-func (s *Server) dispatchConnection(conn quic.EarlyConnection) {
+// dispatchConnection performs zero-copy ALPN routing between raw Brook QUIC and WebTransport/HTTP3.
+func (s *Server) dispatchConnection(conn *quic.Conn) {
 	alpn := conn.ConnectionState().TLS.NegotiatedProtocol
 
-	// 1. Direct ALPN match
-	if alpn == "brook-quic" || alpn == "brook" {
+	switch alpn {
+	case "brook-quic", "brook", "":
 		HandleRawQUICConn(conn, s.Password, s.WithoutBrook, s.TCPTimeout, s.UDPTimeout, nil, s.streamSem)
-		conn.CloseWithError(0, "done")
-		return
-	}
+		_ = conn.CloseWithError(0, "done")
 
-	// 2. Multiplexed ALPN "h3" (used by both WebTransport and legacy Brook QUIC clients)
-	uniChan := make(chan quic.ReceiveStream, 1)
-	bidiChan := make(chan quic.Stream, 1)
-
-	probeCtx, cancel := context.WithTimeout(s.ctx, 10*time.Second)
-	defer cancel()
-
-	go func() {
-		ustr, err := conn.AcceptUniStream(probeCtx)
-		if err == nil {
-			uniChan <- ustr
-		}
-	}()
-
-	go func() {
-		bstr, err := conn.AcceptStream(probeCtx)
-		if err == nil {
-			bidiChan <- bstr
-		}
-	}()
-
-	select {
-	case ustr := <-uniChan:
-		// Cancel probeCtx immediately to stop the losing probe goroutine
-		// before ServeQUICConn tries to accept streams on the same connection.
-		cancel()
-		// Client opened a unidirectional stream (HTTP/3 Control Stream). This is WebTransport!
-		iconn := &interceptedConn{
-			EarlyConnection: conn,
-			uniStreams:      []quic.ReceiveStream{ustr},
-			uniChan:         uniChan,
-			bidiChan:        bidiChan,
-		}
-		if err := s.wtServer.ServeQUICConn(iconn); err != nil && err != http.ErrServerClosed && !isNormalStreamClose(err) {
+	case "h3":
+		if err := s.wtServer.ServeQUICConn(conn); err != nil && err != http.ErrServerClosed && !isNormalStreamClose(err) {
 			log.Printf("[WebTransport] Session ended: %v", err)
 		}
-		s.cleanupWebTransportConn(conn)
-		_ = iconn.CloseWithError(0, "done")
+		_ = conn.CloseWithError(0, "done")
 
-	case bstr := <-bidiChan:
-		// NOTE: probeCtx stays alive during classification so the uni probe
-		// can still deliver a late HTTP/3 control stream. It is canceled
-		// right after the routing decision, before ServeQUICConn or the raw
-		// handler takes over the connection.
-		sStream, harvestedUni, isWT, ok := classifyBidiFirst(conn, bstr, uniChan, probeCtx)
-		// Cancel probeCtx now to stop the losing probe goroutine before
-		// handlers try to accept streams on the same connection.
-		cancel()
-		if !ok {
-			for _, u := range harvestedUni {
-				if u != nil {
-					u.CancelRead(0)
-				}
-			}
-			log.Printf("[Server] bidi-first from %s yielded no usable stream before probe expiry: closing connection", conn.RemoteAddr())
-			conn.CloseWithError(0, "probe timeout")
-			return
-		}
-
-		if isWT {
-			// HTTP/3 HEADERS frame (0x01) or WebTransport stream frame (0x41)
-			// Pass any harvested uni control streams to iconn so ServeQUICConn does not stall.
-			iconn := &interceptedConn{
-				EarlyConnection: conn,
-				bidiStreams:     []quic.Stream{sStream},
-				uniStreams:      harvestedUni,
-				uniChan:         uniChan,
-				bidiChan:        bidiChan,
-			}
-			if err := s.wtServer.ServeQUICConn(iconn); err != nil && err != http.ErrServerClosed && !isNormalStreamClose(err) {
-				log.Printf("[WebTransport] Session ended: %v", err)
-			}
-			s.cleanupWebTransportConn(conn)
-			_ = iconn.CloseWithError(0, "done")
-		} else {
-			// Raw Brook QUIC stream (starts with 12-byte random client nonce)
-			for _, u := range harvestedUni {
-				if u != nil {
-					u.CancelRead(0)
-				}
-			}
-			// Drain any orphaned uni stream with a 200ms grace window to prevent leaks.
-			go func() {
-				select {
-				case orphan, ok := <-uniChan:
-					if ok && orphan != nil {
-						orphan.CancelRead(0)
-					}
-				case <-time.After(200 * time.Millisecond):
-				}
-			}()
-			HandleRawQUICConn(conn, s.Password, s.WithoutBrook, s.TCPTimeout, s.UDPTimeout, sStream, s.streamSem)
-			conn.CloseWithError(0, "done")
-		}
-
-	case <-probeCtx.Done():
-		// Timeout waiting for first stream (slowloris protection).
-		log.Printf("[Server] probe timeout, closing connection from %s (no streams in 10s)", conn.RemoteAddr())
-		conn.CloseWithError(0, "probe timeout")
-		select {
-		case s, ok := <-bidiChan:
-			if ok && s != nil {
-				s.CancelRead(0x100)
-				_ = s.Close()
-			}
-		default:
-		}
-		select {
-		case u, ok := <-uniChan:
-			if ok && u != nil {
-				u.CancelRead(0)
-			}
-		default:
-		}
+	default:
+		log.Printf("[Server] Dropping connection from %s with unsupported ALPN: %q", conn.RemoteAddr(), alpn)
+		_ = conn.CloseWithError(0x101, "unsupported ALPN")
 	}
 }
 
@@ -641,7 +313,7 @@ func (s *Server) setupTLS() (*tls.Config, error) {
 		return &tls.Config{
 			Certificates: []tls.Certificate{cert},
 			ServerName:   s.Domain,
-			NextProtos:   []string{"h3", "brook-quic", "brook"},
+			NextProtos:   []string{"brook-quic", "brook", "h3"},
 		}, nil
 	}
 
@@ -676,7 +348,7 @@ func (s *Server) setupTLS() (*tls.Config, error) {
 		return &tls.Config{
 			GetCertificate: m.GetCertificate,
 			ServerName:     s.Domain,
-			NextProtos:     []string{"h3", "brook-quic", "brook"},
+			NextProtos:     []string{"brook-quic", "brook", "h3"},
 		}, nil
 	}
 
@@ -687,7 +359,7 @@ func (s *Server) setupTLS() (*tls.Config, error) {
 	}
 	return &tls.Config{
 		Certificates: []tls.Certificate{*cert},
-		NextProtos:   []string{"h3", "brook-quic", "brook"},
+		NextProtos:   []string{"brook-quic", "brook", "h3"},
 	}, nil
 }
 
@@ -777,51 +449,8 @@ func (s *Server) Close() error {
 	return nil
 }
 
-// cleanupWebTransportConn removes the connection tracing entry from webtransport.Server's internal
-// sessionManager. Without this, webtransport-go leaks every closed connection and its sessions in
-// an internal map indefinitely.
-func (s *Server) cleanupWebTransportConn(conn quic.EarlyConnection) {
-	if s == nil || s.wtServer == nil || conn == nil {
-		return
-	}
-	tracingVal := conn.Context().Value(quic.ConnectionTracingKey)
-	if tracingVal == nil {
-		return
-	}
-	tracingID, ok := tracingVal.(quic.ConnectionTracingID)
-	if !ok {
-		return
-	}
-
-	wtVal := reflect.ValueOf(s.wtServer)
-	if wtVal.Kind() != reflect.Ptr || wtVal.IsNil() {
-		return
-	}
-	wtElem := wtVal.Elem()
-	connsField := wtElem.FieldByName("conns")
-	if !connsField.IsValid() || connsField.IsNil() {
-		return
-	}
-
-	smElem := connsField.Elem()
-	mxField := smElem.FieldByName("mx")
-	mapField := smElem.FieldByName("conns")
-	if !mxField.IsValid() || !mapField.IsValid() {
-		return
-	}
-
-	mx := (*sync.Mutex)(unsafe.Pointer(mxField.UnsafeAddr()))
-	mx.Lock()
-	defer mx.Unlock()
-
-	m := reflect.NewAt(mapField.Type(), unsafe.Pointer(mapField.UnsafeAddr())).Elem()
-	if !m.IsNil() {
-		m.SetMapIndex(reflect.ValueOf(tracingID), reflect.Value{})
-	}
-}
-
 // ActiveWebTransportConns returns the count of active connections currently tracked in
-// webtransport.Server's sessionManager.
+// webtransport.Server's internal connection map.
 func (s *Server) ActiveWebTransportConns() int {
 	if s == nil || s.wtServer == nil {
 		return 0
@@ -831,14 +460,8 @@ func (s *Server) ActiveWebTransportConns() int {
 		return 0
 	}
 	wtElem := wtVal.Elem()
-	connsField := wtElem.FieldByName("conns")
-	if !connsField.IsValid() || connsField.IsNil() {
-		return 0
-	}
-
-	smElem := connsField.Elem()
-	mxField := smElem.FieldByName("mx")
-	mapField := smElem.FieldByName("conns")
+	mxField := wtElem.FieldByName("connsMx")
+	mapField := wtElem.FieldByName("conns")
 	if !mxField.IsValid() || !mapField.IsValid() {
 		return 0
 	}

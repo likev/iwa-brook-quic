@@ -7,9 +7,9 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
-// RawQUICStreamConn wraps a quic.Stream as a net.Conn / StreamConn.
+// RawQUICStreamConn wraps a *quic.Stream as a net.Conn / StreamConn.
 type RawQUICStreamConn struct {
-	quic.Stream
+	*quic.Stream
 	localAddr  net.Addr
 	remoteAddr net.Addr
 }
@@ -31,7 +31,7 @@ func (c *RawQUICStreamConn) CancelWrite(code uint64) {
 }
 
 // HandleRawQUICConn handles streams from a legacy / raw Brook QUIC connection.
-func HandleRawQUICConn(conn quic.Connection, password []byte, withoutBrook bool, tcpTimeout, udpTimeout int, firstStream quic.Stream, streamSem chan struct{}) {
+func HandleRawQUICConn(conn *quic.Conn, password []byte, withoutBrook bool, tcpTimeout, udpTimeout int, firstStream *quic.Stream, streamSem chan struct{}) {
 	remoteAddr := conn.RemoteAddr()
 	localAddr := conn.LocalAddr()
 

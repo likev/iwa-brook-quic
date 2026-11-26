@@ -473,7 +473,7 @@ async function runUnitTests() {
   const probeOnline = await testMonitor.checkOnce();
   assert(probeOnline === true && testMonitor.isOnline === true, 'NetworkMonitor verifies active internet connectivity via 3 CORS probe URLs');
 
-  // Verify offline when all endpoints fail
+  // Verify asymmetric hysteresis: 1st all-fail stays online, 2nd consecutive all-fail transitions offline
   const failingMonitor = new NetworkMonitor({
     probeUrls: [
       'https://127.0.0.1:1/invalid-1',
@@ -481,10 +481,33 @@ async function runUnitTests() {
       'https://127.0.0.1:1/invalid-3'
     ],
     timeoutMs: 100,
-    checkIntervalMs: 5000
+    checkIntervalMs: 5000,
+    maxConsecutiveFailures: 2
   });
+  const probeFail1 = await failingMonitor.checkOnce();
+  assert(probeFail1 === false && failingMonitor.isOnline === true, 'NetworkMonitor hysteresis stays online after 1st transient probe failure');
   const probeOffline = await failingMonitor.checkOnce();
-  assert(probeOffline === false && failingMonitor.isOnline === false, 'NetworkMonitor identifies offline status when all 3 endpoints fail');
+  assert(probeOffline === false && failingMonitor.isOnline === false, 'NetworkMonitor transitions offline after 2 consecutive all-endpoint failures');
+
+  // Verify active Brook QUIC traffic prevents false offline transitions
+  let simulatedBrookTraffic = true;
+  const trafficGuardedMonitor = new NetworkMonitor({
+    probeUrls: [
+      'https://127.0.0.1:1/invalid-1',
+      'https://127.0.0.1:1/invalid-2',
+      'https://127.0.0.1:1/invalid-3'
+    ],
+    timeoutMs: 100,
+    maxConsecutiveFailures: 2,
+    recentTrafficCheck: () => simulatedBrookTraffic
+  });
+  await trafficGuardedMonitor.checkOnce();
+  await trafficGuardedMonitor.checkOnce();
+  assert(trafficGuardedMonitor.isOnline === true, 'NetworkMonitor stays online when recent Brook QUIC traffic is active despite probe failures');
+  simulatedBrookTraffic = false;
+  await trafficGuardedMonitor.checkOnce();
+  await trafficGuardedMonitor.checkOnce();
+  assert(trafficGuardedMonitor.isOnline === false, 'NetworkMonitor transitions offline once both probes and Brook QUIC traffic stop');
 
   // Test that WebTransportConnectionManager rejects new session create when offline
   const offlineWtMgr = new WebTransportConnectionManager({
@@ -681,6 +704,129 @@ async function runUnitTests() {
     await new Promise(r => setTimeout(r, 60));
     dedupDispatcher._logDeduplicated('warning', 'wt_acquire:timeout', 'WebTransport pool timed out after 10000ms', 50);
     assert(dedupEmitted.length === 2 && dedupEmitted[1].msg.includes('+9 similar suppressed'), 'Deduplicated logger reports suppressed count after window expires');
+  }
+
+  // 1.19d Tier 1 & Tier 2 Stability: Health Scoring, Zombie Eviction, NAT Keepalive, Adaptive Pool & Hedged Claim Gate
+  {
+    const makeMockTransport = (onDatagram = null, onClose = null) => ({
+      close: () => { if (onClose) onClose(); },
+      datagrams: onDatagram ? {
+        writable: new WritableStream({
+          write(chunk) { return onDatagram(chunk); }
+        })
+      } : undefined,
+      createBidirectionalStream: async () => ({
+        readable: new ReadableStream({ start() {} }),
+        writable: new WritableStream({ write() {}, close() {} })
+      })
+    });
+
+    // 1) Health-scored slot selection + excludeSlotIds + zombie eviction
+    let slot0Closed = false;
+    const healthMgr = new WebTransportConnectionManager({
+      serverHost: '127.0.0.1',
+      serverPort: 4433,
+      poolSize: 5,
+      baseWarmSlots: 2,
+      keepaliveIntervalMs: 0,
+      zombieFailureThreshold: 2
+    });
+    healthMgr._connectSlot = async () => { throw new Error('skip bg connect'); };
+    healthMgr.slots[0].state = 'connected';
+    healthMgr.slots[0].transport = makeMockTransport(null, () => { slot0Closed = true; });
+    healthMgr.slots[1].state = 'connected';
+    healthMgr.slots[1].transport = makeMockTransport();
+
+    // Penalize slot 0 once -> createSession should pick healthy slot 1
+    healthMgr.reportSlotFailure(0, 'handshake_timeout');
+    const sPick1 = await healthMgr.createSession();
+    assert(sPick1.slotId === 1, `Health-scored selection bypassed failing slot #1 and chose slot #${sPick1.slotId + 1}`);
+    sPick1.close();
+
+    // Exclude slot 1 -> falls back to slot 0
+    const sPickExcl = await healthMgr.createSession({ excludeSlotIds: new Set([1]) });
+    assert(sPickExcl.slotId === 0, 'excludeSlotIds directs retry/hedge to an untried slot');
+    sPickExcl.close();
+
+    // Second failure on slot 0 -> evicts zombie session
+    healthMgr.reportSlotFailure(0, 'handshake_timeout');
+    assert(slot0Closed && healthMgr.slots[0].state === 'disconnected' && healthMgr.slots[0].transport === null, 'Zombie QUIC slot evicted after reaching zombieFailureThreshold (2)');
+
+    // 2) Client-side NAT keepalive sends 1-byte datagram on idle warm slots
+    let keepaliveBytes = 0;
+    const kaMgr = new WebTransportConnectionManager({
+      serverHost: '127.0.0.1',
+      serverPort: 4433,
+      poolSize: 3,
+      baseWarmSlots: 2,
+      keepaliveIntervalMs: 0,
+      keepaliveIdleThresholdMs: 1000
+    });
+    kaMgr.slots[0].state = 'connected';
+    kaMgr.slots[0].lastActivityAt = Date.now() - 5000;
+    kaMgr.slots[0].transport = makeMockTransport((chunk) => { keepaliveBytes += chunk.length; });
+    await kaMgr._runKeepaliveTick();
+    assert(keepaliveBytes === 1 && kaMgr.slots[0].lastKeepaliveAt > 0, 'Client-side NAT keepalive sends 1-byte datagram on idle connected slot');
+
+    // 3) Adaptive connect() only warms baseWarmSlots (2) instead of blasting all 5 slots
+    const adaptMgr = new WebTransportConnectionManager({
+      serverHost: '127.0.0.1',
+      serverPort: 4433,
+      poolSize: 5,
+      baseWarmSlots: 2,
+      keepaliveIntervalMs: 0
+    });
+    const connectedIds = [];
+    adaptMgr._connectSlot = async (slot) => {
+      connectedIds.push(slot.id);
+      slot.state = 'connected';
+      slot.transport = makeMockTransport();
+      return slot;
+    };
+    await adaptMgr.connect({ staggerMs: 0 });
+    assert(connectedIds.length === 2 && connectedIds[0] === 0 && connectedIds[1] === 1, `Adaptive connect warmed baseWarmSlots=2 instead of all 5 (connected: ${connectedIds.join(',')})`);
+
+    // 4) BrookTunnel atomic claimClient gate prevents losing hedged dial from touching client streams
+    const pw = 'hedge-claim-test';
+    let sendSuccessCalls = 0;
+    let sendFailureCalls = 0;
+    let clientWrites = 0;
+    let clientReadCalls = 0;
+    let registeredHedgeHandlers = null;
+    const mockHedgeQuic = {
+      allocateStreamId: () => 8,
+      registerStream: (id, handlers) => { registeredHedgeHandlers = handlers; },
+      releaseStream: () => {},
+      ensureConnected: async () => {},
+      sendStreamData: async (id, data) => {
+        if (data && data.length > 12 && registeredHedgeHandlers) {
+          const sn = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+          queueMicrotask(() => registeredHedgeHandlers.onData(sn, false));
+        }
+      }
+    };
+    const hedgedLostOutcome = await BrookTunnel.run({
+      clientReader: {
+        read: async () => { clientReadCalls++; return { done: true, value: undefined }; },
+        cancel: async () => { clientReadCalls++; }
+      },
+      clientWriter: {
+        write: async () => { clientWrites++; },
+        close: async () => { clientWrites++; }
+      },
+      quicManager: mockHedgeQuic,
+      dstBytes: encodeAddress('127.0.0.1', 80),
+      password: pw,
+      withoutBrook: true,
+      targetStr: '127.0.0.1:80',
+      sendSuccess: async () => { sendSuccessCalls++; },
+      sendFailure: async () => { sendFailureCalls++; },
+      claimClient: () => false, // Simulate another slot already winning the atomic claim
+      dialTimeoutMs: 1000,
+      closeClientStreams: true
+    });
+    assert(hedgedLostOutcome.kind === 'hedged_lost', `Losing hedged dial exits cleanly as hedged_lost (got ${hedgedLostOutcome.kind})`);
+    assert(sendSuccessCalls === 0 && sendFailureCalls === 0 && clientWrites === 0 && clientReadCalls === 0, 'Losing hedged dial never touches clientReader, clientWriter, sendSuccess, or sendFailure');
   }
 
   // 1.20 BrookTunnel clean RESET_STREAM handling (stream_reset after clean frame vs stream_error before data)
