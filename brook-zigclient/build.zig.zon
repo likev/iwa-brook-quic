@@ -1,0 +1,12 @@
+.{
+    .name = .brook_zigclient,
+    .version = "1.0.0",
+    .fingerprint = 0xec7b95908dd897e4,
+    .minimum_zig_version = "0.17.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "web",
+    },
+}

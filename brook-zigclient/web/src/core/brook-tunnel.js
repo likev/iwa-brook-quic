@@ -1,0 +1,670 @@
+/**
+ * Brook Tunnel Orchestrator: pipes data between local TCP client and remote Brook QUIC stream.
+ * Supports full-duplex streaming with independent half-close coordination,
+ * post-connect dial verification timer, speculative socket pruning, bounded receive/transmit buffers,
+ * deterministic structured outcome reporting, and reader-lock-safe retry semantics.
+ */
+
+import { generateNonce, deriveKey } from './brook-crypto.js';
+import { sealFrame, openLength, openPayload, buildBrookHeader, BrookCipher } from './brook-framing.js';
+
+export class BrookTunnel {
+  static globalMetrics = {
+    rxQueuedBytes: 0,
+    uploadPendingBytes: 0,
+    writerDurations: [],
+    recordWriterWait(ms) {
+      this.writerDurations.push(ms);
+      if (this.writerDurations.length > 100) this.writerDurations.shift();
+    },
+    getWriterWaitMsP95() {
+      if (this.writerDurations.length === 0) return 0;
+      const sorted = [...this.writerDurations].sort((a, b) => a - b);
+      const idx = Math.min(sorted.length - 1, Math.floor(sorted.length * 0.95));
+      return Math.round(sorted[idx] * 10) / 10;
+    },
+    getStats() {
+      return {
+        rxQueuedBytes: Math.max(0, this.rxQueuedBytes),
+        uploadPendingBytes: Math.max(0, this.uploadPendingBytes),
+        writerWaitMs: this.getWriterWaitMsP95()
+      };
+    }
+  };
+  /**
+   * Run bidirectional Brook encrypted tunnel over a QUIC stream.
+   *
+   * @param {Object} options
+   * @param {ReadableStreamDefaultReader} options.clientReader - Local TCP socket reader
+   * @param {WritableStreamDefaultWriter} options.clientWriter - Local TCP socket writer
+   * @param {QuicConnectionManager|QuicSession} options.quicManager - QUIC manager or session
+   * @param {Uint8Array} options.dstBytes - Destination slice [ATYP, ADDR..., PORT]
+   * @param {Uint8Array} options.leftover - Any initial data already read (e.g. rewritten HTTP body)
+   * @param {string} options.password - Brook server password
+   * @param {boolean} options.withoutBrook - WithoutBrook mode
+   * @param {number} options.clockOffsetSec - Network clock drift offset in seconds
+   * @param {string} options.targetStr - Target host string (for logging/metrics)
+   * @param {number|string} options.sessionId - Session ID for logging
+   * @param {Function} options.sendSuccess - One-shot callback to confirm connection to client
+   * @param {Function} options.sendFailure - Callback to signal proxy failure
+   * @param {number} options.dialTimeoutMs - Timeout for server dial / nonce receipt
+   * @param {boolean} [options.closeClientStreams=true] - Whether to close client streams on exit
+   * @param {Function} options.onHandshakeDone - Callback when server handshake completes
+   * @param {Function} options.onClientDataRead - Callback when client sends payload data
+   * @param {Function} options.onBytes - Callback for throughput accounting (sent, received)
+   * @param {Function} options.onClose - Callback when session terminates
+   * @param {Function} options.onLog - Logging callback
+   * @returns {Promise<{ success: boolean, kind: string, bytesSent: number, bytesReceived: number, serverHandshakeDone: boolean, error?: Error }>}
+   */
+  static async run({
+    clientReader,
+    clientWriter,
+    quicManager,
+    dstBytes,
+    leftover = new Uint8Array(0),
+    password,
+    withoutBrook = true,
+    clockOffsetSec = 0,
+    targetStr,
+    sessionId = '',
+    sendSuccess = null,
+    sendFailure = null,
+    dialTimeoutMs = 8000,
+    closeClientStreams = true,
+    claimClient = null,
+    onHandshakeDone = null,
+    onClientDataRead = null,
+    onBytes,
+    onClose,
+    onLog
+  }) {
+    const logTag = sessionId ? `[#${sessionId}]` : `[Stream]`;
+    const streamId = quicManager.allocateStreamId();
+    const tunnelStartTime = Date.now();
+
+    let isTerminated = false;
+    let clientReadClosed = false;
+    let clientWriteClosed = false;
+    let serverFinReceived = false;
+    let transportClosed = false;
+    let streamResetError = null;
+    let hasExchangedData = false;
+    let successSent = false;
+    let activeWritePromise = null;
+
+    let totalBytesSent = 0;
+    let totalBytesRecv = 0;
+
+    let resolveCompletion = null;
+    const completionPromise = new Promise(r => { resolveCompletion = r; });
+
+    let resolveHandshake = null;
+    let rejectHandshake = null;
+    const handshakePromise = new Promise((resolve, reject) => {
+      resolveHandshake = resolve;
+      rejectHandshake = reject;
+    });
+
+    let cleanupPromise = null;
+    let terminationReason = 'unknown';
+    let terminationError = null;
+
+    // 1. Prepare Cryptographic Context
+    const cn = generateNonce();
+    const cnCopy = new Uint8Array(cn);
+    const ck = await deriveKey(password, cnCopy, 'brook', withoutBrook);
+    const clientCipher = new BrookCipher(ck);
+
+    let sn = null;
+    let sk = null;
+    let serverCipher = null;
+    let rxBuffer = new Uint8Array(0);
+    let rxOffset = 0;
+    let serverHandshakeDone = false;
+    let dialDurationMs = 0;
+    let expectedPayloadLen = -1;
+
+    // Bounded Serialized FIFO queue for downstream processing (16MB buffer cap)
+    const MAX_RX_BUFFER_BYTES = 16 * 1024 * 1024;
+    let rxQueuedBytes = 0;
+    const rxQueue = [];
+    let isProcessingRx = false;
+    let rxHighWaterLogged = false;
+
+    // 2. Timers:
+    let handshakeTimer = null;
+    let idleTimer = null;
+
+    const resetIdleTimer = (durationMs = null) => {
+      if (idleTimer) clearTimeout(idleTimer);
+      if (!isTerminated) {
+        let timeout;
+        if (durationMs !== null) {
+          timeout = durationMs;
+        } else if (serverFinReceived) {
+          timeout = 15000;
+        } else if (clientReadClosed) {
+          timeout = 30000;
+        } else {
+          timeout = hasExchangedData ? 60000 : 30000;
+        }
+        idleTimer = setTimeout(() => {
+          if (!isTerminated) {
+            if (totalBytesRecv === 0 && onLog) {
+              onLog('info', `${logTag} ℹ️ Speculative connection for ${targetStr} idle for ${(timeout / 1000).toFixed(0)}s (closed by idle timer).`);
+            }
+            cleanup('idle_timeout', new Error(`Connection idle timeout after ${timeout}ms`));
+          }
+        }, timeout);
+      }
+    };
+
+    const cleanup = (reason = 'unknown', err = null) => {
+      if (cleanupPromise) return cleanupPromise;
+      isTerminated = true;
+      terminationReason = reason;
+      if (err && !terminationError) terminationError = err;
+
+      if (!serverHandshakeDone && rejectHandshake) {
+        rejectHandshake(err || new Error(`Brook tunnel terminated (${reason})`));
+      }
+
+      cleanupPromise = (async () => {
+        if (handshakeTimer) {
+          clearTimeout(handshakeTimer);
+          handshakeTimer = null;
+        }
+        if (idleTimer) {
+          clearTimeout(idleTimer);
+          idleTimer = null;
+        }
+
+        if (quicManager.releaseStream) {
+          quicManager.releaseStream(streamId);
+        } else if (quicManager.unregisterStream) {
+          quicManager.unregisterStream(streamId);
+        }
+
+        if (rxQueuedBytes > 0) {
+          BrookTunnel.globalMetrics.rxQueuedBytes = Math.max(0, BrookTunnel.globalMetrics.rxQueuedBytes - rxQueuedBytes);
+          rxQueuedBytes = 0;
+        }
+
+        // Await active write promise before attempting to close writer with 5s bounded grace
+        if (activeWritePromise) {
+          try {
+            await Promise.race([
+              activeWritePromise.catch(() => {}),
+              new Promise(r => setTimeout(r, 5000))
+            ]);
+          } catch (e) {}
+          activeWritePromise = null;
+        }
+
+        // If dial never succeeded and client was not notified, signal error
+        if (reason !== 'hedged_lost' && !serverHandshakeDone && !successSent && sendFailure && closeClientStreams) {
+          try {
+            await sendFailure(0x05);
+            sendFailure = null;
+          } catch (e) {}
+        }
+
+        // Bounded client stream cleanup: only cancel/close client reader/writer if closeClientStreams is true
+        // or if serverHandshakeDone is true (stream was active). Lock release is owned by dispatcher.
+        if (reason !== 'hedged_lost' && (closeClientStreams || serverHandshakeDone)) {
+          try {
+            await Promise.race([
+              clientReader.cancel().catch(() => {}),
+              new Promise(r => setTimeout(r, 500))
+            ]);
+          } catch (e) {}
+
+          if (!clientWriteClosed) {
+            clientWriteClosed = true;
+            try {
+              await Promise.race([
+                clientWriter.close().catch(() => {}),
+                new Promise(r => setTimeout(r, 500))
+              ]);
+            } catch (e) {}
+          }
+        }
+
+        const durationSec = ((Date.now() - tunnelStartTime) / 1000).toFixed(2);
+        if (onLog && hasExchangedData) {
+          const dialInfo = dialDurationMs > 0 ? `dial: ${dialDurationMs}ms, ` : '';
+          onLog('info', `${logTag} 🛑 Tunnel finished for ${targetStr} (Up: ${totalBytesSent}B, Down: ${totalBytesRecv}B, ${dialInfo}total: ${durationSec}s, reason: ${reason})`);
+        }
+
+        if (onClose) {
+          try { onClose(); } catch (e) {}
+        }
+        if (resolveCompletion) resolveCompletion();
+      })();
+
+      return cleanupPromise;
+    };
+
+    const finalizeStreamReset = (err) => {
+      const msg = err?.message || String(err || '');
+      const cleanBoundary = expectedPayloadLen === -1 && rxOffset >= rxBuffer.length;
+      if (serverHandshakeDone && totalBytesRecv > 0 && cleanBoundary) {
+        if (onLog) {
+          onLog('info', `${logTag} ℹ️ QUIC stream ${streamId} reset by peer after ${totalBytesRecv}B transferred`);
+        }
+        cleanup('stream_reset', err);
+      } else {
+        if (onLog) {
+          onLog('warning', `${logTag} ⚠️ QUIC stream ${streamId} reset by peer: ${msg}`);
+        }
+        cleanup('stream_error', err);
+      }
+    };
+
+    const checkFullClose = () => {
+      if (clientReadClosed && serverFinReceived) {
+        if (!serverHandshakeDone) {
+          cleanup('client_abort', new Error('Connection closed before handshake completed'));
+          return;
+        }
+        if (expectedPayloadLen !== -1 || rxBuffer.length - rxOffset > 0) {
+          cleanup('framing_error', new Error('Stream closed with incomplete frame in buffer'));
+          return;
+        }
+        if (totalBytesRecv === 0) {
+          cleanup('target_dial_refused', new Error('Target closed connection with 0 bytes'));
+          return;
+        }
+        cleanup('both_closed');
+      }
+    };
+
+    const processRxQueue = async () => {
+      if (isProcessingRx || isTerminated) return;
+      isProcessingRx = true;
+
+      try {
+        while (rxQueue.length > 0 && !isTerminated) {
+          const item = rxQueue.shift();
+          const { data, fin } = item;
+          if (data) {
+            rxQueuedBytes -= data.length;
+            BrookTunnel.globalMetrics.rxQueuedBytes = Math.max(0, BrookTunnel.globalMetrics.rxQueuedBytes - data.length);
+          }
+
+          if (data && data.length > 0) {
+            if (rxOffset > 0) {
+              rxBuffer = rxBuffer.slice(rxOffset);
+              rxOffset = 0;
+            }
+            if (rxBuffer.length === 0) {
+              rxBuffer = data;
+            } else {
+              const merged = new Uint8Array(rxBuffer.length + data.length);
+              merged.set(rxBuffer, 0);
+              merged.set(data, rxBuffer.length);
+              rxBuffer = merged;
+            }
+            rxOffset = 0;
+
+            // Step A: Read Server Nonce (12 bytes)
+            if (!serverHandshakeDone) {
+              if (rxBuffer.length - rxOffset < 12) continue;
+              sn = rxBuffer.slice(rxOffset, rxOffset + 12);
+              rxOffset += 12;
+              sk = await deriveKey(password, sn, 'brook', withoutBrook);
+              serverCipher = new BrookCipher(sk);
+
+              // Atomic ownership gate for hedged pre-handshake dials: only one racer may claim client streams
+              if (claimClient && !claimClient()) {
+                cleanup('hedged_lost', new Error('Hedged dial superseded by faster slot'));
+                return;
+              }
+
+              serverHandshakeDone = true;
+              dialDurationMs = Date.now() - tunnelStartTime;
+
+              if (handshakeTimer) {
+                clearTimeout(handshakeTimer);
+                handshakeTimer = null;
+              }
+
+              // Confirm SOCKS5 / HTTP success to browser now that dial has begun
+              if (sendSuccess && !successSent) {
+                successSent = true;
+                try {
+                  await sendSuccess();
+                  sendSuccess = null;
+                } catch (e) {}
+              }
+
+              if (onHandshakeDone) {
+                try {
+                  onHandshakeDone();
+                  onHandshakeDone = null;
+                } catch (e) {}
+              }
+
+              if (resolveHandshake) {
+                resolveHandshake();
+              }
+
+              const rttMs = Date.now() - tunnelStartTime;
+              if (onLog) {
+                onLog('success', `${logTag} 🚀 [Brook] Server dial initiated for ${targetStr} (${rttMs}ms, sn verified)`);
+              }
+            }
+
+            // Step B: Decode length & payload frames sequentially
+            while (serverHandshakeDone && !isTerminated) {
+              const available = rxBuffer.length - rxOffset;
+              // 1. Decode Length Prefix (18 bytes)
+              if (expectedPayloadLen === -1) {
+                if (available < 18) break;
+                const chunk18 = rxBuffer.subarray(rxOffset, rxOffset + 18);
+                rxOffset += 18;
+                try {
+                  expectedPayloadLen = await openLength(serverCipher, sn, chunk18);
+                } catch (err) {
+                  if (onLog) onLog('error', `${logTag} Frame length decrypt failed on stream ${streamId}: ${err.message}`);
+                  cleanup('decrypt_error', err);
+                  return;
+                }
+              }
+
+              // 2. Decode Payload (expectedPayloadLen + 16 bytes tag)
+              if (expectedPayloadLen >= 0) {
+                const requiredBytes = expectedPayloadLen + 16;
+                if (rxBuffer.length - rxOffset < requiredBytes) break;
+
+                const payloadAndTag = rxBuffer.subarray(rxOffset, rxOffset + requiredBytes);
+                rxOffset += requiredBytes;
+
+                let plainPayload;
+                try {
+                  plainPayload = await openPayload(serverCipher, sn, payloadAndTag);
+                } catch (err) {
+                  if (onLog) onLog('error', `${logTag} Payload decrypt failed on stream ${streamId}: ${err.message}`);
+                  cleanup('decrypt_error', err);
+                  return;
+                }
+
+                expectedPayloadLen = -1; // Reset for next frame
+
+                // Pipe plain decrypted bytes to local client
+                const plainLen = plainPayload ? plainPayload.length : 0;
+                if (plainLen > 0) {
+                  if (!hasExchangedData && onLog) {
+                    onLog('info', `${logTag} 🎯 [Brook] First target byte received for ${targetStr} (${plainLen}B)`);
+                  }
+                  hasExchangedData = true;
+                  totalBytesRecv += plainLen;
+                  try {
+                    const t0 = (typeof performance !== 'undefined') ? performance.now() : Date.now();
+                    const writePromise = clientWriter.write(plainPayload);
+                    const writeTimeout = new Promise((_, reject) => {
+                      setTimeout(() => reject(new Error('clientWriter.write timed out after 15s')), 15000);
+                    });
+                    activeWritePromise = Promise.race([writePromise, writeTimeout]);
+                    await activeWritePromise;
+                    activeWritePromise = null;
+                    const waitMs = ((typeof performance !== 'undefined') ? performance.now() : Date.now()) - t0;
+                    BrookTunnel.globalMetrics.recordWriterWait(waitMs);
+                    resetIdleTimer();
+                    if (onBytes) onBytes(0, plainLen);
+                  } catch (err) {
+                    activeWritePromise = null;
+                    cleanup('client_write_error', err);
+                    return;
+                  }
+                }
+              }
+            }
+
+            // Immediately trim rxBuffer to retain only unconsumed remainder (slice ensures previous ArrayBuffer can be GC'd)
+            if (rxOffset > 0) {
+              rxBuffer = rxOffset === rxBuffer.length ? new Uint8Array(0) : rxBuffer.slice(rxOffset);
+              rxOffset = 0;
+            }
+          }
+
+          if (fin) {
+            if (!serverHandshakeDone && onLog) {
+              onLog('warning', `${logTag} ⚠️ Brook server closed stream before sending server nonce for ${targetStr}. Possible client clock drift (diff > 60s) or invalid password.`);
+            }
+            serverFinReceived = true;
+
+            if (!clientWriteClosed) {
+              clientWriteClosed = true;
+              try {
+                await clientWriter.close().catch(() => {});
+              } catch (e) {}
+            }
+
+            if (expectedPayloadLen !== -1 || rxOffset < rxBuffer.length) {
+              cleanup('framing_error', new Error('Server sent FIN with incomplete frame in buffer'));
+              return;
+            }
+
+            // If target closed with 0 bytes before handshake completed, fail fast immediately (target dial refused or dropped)
+            if (!serverHandshakeDone && totalBytesRecv === 0) {
+              if (onLog) {
+                onLog('warning', `${logTag} ⚠️ [Brook] Target ${targetStr} closed connection before handshake (dial refused or dropped)`);
+              }
+              cleanup('target_dial_refused', new Error('Target connection refused (0 bytes)'));
+              return;
+            }
+
+            checkFullClose();
+            if (serverFinReceived && !clientReadClosed && !isTerminated) {
+              // Bounded half-close: allow client 10s to complete reading
+              resetIdleTimer(10000);
+            }
+            return;
+          }
+        }
+      } catch (err) {
+        cleanup('rx_error', err);
+      } finally {
+        isProcessingRx = false;
+        if (rxQueue.length > 0 && !isTerminated) {
+          queueMicrotask(processRxQueue);
+        } else if (streamResetError && !isTerminated && !serverFinReceived) {
+          finalizeStreamReset(streamResetError);
+        } else if (transportClosed && !isTerminated && !serverFinReceived) {
+          cleanup('transport_closed', new Error('Underlying transport closed before server FIN'));
+        }
+        if (rxQueuedBytes < 1024 * 1024 && rxHighWaterLogged) {
+          rxHighWaterLogged = false;
+          if (onLog) {
+            onLog('info', `${logTag} ℹ️ [Brook Buffer] Downstream rx buffer recovered to ${Math.round(rxQueuedBytes / 1024)}KB.`);
+          }
+        }
+      }
+    };
+
+    try {
+      // 3. Register QUIC stream receiver
+      quicManager.registerStream(streamId, {
+        onData: (data, fin) => {
+          if (isTerminated) return;
+          resetIdleTimer();
+          const dataLen = data ? data.length : 0;
+          if (rxQueuedBytes + dataLen > MAX_RX_BUFFER_BYTES) {
+            if (onLog) onLog('error', `${logTag} Downstream receive buffer overflow (${rxQueuedBytes + dataLen} > ${MAX_RX_BUFFER_BYTES}). Terminating tunnel.`);
+            cleanup('rx_overflow', new Error('Downstream receive buffer overflow'));
+            return;
+          }
+          if (rxQueuedBytes + dataLen > 4 * 1024 * 1024 && !rxHighWaterLogged) {
+            rxHighWaterLogged = true;
+            if (onLog) {
+              onLog('warning', `${logTag} ⚠️ [Brook Buffer] High downstream buffer pressure (${Math.round((rxQueuedBytes + dataLen) / 1024)}KB). Slow client TCP consumer detected.`);
+            }
+          }
+          rxQueuedBytes += dataLen;
+          BrookTunnel.globalMetrics.rxQueuedBytes += dataLen;
+          rxQueue.push({ data, fin });
+          processRxQueue();
+        },
+        onClose: () => {
+          transportClosed = true;
+          if (rxQueue.length === 0 && !isProcessingRx && !isTerminated) {
+            if (!serverFinReceived) {
+              cleanup('transport_closed', new Error('Underlying transport closed before server FIN'));
+            } else {
+              checkFullClose();
+            }
+          }
+        },
+        onError: (err) => {
+          const msg = err?.message || String(err || '');
+          if (/RESET_STREAM/i.test(msg)) {
+            streamResetError = err;
+            if (rxQueue.length === 0 && !isProcessingRx && !isTerminated) {
+              finalizeStreamReset(err);
+            }
+            return;
+          }
+          if (onLog) onLog('error', `${logTag} QUIC stream ${streamId} error: ${msg}`);
+          cleanup('stream_error', err);
+        }
+      });
+
+      // 4. Initiate Brook Client Handshake
+      resetIdleTimer();
+      await quicManager.ensureConnected();
+
+      // Step A: Send client nonce (12B)
+      await quicManager.sendStreamData(streamId, cn, false);
+      totalBytesSent += cn.length;
+      if (onBytes) onBytes(cn.length, 0);
+
+      // Step B: Send sealed header: [uint32 timestamp (even)] + dstBytes
+      const headerBody = buildBrookHeader(dstBytes, true, clockOffsetSec);
+      const sealedHeader = await sealFrame(clientCipher, cnCopy, headerBody);
+      await quicManager.sendStreamData(streamId, sealedHeader, false);
+      totalBytesSent += sealedHeader.length;
+      if (onBytes) onBytes(sealedHeader.length, 0);
+
+      // Step C: If there is leftover data (e.g. rewritten HTTP request), seal and send immediately
+      if (leftover && leftover.length > 0) {
+        hasExchangedData = true;
+        const CHUNK_SIZE = 32768;
+        for (let offset = 0; offset < leftover.length; offset += CHUNK_SIZE) {
+          const slice = leftover.subarray(offset, Math.min(offset + CHUNK_SIZE, leftover.length));
+          const sealedLeftover = await sealFrame(clientCipher, cnCopy, slice);
+          await quicManager.sendStreamData(streamId, sealedLeftover, false);
+          totalBytesSent += sealedLeftover.length;
+          if (onBytes) onBytes(sealedLeftover.length, 0);
+        }
+      }
+
+      // Step D: Start Dial Verification Timer only AFTER QUIC session is connected and frames are on wire
+      handshakeTimer = setTimeout(() => {
+        if (!serverHandshakeDone && !isTerminated) {
+          if (onLog) {
+            onLog('warning', `${logTag} ⚠️ [Brook] Server dial response pending for ${targetStr} (${(dialTimeoutMs / 1000).toFixed(1)}s). Session stalled or dropped.`);
+          }
+          cleanup('handshake_timeout', new Error(`Server dial timed out after ${dialTimeoutMs}ms`));
+        }
+      }, dialTimeoutMs);
+
+      // Step E: Wait for Server Dial to complete before reading client payload bytes
+      // This protects clientReader from being read or locked if initial dial fails
+      try {
+        await handshakePromise;
+      } catch (handshakeErr) {
+        // Dial failed, timed out, or refused
+      }
+
+      // 5. Start upstream read loop (Client -> QUIC) only when dial succeeded
+      if (serverHandshakeDone && !isTerminated) {
+        while (!isTerminated) {
+          let readResult;
+          try {
+            readResult = await clientReader.read();
+          } catch (err) {
+            cleanup('client_abort', err);
+            break;
+          }
+
+          const { value, done } = readResult;
+          if (done) {
+            clientReadClosed = true;
+            if (!serverHandshakeDone) {
+              cleanup('client_abort', new Error('Client closed before server dial completed'));
+              break;
+            }
+            try {
+              await quicManager.sendStreamData(streamId, new Uint8Array(0), true);
+            } catch (e) {}
+            checkFullClose();
+            if (!isTerminated && !serverFinReceived) {
+              // Client closed its write side; allow server bounded time to complete response
+              resetIdleTimer(15000);
+            }
+            break;
+          }
+
+          if (value && value.length > 0) {
+            BrookTunnel.globalMetrics.uploadPendingBytes += value.length;
+            if (onClientDataRead) {
+              onClientDataRead();
+            }
+            hasExchangedData = true;
+            resetIdleTimer();
+            const CHUNK_SIZE = 32768;
+            let writeFailed = false;
+            for (let offset = 0; offset < value.length; offset += CHUNK_SIZE) {
+              const slice = value.subarray(offset, Math.min(offset + CHUNK_SIZE, value.length));
+              const sealedChunk = await sealFrame(clientCipher, cnCopy, slice);
+              const chunkLen = sealedChunk.length;
+              try {
+                await quicManager.sendStreamData(streamId, sealedChunk, false);
+                BrookTunnel.globalMetrics.uploadPendingBytes = Math.max(0, BrookTunnel.globalMetrics.uploadPendingBytes - slice.length);
+                totalBytesSent += chunkLen;
+                if (onBytes) onBytes(chunkLen, 0);
+              } catch (err) {
+                BrookTunnel.globalMetrics.uploadPendingBytes = Math.max(0, BrookTunnel.globalMetrics.uploadPendingBytes - (value.length - offset));
+                writeFailed = true;
+                break;
+              }
+            }
+            if (writeFailed) {
+              cleanup('upstream_write_failed', new Error('Failed to send stream data to QUIC session'));
+              break;
+            }
+          }
+        }
+
+        // If client finished sending but server is still replying, await completion
+        if (!isTerminated && !serverFinReceived) {
+          await completionPromise;
+        }
+      }
+    } catch (err) {
+      if (onLog) onLog('error', `${logTag} Tunnel error for ${targetStr}: ${err.message}`);
+      cleanup('tunnel_error', err);
+    } finally {
+      await (cleanupPromise || cleanup('loop_exit'));
+    }
+
+    const isSuccess = terminationReason === 'both_closed' ||
+      (serverHandshakeDone && totalBytesRecv > 0 && (
+        terminationReason === 'idle_timeout' ||
+        terminationReason === 'client_closed' ||
+        terminationReason === 'transport_closed' ||
+        terminationReason === 'stream_reset'
+      ));
+
+    return {
+      success: isSuccess,
+      kind: terminationReason,
+      bytesSent: totalBytesSent,
+      bytesReceived: totalBytesRecv,
+      serverHandshakeDone,
+      dialDurationMs,
+      error: terminationError
+    };
+  }
+}

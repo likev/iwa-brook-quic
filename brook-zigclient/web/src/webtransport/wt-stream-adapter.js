@@ -1,0 +1,157 @@
+/**
+ * WebTransport Stream Adapter: adapts a native WebTransportBidirectionalStream
+ * to the stream session interface expected by BrookTunnel.
+ */
+
+export class WtStreamSession {
+  constructor({ bidiStream, streamId = 0, slotId = null, onClose = null, onLog = null }) {
+    this.bidiStream = bidiStream;
+    this.streamId = streamId;
+    this.slotId = slotId;
+    this.onCloseCallback = onClose;
+    this.onLog = onLog;
+
+    this.reader = bidiStream.readable.getReader();
+    this.writer = bidiStream.writable.getWriter();
+    this.streamHandlers = new Map();
+    this._pendingChunks = [];
+    this._pendingBytes = 0;
+    this.isClosed = false;
+    this.isConnected = true;
+
+    this._startReadPump();
+  }
+
+  allocateStreamId() {
+    return this.streamId;
+  }
+
+  registerStream(streamId, handlers) {
+    this.streamHandlers.set(streamId, handlers);
+    if (this._pendingChunks.length > 0) {
+      const pending = this._pendingChunks;
+      this._pendingChunks = [];
+      this._pendingBytes = 0;
+      for (const item of pending) {
+        if (handlers.onData) handlers.onData(item.data, item.fin);
+        if (item.fin && handlers.onClose) handlers.onClose();
+      }
+    }
+  }
+
+  unregisterStream(streamId) {
+    this.streamHandlers.delete(streamId);
+  }
+
+  releaseStream(streamId) {
+    this.unregisterStream(streamId);
+  }
+
+  async ensureConnected() {
+    if (this.isClosed || !this.isConnected) {
+      throw new Error('WebTransport stream session is closed');
+    }
+  }
+
+  async sendStreamData(streamId, data, fin = false) {
+    if (this.isClosed) {
+      throw new Error('Cannot send stream data: WebTransport stream is closed');
+    }
+    const u8 = data instanceof Uint8Array ? data : new Uint8Array(data);
+    if (u8.length > 0) {
+      const writePromise = this.writer.write(u8);
+      const writeTimeout = new Promise((_, reject) => {
+        setTimeout(() => reject(new Error('WebTransport stream write timed out after 15s')), 15000);
+      });
+      await Promise.race([writePromise, writeTimeout]);
+    }
+    if (fin) {
+      try {
+        await this.writer.close();
+      } catch (e) {}
+    }
+  }
+
+  async _startReadPump() {
+    const MAX_PENDING_BYTES = 4 * 1024 * 1024;
+    const failPendingOverflow = (droppedBytes) => {
+      // Bounded queue overflow: fail fast instead of silently dropping bytes,
+      // which would corrupt GCM framing and surface as decrypt_error downstream.
+      if (this.onLog) {
+        try { this.onLog('error', `WT stream ${this.streamId} pending buffer overflow (${droppedBytes}B dropped). Closing stream.`); } catch (e) {}
+      }
+      const h = this.streamHandlers.get(this.streamId);
+      if (h && h.onError) {
+        try { h.onError(new Error('WT pending buffer overflow')); } catch (e) {}
+      }
+      this._pendingChunks = [];
+      this._pendingBytes = 0;
+      this.close();
+    };
+    try {
+      while (!this.isClosed) {
+        const { value, done } = await this.reader.read();
+        if (done) {
+          const handler = this.streamHandlers.get(this.streamId);
+          if (handler) {
+            if (handler.onData) {
+              handler.onData(new Uint8Array(0), true);
+            }
+            if (handler.onClose) {
+              handler.onClose();
+            }
+          } else {
+            this._pendingChunks.push({ data: new Uint8Array(0), fin: true });
+          }
+          break;
+        }
+
+        if (value && value.length > 0) {
+          const handler = this.streamHandlers.get(this.streamId);
+          if (handler && handler.onData) {
+            handler.onData(value, false);
+          } else {
+            if (this._pendingBytes + value.length > MAX_PENDING_BYTES) {
+              failPendingOverflow(value.length);
+              break;
+            }
+            this._pendingChunks.push({ data: value, fin: false });
+            this._pendingBytes += value.length;
+          }
+        }
+      }
+    } catch (err) {
+      if (!this.isClosed) {
+        const handler = this.streamHandlers.get(this.streamId);
+        if (handler && handler.onError) {
+          handler.onError(err);
+        }
+      }
+    } finally {
+      this.close();
+    }
+  }
+
+  close() {
+    if (this.isClosed) return;
+    this.isClosed = true;
+    this.isConnected = false;
+
+    for (const [id, handler] of this.streamHandlers.entries()) {
+      if (handler.onClose) {
+        try { handler.onClose(); } catch (e) {}
+      }
+    }
+    this.streamHandlers.clear();
+
+    try { this.reader.cancel().catch(() => {}); } catch (e) {}
+    try { this.reader.releaseLock(); } catch (e) {}
+    try { this.writer.close().catch(() => {}); } catch (e) {}
+    try { this.writer.releaseLock(); } catch (e) {}
+
+    if (this.onCloseCallback) {
+      try { this.onCloseCallback(); } catch (e) {}
+      this.onCloseCallback = null;
+    }
+  }
+}
